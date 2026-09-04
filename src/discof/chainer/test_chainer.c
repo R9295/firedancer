@@ -252,6 +252,36 @@ test_basic( fd_wksp_t * wksp ) {
   FD_LOG_NOTICE(( "pass: basic single-version turbine block" ));
 }
 
+/* Alpenglow starts directly from a synthetic slot-0 block whose block
+   ID is all zero.  Zero is otherwise the chainer's "unknown" sentinel,
+   so make sure a complete child can resolve that specific root and
+   derive its own non-zero block ID. */
+
+static void
+test_zero_genesis_block_id( fd_wksp_t * wksp ) {
+  fd_chainer_t * chainer = setup( wksp );
+
+  fd_hash_t genesis = {0};
+  fd_chainer_init( chainer, 0UL, &genesis );
+
+  fd_hash_t mr = mkhash( 1UL );
+  FD_TEST( !feed_fec( chainer, 1UL, 0U, 1, &mr, 0UL, &genesis ) );
+
+  fd_chainer_slotv_t * slot1 = slotv_at( chainer, 1UL, 0UL );
+  FD_TEST( slot1 );
+  FD_TEST( slot1->connected );
+  FD_TEST( !fd_hash_check_zero( &slot1->block_id ) );
+  FD_TEST( slot1->delivered_idx==31U );
+  FD_TEST( fd_chainer_highest_repaired_slot( chainer )==1UL );
+
+  out_rec_t exp[] = { { 1UL, 0U, mr } };
+  expect_out( chainer, exp, 1UL );
+  FD_TEST( !fd_chainer_verify( chainer ) );
+
+  teardown( chainer );
+  FD_LOG_NOTICE(( "pass: zero Alpenglow genesis block ID" ));
+}
+
 /* (b) Two versions of a slot whose FEC sets 0..k carry the same merkle
    root and diverge after: the shared prefix must be recorded against
    both versions, so the notar-fallback version does not re-repair
@@ -1074,6 +1104,7 @@ main( int argc, char ** argv ) {
   FD_TEST( wksp );
 
   test_basic                             ( wksp );
+  test_zero_genesis_block_id             ( wksp );
   test_shared_prefix                     ( wksp );
   test_notar_fallback_in_flight          ( wksp );
   test_sentinel_before_turbine           ( wksp );

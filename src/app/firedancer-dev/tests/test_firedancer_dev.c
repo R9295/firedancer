@@ -175,6 +175,37 @@ test_pack_execle_links( config_t const * config ) {
   FD_TEST( fd_topo_find_link( &config->topo, "pack_execle", execle_cnt )==ULONG_MAX );
 }
 
+static void
+test_direct_genesis_topology( config_t * config ) {
+  config->development.bootstrap  = 1;
+  config->gossip.entrypoints_cnt = 1UL;
+  fd_cstr_ncpy( config->gossip.entrypoints[ 0 ],
+                "127.0.0.1:8001",
+                sizeof(config->gossip.entrypoints[ 0 ]) );
+
+  fd_topo_initialize( config );
+
+  ulong genesi_idx = fd_topo_find_tile( &config->topo, "genesi", 0UL );
+  ulong ipecho_idx = fd_topo_find_tile( &config->topo, "ipecho", 0UL );
+  ulong gossip_idx = fd_topo_find_tile( &config->topo, "gossip", 0UL );
+  ulong gossvf_idx = fd_topo_find_tile( &config->topo, "gossvf", 0UL );
+
+  FD_TEST( genesi_idx!=ULONG_MAX );
+  FD_TEST( ipecho_idx!=ULONG_MAX );
+  FD_TEST( gossip_idx!=ULONG_MAX );
+  FD_TEST( gossvf_idx!=ULONG_MAX );
+  FD_TEST( config->topo.tiles[ genesi_idx ].genesi.entrypoints_cnt==0UL );
+  FD_TEST( config->topo.tiles[ ipecho_idx ].ipecho.entrypoints_cnt==0UL );
+  FD_TEST( config->topo.tiles[ gossip_idx ].gossip.entrypoints_cnt==1UL );
+  FD_TEST( config->topo.tiles[ gossvf_idx ].gossvf.entrypoints_cnt==1UL );
+  FD_TEST( !strcmp( config->topo.tiles[ gossip_idx ].gossip.entrypoints[ 0 ], "127.0.0.1:8001" ) );
+  FD_TEST( !strcmp( config->topo.tiles[ gossvf_idx ].gossvf.entrypoints[ 0 ], "127.0.0.1:8001" ) );
+
+  char const * snapshot_tiles[] = { "snapct", "snapld", "snapdc", "snapin", "snapwr" };
+  for( ulong i=0UL; i<sizeof(snapshot_tiles)/sizeof(snapshot_tiles[ 0 ]); i++ )
+    FD_TEST( fd_topo_find_tile( &config->topo, snapshot_tiles[ i ], 0UL )==ULONG_MAX );
+}
+
 int
 firedancer_dev_test_run( int     argc,
                          char ** argv,
@@ -201,6 +232,9 @@ firedancer_dev_test_run( int     argc,
       config->development.hugetlbfs.min_size = 0;
       config->has_user_config = 1;
 
+      static config_t direct_genesis_config[ 1 ];
+      fd_config_load( 1, 1, (char const *)firedancer_default_config, firedancer_default_config_sz, NULL, NULL, 0UL, NULL, 0UL, NULL, direct_genesis_config, 1 /* dev */ );
+      test_direct_genesis_topology( direct_genesis_config );
       fd_topo_initialize( config );
       test_pack_execle_links( config );
 
@@ -346,7 +380,7 @@ main( int     argc,
     fd_boot( &argc, &argv );
     static config_t config[ 1 ];
     fd_config_load( 1, 1, (char const *)firedancer_default_config, firedancer_default_config_sz, NULL, NULL, 0UL, NULL, 0UL, NULL, config, 1 /* dev */ );
-    fd_topo_initialize( config );
+    test_direct_genesis_topology( config );
     test_pack_execle_links( config );
     fd_halt();
     return 0;

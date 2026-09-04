@@ -1860,9 +1860,20 @@ enforce_nanosecond_clock_bounds( fd_replay_tile_t * ctx,
   fd_alpenglow_pda( "alpenclock", &alpenclock_addr );
 
   fd_acc_t acc = fd_accdb_read_one( ctx->accdb, bank->accdb_fork_id, alpenclock_addr.uc );
-  FD_CHECK_CRIT( acc.lamports && acc.data_len>=sizeof(ulong), "alpenclock account missing" ); /* Firedancer does not support producing the FIRST alpenglow block */
-  long parent_nanos = (long)FD_LOAD( ulong, acc.data );
+  int  has_alpenclock = !!acc.lamports && acc.data_len>=sizeof(ulong);
+  long parent_nanos   = has_alpenclock ? (long)FD_LOAD( ulong, acc.data ) : 0L;
   fd_accdb_unread_one( ctx->accdb, &acc );
+
+  /* A development chain can start directly in Alpenglow mode, without
+     a legacy migration block having created the alpenclock account.
+     Treat genesis creation time as the parent timestamp for that first
+     produced block.  Finalizing the block below creates alpenclock, so
+     every subsequent block follows the normal account-backed path. */
+  if( FD_UNLIKELY( !has_alpenclock ) ) {
+    FD_CHECK_CRIT( bank->f.parent_slot==0UL, "alpenclock account missing after genesis" );
+    parent_nanos = (long)fd_ulong_min( fd_ulong_sat_mul( bank->f.genesis_creation_time, 1000000000UL ),
+                                      (ulong)LONG_MAX );
+  }
 
   ulong elapsed = fd_slot_params_slot_range_duration_ns( bank, bank->f.parent_slot+1UL, bank->f.slot+1UL /* inclusive */ );
 
@@ -4480,7 +4491,15 @@ privileged_init( fd_topo_t const *      topo,
   FD_TEST( fd_rng_secure( &ctx->vote_tracker_seed,    sizeof(ulong) )         );
   FD_TEST( fd_rng_secure( &ctx->block_id_map_seed,    sizeof(ulong) )         );
   FD_TEST( fd_rng_secure( &ctx->ag_block_id_map_seed, sizeof(ulong) )         );
-  FD_TEST( fd_rng_secure( &ctx->initial_block_id,     sizeof(fd_hash_t) )     );
+  if( FD_UNLIKELY( tile->replay.alpenglow ) ) {
+    /* Alpenglow names the genesis block with the default (all-zero)
+       block ID.  Rotor uses the same ID when it initializes its chainer;
+       choosing a process-local random value here prevents the first
+       produced block from attaching to genesis. */
+    fd_memset( &ctx->initial_block_id, 0, sizeof(fd_hash_t) );
+  } else {
+    FD_TEST( fd_rng_secure( &ctx->initial_block_id, sizeof(fd_hash_t) ) );
+  }
   FD_TEST( fd_rng_secure( &ctx->runtime_stack_seed,   sizeof(ulong) )         );
 
   ctx->store_disk_fd = -1;

@@ -430,9 +430,18 @@ fd_chainer_verify( fd_chainer_t const * chainer ) {
 
 static int
 finalize_block_id( fd_chainer_t * chainer, fd_chainer_slotv_t * slotv ) {
-  if( FD_UNLIKELY( slotv->complete_idx==UINT_MAX ) )                 return 0;
-  if( FD_UNLIKELY( slotv->parent_slot==AG_UNKNOWN_SLOT ) )           return 0;
-  if( FD_UNLIKELY( fd_hash_check_zero( &slotv->parent_block_id ) ) ) return 0;
+  if( FD_UNLIKELY( slotv->complete_idx==UINT_MAX ) )       return 0;
+  if( FD_UNLIKELY( slotv->parent_slot==AG_UNKNOWN_SLOT ) ) return 0;
+
+  /* A zero block ID ordinarily means "not known yet".  Alpenglow's
+     synthetic genesis block is the one exception: its canonical block
+     ID is zero.  Only accept zero when it resolves to the connected
+     chainer root, so a missing non-genesis parent cannot be mistaken
+     for genesis. */
+  if( FD_UNLIKELY( fd_hash_check_zero( &slotv->parent_block_id ) ) ) {
+    fd_chainer_slotv_t * parent = fd_chainer_slot_version_query( chainer, slotv->parent_slot, &slotv->parent_block_id );
+    if( FD_UNLIKELY( slotv->parent_slot!=chainer->root || !parent || !parent->connected ) ) return 0;
+  }
 
   uint fec_set_cnt = ( slotv->complete_idx + 1U ) / FD_FEC_SHRED_CNT;
   uchar tree_mem[ FD_BMTREE_COMMIT_FOOTPRINT( 0UL ) ] __attribute__((aligned(FD_BMTREE_COMMIT_ALIGN)));

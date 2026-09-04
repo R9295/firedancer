@@ -175,7 +175,9 @@ setup_pool( void ) {
   FD_TEST( ag_pool_footprint( slot_max )<=sizeof(scratch) );
   ag_pool_t * pool = ag_pool_join( ag_pool_new( scratch, slot_max, 42UL ) );
   FD_TEST( pool );
-  ag_pool_init( pool, 0UL );
+  ag_block_hash_t genesis; genesis_hash( genesis );
+  ag_block_id_t   boot = ag_block_id( 0UL, genesis );
+  ag_pool_init( pool, &boot );
 
   g_epoch_info = make_epoch_info( 0UL, g_info, NV );
   ag_pool_advance_epoch( pool, g_epoch_info, 0UL, 0UL );
@@ -1118,7 +1120,9 @@ setup_two_epoch_pool( ag_epoch_info_t ** out_a,
   FD_TEST( ag_pool_footprint( slot_max )<=sizeof(scratch) );
   ag_pool_t * pool = ag_pool_join( ag_pool_new( scratch, slot_max, 42UL ) );
   FD_TEST( pool );
-  ag_pool_init( pool, 0UL );
+  ag_block_hash_t genesis; genesis_hash( genesis );
+  ag_block_id_t   boot = ag_block_id( 0UL, genesis );
+  ag_pool_init( pool, &boot );
 
   ag_validator_info_t heavy[ NV ];
   for( ulong i=0UL; i<NV; i++ ) {
@@ -1241,7 +1245,7 @@ test_retired_epoch_already_pruned( void ) {
 
 static void
 test_standstill_recovery_no_final_cert( void ) {
-  ag_pool_t * pool = setup_pool(); /* ag_pool_init( pool, 0UL ), no certs */
+  ag_pool_t * pool = setup_pool(); /* boot block seeds parent readiness, but has no pool cert */
 
   FD_TEST(  ag_pool_finalized_slot( pool )==0UL );
   FD_TEST( !contains_slot( pool, 0UL ) );

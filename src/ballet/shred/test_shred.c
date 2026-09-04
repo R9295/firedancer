@@ -134,6 +134,28 @@ main( int     argc,
 
 # define PARSE(x) fd_shred_parse( x, sizeof(x), FD_SHRED_BLK_MAX )
 
+  /* Test parent offset bounds, including a nonzero slot whose parent is
+     genesis. */
+  union {
+    fd_shred_t shred;
+    uchar      buf[ FD_SHRED_MAX_SZ ];
+  } parent_test;
+  memcpy( parent_test.buf, fixture_legacy_data_shred, sizeof(parent_test.buf) );
+
+  parent_test.shred.slot            = 0UL;
+  parent_test.shred.data.parent_off = 0U;
+  FD_TEST( PARSE( parent_test.buf )!=NULL );
+
+  parent_test.shred.slot            = 4UL;
+  parent_test.shred.data.parent_off = 4U;
+  FD_TEST( PARSE( parent_test.buf )!=NULL );
+
+  parent_test.shred.data.parent_off = 0U;
+  FD_TEST( PARSE( parent_test.buf )==NULL );
+
+  parent_test.shred.data.parent_off = 5U;
+  FD_TEST( PARSE( parent_test.buf )==NULL );
+
   /* Parse legacy data shred. */
   shred = PARSE( fixture_legacy_data_shred );
   FD_TEST( shred != NULL );

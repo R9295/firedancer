@@ -1153,6 +1153,8 @@ after_frag( fd_shred_ctx_t *    ctx,
     if( FD_LIKELY( fd_disco_netmux_sig_proto( sig ) != DST_PROTO_REPAIR &&
                  ( (rv==FD_FEC_RESOLVER_SHRED_OKAY) | (rv==FD_FEC_RESOLVER_SHRED_COMPLETES) ) ) ) {
       /* Relay this shred */
+      for( ulong i=0UL; i<ctx->adtl_dests_retransmit_cnt; i++ ) send_shred( ctx, stem, *out_shred, ctx->adtl_dests_retransmit+i, ctx->tsorig );
+
       ulong max_dest_cnt[1];
       do {
         /* If we've validated the shred and it COMPLETES but we can't
@@ -1163,7 +1165,6 @@ after_frag( fd_shred_ctx_t *    ctx,
         fd_shred_dest_idx_t * dests = fd_shred_dest_compute_children( sdest, &shred, 1UL, ctx->scratchpad_dests, 1UL, fanout, fanout, max_dest_cnt );
         if( FD_UNLIKELY( !dests ) ) break;
 
-        for( ulong i=0UL; i<ctx->adtl_dests_retransmit_cnt; i++ ) send_shred( ctx, stem, *out_shred, ctx->adtl_dests_retransmit+i, ctx->tsorig );
         for( ulong j=0UL; j<*max_dest_cnt; j++ ) send_shred( ctx, stem, *out_shred, fd_shred_dest_idx_to_dest( sdest, dests[ j ] ), ctx->tsorig );
       } while( 0 );
     }
@@ -1211,22 +1212,24 @@ after_frag( fd_shred_ctx_t *    ctx,
         if( !(set->parity_shred_rcvd & (1U<<i)) ) new_shreds[ k++ ] = set->parity_shreds[ i ].s;
 
       if( FD_UNLIKELY( !k ) ) break;
+
+      int from_net = ctx->in_kind[ in_idx ]==IN_KIND_NET;
+      fd_shred_dest_weighted_t const * adtl_dests = fd_ptr_if( from_net, ctx->adtl_dests_retransmit+0, ctx->adtl_dests_leader+0 );
+      ulong                            adtl_cnt   = fd_ulong_if( from_net, ctx->adtl_dests_retransmit_cnt, ctx->adtl_dests_leader_cnt );
+      for( ulong i=0UL; i<k; i++ ) {
+        for( ulong j=0UL; j<adtl_cnt; j++ ) send_shred( ctx, stem, new_shreds[ i ], adtl_dests+j, ctx->tsorig );
+      }
+
       fd_shred_dest_t * sdest = fd_stake_ci_get_sdest_for_slot( ctx->stake_ci, new_shreds[ 0 ]->slot );
       if( FD_UNLIKELY( !sdest ) ) break;
 
       ulong out_stride;
       ulong max_dest_cnt[1];
       fd_shred_dest_idx_t * dests;
-      if( FD_LIKELY( ctx->in_kind[ in_idx ]==IN_KIND_NET ) ) {
-        for( ulong i=0UL; i<k; i++ ) {
-          for( ulong j=0UL; j<ctx->adtl_dests_retransmit_cnt; j++ ) send_shred( ctx, stem, new_shreds[ i ], ctx->adtl_dests_retransmit+j, ctx->tsorig );
-        }
+      if( FD_LIKELY( from_net ) ) {
         out_stride = k;
         dests = fd_shred_dest_compute_children( sdest, new_shreds, k, ctx->scratchpad_dests, k, fanout, fanout, max_dest_cnt );
       } else {
-        for( ulong i=0UL; i<k; i++ ) {
-          for( ulong j=0UL; j<ctx->adtl_dests_leader_cnt; j++ ) send_shred( ctx, stem, new_shreds[ i ], ctx->adtl_dests_leader+j, ctx->tsorig );
-        }
         out_stride = 1UL;
         *max_dest_cnt = 1UL;
         dests = fd_shred_dest_compute_first( sdest, new_shreds, k, ctx->scratchpad_dests );

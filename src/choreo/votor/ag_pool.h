@@ -41,11 +41,13 @@ ag_pool_leave( ag_pool_t const * pool );
 void *
 ag_pool_delete( void * mem );
 
-/* init before any cert, vote or block is added; genesis is slot 0 */
+/* init before any cert, vote or block is added.  boot_block is already
+   finalized (genesis is slot 0) and therefore is also a valid
+   notar-fallback-or-stronger parent for the first live leader window. */
 
 void
 ag_pool_init( ag_pool_t * self,
-              ulong       slot );
+              ag_block_id_t const * boot_block );
 
 void
 ag_pool_fini( ag_pool_t * self );

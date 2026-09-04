@@ -264,7 +264,12 @@ fd_topo_initialize( config_t * config ) {
 
   ulong genesis_max_message_size = config->firedancer.development.genesis.max_file_size_mib << 20;
 
-  int snapshots_enabled = !!config->gossip.entrypoints_cnt;
+  /* In development, allow a validator to initialize from its local
+     genesis while retaining gossip entrypoints for peer discovery.  This
+     is useful for multi-validator clusters that share a genesis but do
+     not yet have (or intentionally do not exercise) snapshot bootstrap. */
+  int genesis_bootstrap = !config->gossip.entrypoints_cnt || config->development.bootstrap;
+  int snapshots_enabled = !genesis_bootstrap;
   int snapmk_enabled    = !!snapzp_tile_cnt;
   int rpc_enabled       = config->tiles.rpc.enabled;
   int telemetry_enabled = config->telemetry && strcmp( config->tiles.event.url, "" );
@@ -1368,7 +1373,7 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     tile->ipecho.expected_shred_version = config->consensus.expected_shred_version;
     tile->ipecho.bind_address           = config->net.ip_addr;
     tile->ipecho.bind_port              = config->gossip.port;
-    tile->ipecho.entrypoints_cnt        = config->gossip.entrypoints_cnt;
+    tile->ipecho.entrypoints_cnt        = config->development.bootstrap ? 0UL : config->gossip.entrypoints_cnt;
     for( ulong i=0UL; i<tile->ipecho.entrypoints_cnt; i++ )
       fd_cstr_ncpy( tile->ipecho.entrypoints[ i ], config->gossip.entrypoints[ i ], sizeof(tile->ipecho.entrypoints[ i ]) );
 
@@ -1378,7 +1383,7 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     tile->genesi.allow_download = config->firedancer.snapshots.genesis_download;
     fd_cstr_ncpy( tile->genesi.genesis_path, config->paths.genesis, sizeof(tile->genesi.genesis_path) );
     tile->genesi.expected_shred_version = config->consensus.expected_shred_version;
-    tile->genesi.entrypoints_cnt        = config->gossip.entrypoints_cnt;
+    tile->genesi.entrypoints_cnt        = config->development.bootstrap ? 0UL : config->gossip.entrypoints_cnt;
     for( ulong i=0UL; i<tile->genesi.entrypoints_cnt; i++ )
       fd_cstr_ncpy( tile->genesi.entrypoints[ i ], config->gossip.entrypoints[ i ], sizeof(tile->genesi.entrypoints[ i ]) );
 
