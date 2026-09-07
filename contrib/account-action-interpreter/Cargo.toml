@@ -1,0 +1,14 @@
+[package]
+name = "account-action-interpreter"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Local account-action test interpreter and sBPF ELF builder"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+solana-llvm-compiler = { git = "https://github.com/R9295/solana-llvm-compiler", rev = "68b18e19eb758c663ffe3e7dff6d9c93b3c6a247" }
+
+[dev-dependencies]
+solana-sbpf = "=0.22.0"

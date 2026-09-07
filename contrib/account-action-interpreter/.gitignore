@@ -1,0 +1,5 @@
+/target/
+/artifacts/*
+!/artifacts/account_actions.so
+!/artifacts/actions.bin
+!Cargo.lock
