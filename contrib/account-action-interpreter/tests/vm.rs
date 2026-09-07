@@ -1,6 +1,6 @@
 //! Offline ELF execution tests using a synthetic aligned Solana input buffer.
 //!
-//! These check this interpreter's behavior and guards. They do not implement
+//! These check raw interpreter buffer writes and observation records. They do not implement
 //! validator account reconciliation, rent checks, CPI, or transaction rollback.
 
 use account_action_interpreter::{Action, build_elf, encode_actions};
@@ -140,6 +140,7 @@ struct Layout {
     owner: usize,
     lamports: usize,
     data: usize,
+    capacity: usize,
 }
 
 struct Input {
@@ -185,6 +186,7 @@ impl Input {
                         owner,
                         lamports,
                         data,
+                        capacity: account.data.len() + GROWTH_SLACK,
                     });
                 }
             }
@@ -202,8 +204,19 @@ impl Input {
 
     fn data(&self, account: usize) -> &[u8] {
         let offset = self.layouts[account].data;
-        let len = u64::from_le_bytes(self.bytes[offset - 8..offset].try_into().unwrap()) as usize;
+        let len = usize::try_from(self.data_len(account)).unwrap();
+        assert!(len <= self.layouts[account].capacity);
         &self.bytes[offset..offset + len]
+    }
+
+    fn data_len(&self, account: usize) -> u64 {
+        let offset = self.layouts[account].data;
+        u64::from_le_bytes(self.bytes[offset - 8..offset].try_into().unwrap())
+    }
+
+    fn physical_data(&self, account: usize) -> &[u8] {
+        let layout = self.layouts[account];
+        &self.bytes[layout.data..layout.data + layout.capacity]
     }
 }
 
@@ -408,53 +421,113 @@ fn shrink_and_regrow_zero_new_bytes_and_duplicate_entries_share_state() {
 }
 
 #[test]
-fn readonly_and_truncated_actions_are_rejected_before_writing() {
-    let action = Action::WriteData {
-        account: 0,
-        offset: 0,
-        bytes: vec![9],
-    };
-    let encoded = encode_actions(&[action]).unwrap();
-    let mut account = Account::owned(&[1]);
-    account.writable = false;
-    let mut readonly = Input::new(&[Entry::Account(account)], &encoded);
-    let outcome = execute(&mut readonly);
-    assert_eq!(outcome.status, 0xAC0104);
-    assert_eq!(record(&outcome.return_data).status, 0xAC0104);
-    assert_eq!(readonly.data(0), &[1]);
-
-    let mut truncated = Input::new(
-        &[Entry::Account(Account::owned(&[1]))],
-        &encoded[..encoded.len() - 1],
-    );
-    assert_eq!(execute(&mut truncated).status, 0xAC0101);
-    assert_eq!(truncated.data(0), &[1]);
-}
-
-#[test]
-fn executable_lifecycle_requests_return_explicit_unsupported_errors() {
-    for (action, expected) in [
-        (Action::MarkExecutable { account: 0 }, 0xAC010A),
-        (Action::RemoveExecutable { account: 0 }, 0xAC010B),
-    ] {
-        let mut input = Input::new(
-            &[Entry::Account(Account::owned(&[]))],
-            &encode_actions(&[action]).unwrap(),
-        );
-        let outcome = execute(&mut input);
-        assert_eq!(outcome.status, expected);
-        assert_eq!(record(&outcome.return_data).status, expected);
-    }
-}
-
-#[test]
-fn clearing_data_allows_owner_reassignment_and_prevents_old_owner_writes() {
+fn writable_and_owner_flags_do_not_preempt_synthetic_buffer_mutations() {
     let actions = [
-        Action::ResizeZero { account: 0 },
+        Action::WriteData {
+            account: 0,
+            offset: 0,
+            bytes: vec![9],
+        },
+        Action::ResizeGrow {
+            account: 0,
+            amount: 1,
+        },
+        Action::DebitLamports {
+            account: 0,
+            amount: 3,
+        },
+        Action::CreditLamports {
+            account: 0,
+            amount: 1,
+        },
         Action::ReassignOwner {
             account: 0,
             owner: [0x55; 32],
         },
+        Action::ReadOwner { account: 0 },
+    ];
+    for writable in [false, true] {
+        for owner in [PROGRAM_ID, [0x77; 32]] {
+            let mut account = Account::owned(&[1]);
+            account.writable = writable;
+            account.owner = owner;
+            let mut input = Input::new(
+                &[Entry::Account(account)],
+                &encode_actions(&actions).unwrap(),
+            );
+            let outcome = execute(&mut input);
+            assert_eq!(outcome.status, 0);
+            assert_eq!(input.data(0), &[9, 0]);
+            assert_eq!(input.lamports(0), 999_998);
+            assert_eq!(record(&outcome.return_data).result, &[0x55; 32]);
+            assert!(outcome.logs.iter().all(|bytes| record(bytes).status == 0));
+        }
+    }
+    // This synthetic VM does not enforce account reconciliation. These asserts
+    // describe the interpreter's local writes, not validator acceptance.
+}
+
+#[test]
+fn malformed_streams_stop_successfully_without_partial_payload_writes() {
+    let encoded = encode_actions(&[Action::WriteData {
+        account: 0,
+        offset: 0,
+        bytes: vec![9],
+    }])
+    .unwrap();
+    for malformed in [
+        b"BAD!".to_vec(),
+        b"ACI1\x05".to_vec(),
+        encoded[..encoded.len() - 1].to_vec(),
+    ] {
+        let mut input = Input::new(&[Entry::Account(Account::owned(&[1]))], &malformed);
+        let before = input.bytes.clone();
+        let outcome = execute(&mut input);
+        assert_eq!(outcome.status, 0);
+        assert_eq!(outcome.logs.len(), 1);
+        assert_eq!(record(&outcome.return_data).status, 1);
+        assert_eq!(input.bytes, before);
+    }
+}
+
+#[test]
+fn executable_lifecycle_requests_are_unavailable_and_the_sequence_continues() {
+    let actions = [
+        Action::MarkExecutable { account: 0 },
+        Action::RemoveExecutable { account: 0 },
+        Action::ReadExecutable { account: 0 },
+    ];
+    for executable in [false, true] {
+        let mut account = Account::owned(&[]);
+        account.executable = executable;
+        let mut input = Input::new(
+            &[Entry::Account(account)],
+            &encode_actions(&actions).unwrap(),
+        );
+        let outcome = execute(&mut input);
+        assert_eq!(outcome.status, 0);
+        assert_eq!(outcome.logs.len(), 3);
+        assert_eq!(record(&outcome.logs[0]).status, 2);
+        assert_eq!(record(&outcome.logs[1]).status, 2);
+        let last = record(&outcome.return_data);
+        assert_eq!((last.step, last.status), (2, 0));
+        assert_eq!(last.result, &[executable as u8]);
+    }
+}
+
+#[test]
+fn owner_reassignment_with_nonzero_data_does_not_gate_subsequent_actions() {
+    let actions = [
+        Action::ReassignOwner {
+            account: 0,
+            owner: [0x55; 32],
+        },
+        Action::WriteData {
+            account: 0,
+            offset: 0,
+            bytes: vec![9],
+        },
+        Action::ResizeZero { account: 0 },
         Action::ResizeGrow {
             account: 0,
             amount: 1,
@@ -465,16 +538,15 @@ fn clearing_data_allows_owner_reassignment_and_prevents_old_owner_writes() {
         &encode_actions(&actions).unwrap(),
     );
     let outcome = execute(&mut input);
-    assert_eq!(outcome.status, 0xAC0105);
-    assert!(input.data(0).is_empty());
+    assert_eq!(outcome.status, 0);
+    assert_eq!(input.data(0), &[0]);
     let owner = input.layouts[0].owner;
     assert_eq!(&input.bytes[owner..owner + 32], &[0x55; 32]);
-    // The preceding mutations intentionally remain visible in this VM input.
-    // A validator is responsible for rolling back a failed transaction.
+    assert!(outcome.logs.iter().all(|bytes| record(bytes).status == 0));
 }
 
 #[test]
-fn zero_lamports_can_be_balanced_and_arithmetic_errors_preserve_balances() {
+fn zero_lamports_and_unsigned_arithmetic_write_raw_balances() {
     let mut destination = Account::owned(&[]);
     destination.address = [0x22; 32];
     let actions = [
@@ -493,15 +565,16 @@ fn zero_lamports_can_be_balanced_and_arithmetic_errors_preserve_balances() {
     );
     assert_eq!(execute(&mut input).status, 0);
     assert_eq!((input.lamports(0), input.lamports(1)), (0, 2_000_000));
-    // This checks the program's buffer writes, not runtime deletion at commit.
+    // This checks buffer writes, not runtime deletion at commit.
 
-    for (starting_balance, action) in [
+    for (starting_balance, action, expected) in [
         (
             0,
             Action::DebitLamports {
                 account: 0,
                 amount: 1,
             },
+            u64::MAX,
         ),
         (
             u64::MAX,
@@ -509,55 +582,163 @@ fn zero_lamports_can_be_balanced_and_arithmetic_errors_preserve_balances() {
                 account: 0,
                 amount: 1,
             },
+            0,
         ),
     ] {
         let mut account = Account::owned(&[]);
         account.lamports = starting_balance;
         let mut input = Input::new(
             &[Entry::Account(account)],
-            &encode_actions(&[action]).unwrap(),
+            &encode_actions(&[action, Action::ReadLamports { account: 0 }]).unwrap(),
         );
-        let before = input.bytes.clone();
         let outcome = execute(&mut input);
-        assert_eq!(outcome.status, 0xAC0107);
-        assert_eq!(record(&outcome.return_data).status, 0xAC0107);
-        assert_eq!(input.bytes, before);
+        assert_eq!(outcome.status, 0);
+        assert_eq!(record(&outcome.logs[0]).status, 0);
+        assert_eq!(input.lamports(0), expected);
+        assert_eq!(record(&outcome.return_data).result, &expected.to_le_bytes());
     }
 }
 
 #[test]
-fn growth_limit_is_inclusive_and_rejection_preserves_the_input() {
-    for (amount, expected) in [(10_240, 0), (10_241, 0xAC0108)] {
+fn logical_growth_is_recorded_beyond_slack_without_overwriting_adjacent_memory() {
+    for amount in [10_240, 10_241, 10 * 1024 * 1024] {
         let action = Action::ResizeGrow { account: 0, amount };
         let mut input = Input::new(
             &[Entry::Account(Account::owned(&[7]))],
             &encode_actions(&[action]).unwrap(),
         );
-        let before = input.bytes.clone();
+        let layout = input.layouts[0];
+        let physical_end = layout.data + layout.capacity;
+        let following = input.bytes[physical_end..].to_vec();
         let outcome = execute(&mut input);
-        assert_eq!(outcome.status, expected);
-        assert_eq!(record(&outcome.return_data).status, expected);
-        if expected == 0 {
-            assert_eq!(input.data(0).len(), 10_241);
-            assert_eq!(input.data(0)[0], 7);
-            assert!(input.data(0)[1..].iter().all(|byte| *byte == 0));
-        } else {
-            assert_eq!(input.bytes, before);
-        }
+        assert_eq!(outcome.status, 0);
+        assert_eq!(record(&outcome.return_data).status, 0);
+        assert_eq!(input.data_len(0), 1 + u64::from(amount));
+        assert_eq!(input.physical_data(0)[0], 7);
+        assert!(input.physical_data(0)[1..].iter().all(|byte| *byte == 0));
+        assert_eq!(input.bytes[physical_end..], following);
     }
 }
 
 #[test]
-fn unknown_opcode_and_missing_account_are_rejected_without_mutations() {
+fn shrinking_below_zero_wraps_logical_length_and_refreshes_duplicate_entries() {
+    let actions = [
+        Action::ResizeShrink {
+            account: 0,
+            amount: 2,
+        },
+        Action::ResizeGrow {
+            account: 1,
+            amount: 2,
+        },
+        Action::ReadData {
+            account: 0,
+            offset: 0,
+            len: 1,
+        },
+    ];
+    let mut input = Input::new(
+        &[Entry::Account(Account::owned(&[7])), Entry::Duplicate(0)],
+        &encode_actions(&actions).unwrap(),
+    );
+    let outcome = execute(&mut input);
+    assert_eq!(outcome.status, 0);
+    assert_eq!(input.data_len(0), 1);
+    assert_eq!(input.data_len(1), 1);
+    assert_eq!(input.data(0), &[7]);
+    assert_eq!(record(&outcome.return_data).result, &[7]);
+    assert!(outcome.logs.iter().all(|bytes| record(bytes).status == 0));
+}
+
+#[test]
+fn data_access_uses_physical_capacity_and_skips_unsafe_memory_ranges() {
+    let actions = [
+        Action::WriteData {
+            account: 0,
+            offset: 1,
+            bytes: vec![9],
+        },
+        Action::ReadData {
+            account: 0,
+            offset: 1,
+            len: 1,
+        },
+        Action::ResizeGrow {
+            account: 0,
+            amount: 10 * 1024 * 1024,
+        },
+        Action::WriteData {
+            account: 0,
+            offset: 1 + GROWTH_SLACK as u32,
+            bytes: vec![99],
+        },
+        Action::ReadData {
+            account: 0,
+            offset: 1 + GROWTH_SLACK as u32,
+            len: 1,
+        },
+        Action::ReadAddress { account: 0 },
+    ];
+    let mut input = Input::new(
+        &[Entry::Account(Account::owned(&[7]))],
+        &encode_actions(&actions).unwrap(),
+    );
+    let layout = input.layouts[0];
+    let physical_end = layout.data + layout.capacity;
+    let following = input.bytes[physical_end..].to_vec();
+    let outcome = execute(&mut input);
+    assert_eq!(outcome.status, 0);
+    assert_eq!(outcome.logs.len(), actions.len());
+    assert_eq!(record(&outcome.logs[0]).status, 0);
+    assert_eq!(record(&outcome.logs[1]).result, &[9]);
+    assert_eq!(record(&outcome.logs[3]).status, 1);
+    assert_eq!(record(&outcome.logs[4]).status, 1);
+    assert_eq!(record(&outcome.return_data).result, &[0x11; 32]);
+    assert_eq!(input.bytes[physical_end..], following);
+}
+
+#[test]
+fn unknown_opcode_missing_account_and_bad_payload_skip_then_continue() {
     let mut unknown = encode_actions(&[Action::ReadAddress { account: 0 }]).unwrap();
     unknown[4] = 0xff;
     let missing = encode_actions(&[Action::ReadAddress { account: 1 }]).unwrap();
-    for (encoded, expected) in [(unknown, 0xAC0102), (missing, 0xAC0103)] {
+    let mut bad_payload = b"ACI1".to_vec();
+    bad_payload.extend_from_slice(&[0, 0, 1, 0, 42]); // read_address expects no payload
+    for mut encoded in [unknown, missing, bad_payload] {
+        let tail = encode_actions(&[Action::ReadLamports { account: 0 }]).unwrap();
+        encoded.extend_from_slice(&tail[4..]);
         let mut input = Input::new(&[Entry::Account(Account::owned(&[7]))], &encoded);
         let before = input.bytes.clone();
         let outcome = execute(&mut input);
-        assert_eq!(outcome.status, expected);
-        assert_eq!(record(&outcome.return_data).status, expected);
+        assert_eq!(outcome.status, 0);
+        assert_eq!(outcome.logs.len(), 2);
+        assert_eq!(record(&outcome.logs[0]).status, 1);
+        let last = record(&outcome.return_data);
+        assert_eq!((last.step, last.status), (1, 0));
+        assert_eq!(last.result, &1_000_000u64.to_le_bytes());
         assert_eq!(input.bytes, before);
     }
+}
+
+#[test]
+fn oversized_observation_is_skipped_and_does_not_stop_the_sequence() {
+    let mut encoded = encode_actions(&[
+        Action::ReadData {
+            account: 0,
+            offset: 0,
+            len: 512,
+        },
+        Action::ReadLamports { account: 0 },
+    ])
+    .unwrap();
+    encoded[12..16].copy_from_slice(&513u32.to_le_bytes());
+    let mut input = Input::new(&[Entry::Account(Account::owned(&vec![7; 513]))], &encoded);
+    let outcome = execute(&mut input);
+    assert_eq!(outcome.status, 0);
+    assert_eq!(outcome.logs.len(), 2);
+    assert_eq!(record(&outcome.logs[0]).status, 1);
+    assert_eq!(
+        record(&outcome.return_data).result,
+        &1_000_000u64.to_le_bytes()
+    );
 }

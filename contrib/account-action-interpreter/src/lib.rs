@@ -8,7 +8,6 @@ use std::{io, path::Path};
 
 pub const MAGIC: &[u8; 4] = b"ACI1";
 pub const MAX_READ_BYTES: u32 = 512;
-pub const MAX_ACTIONS: usize = 256;
 
 /// Account indices refer to the instruction's account list, including aliases.
 /// Integer operands use little-endian encoding. Grow/shrink take byte deltas.
@@ -117,9 +116,6 @@ impl Action {
 /// An empty stream is a successful no-op. The runtime still limits transaction
 /// and instruction size; the encoder does not pack or submit transactions.
 pub fn encode_actions(actions: &[Action]) -> Result<Vec<u8>, String> {
-    if actions.len() > MAX_ACTIONS {
-        return Err(format!("at most {MAX_ACTIONS} actions per invocation"));
-    }
     let mut out = MAGIC.to_vec();
     for action in actions {
         let mut payload = Vec::new();
@@ -204,7 +200,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_operands_are_rejected() {
+    fn wire_and_output_bounds_are_checked_without_an_action_count_limit() {
         assert!(
             encode_actions(&[Action::ReadData {
                 account: 0,
@@ -221,7 +217,7 @@ mod tests {
             }])
             .is_err()
         );
-        assert!(encode_actions(&vec![Action::ReadOwner { account: 0 }; MAX_ACTIONS + 1]).is_err());
+        assert!(encode_actions(&vec![Action::ReadOwner { account: 0 }; 257]).is_ok());
         assert_eq!(encode_actions(&[]).unwrap(), MAGIC);
     }
 }

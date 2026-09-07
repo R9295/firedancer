@@ -101,6 +101,12 @@ fn decode_result(data: &[u8]) -> Result<Value, String> {
         "action": name,
         "account": account,
         "status": status,
+        "outcome": match status {
+            0 => "applied",
+            1 => "skipped",
+            2 => "unavailable",
+            _ => "unknown",
+        },
         "payload_hex": hex(payload),
     });
     if status == 0 {
@@ -178,12 +184,16 @@ mod tests {
         assert!(decode_result(&record(4, 0, &[2])).is_err());
         assert!(decode_result(&record(0, 0, &[])).is_err());
         assert_eq!(decode_result(&record(4, 0, &[1])).unwrap()["value"], true);
-        // A failed read has no value to decode and may carry an empty payload.
+        // A skipped read has no value; this is not an instruction error code.
         assert!(
-            decode_result(&record(1, 42, &[]))
+            decode_result(&record(1, 1, &[]))
                 .unwrap()
                 .get("value")
                 .is_none()
+        );
+        assert_eq!(
+            decode_result(&record(13, 2, &[])).unwrap()["outcome"],
+            "unavailable"
         );
     }
 }
