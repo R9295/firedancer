@@ -1,5 +1,7 @@
 //! Execute instruction fixtures through solfuzz-agave's protobuf C ABI.
 
+pub mod fuzz;
+
 use prost::Message;
 use protosol::protos::{InstrContext, InstrEffects};
 use std::{error::Error, io, sync::Mutex};
