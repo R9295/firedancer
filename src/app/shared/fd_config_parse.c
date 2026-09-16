@@ -135,6 +135,10 @@ fd_config_extract_podf( uchar *        pod,
   CFG_POP      ( bool,   development.fixed_fec_sets                          );
   CFG_POP      ( bool,   development.alpenglow                               );
 
+  CFG_POP      ( ulong,  development.runtime.max_stake_accounts              );
+  CFG_POP      ( ulong,  development.runtime.max_stake_accounts_fallback     );
+  CFG_POP      ( ulong,  development.runtime.max_vote_accounts               );
+
   CFG_POP      ( ushort, development.votor.quic_client_listen_port           );
   CFG_POP      ( ushort, development.votor.quic_server_listen_port           );
 

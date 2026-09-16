@@ -317,9 +317,12 @@ fd_topo_huge_page_cnt( fd_topo_t const * topo,
     }
   }
 
-  /* The stack huge pages are also placed in the hugetlbfs. */
+  /* Match initialize_stacks: floating tiles use CPU 0.  Each stack is
+     allocated on just one NUMA node, not on every node. */
   for( ulong i=0UL; i<topo->tile_cnt; i++ ) {
-    result += fd_topo_tile_extra_huge_pages( &topo->tiles[ i ] );
+    fd_topo_tile_t const * tile = &topo->tiles[ i ];
+    ulong stack_cpu_idx = tile->cpu_idx<65535UL ? tile->cpu_idx : 0UL;
+    if( fd_shmem_numa_idx( stack_cpu_idx )==numa_idx ) result += fd_topo_tile_extra_huge_pages( tile );
   }
 
   /* No anonymous huge pages in use yet. */

@@ -415,6 +415,9 @@ fd_config_fill( fd_config_t * config,
     if( FD_UNLIKELY( config->development.bench.max_shreds_per_block ) )          FD_LOG_ERR(( "trying to join a live cluster, but configuration sets [development.bench.max_shreds_per_block] which is a development only feature" ));
     if( FD_UNLIKELY( config->development.bench.disable_blockstore_from_slot ) )  FD_LOG_ERR(( "trying to join a live cluster, but configuration has a non-zero value for [development.bench.disable_blockstore_from_slot] which is a development only feature" ));
     if( FD_UNLIKELY( config->development.bench.disable_status_cache ) )          FD_LOG_ERR(( "trying to join a live cluster, but configuration enables [development.bench.disable_status_cache] which is a development only feature" ));
+    if( FD_UNLIKELY( config->is_firedancer && config->firedancer.development.runtime.max_stake_accounts ) ) FD_LOG_ERR(( "trying to join a live cluster, but configuration sets [development.runtime.max_stake_accounts] which is a development only feature" ));
+    if( FD_UNLIKELY( config->is_firedancer && config->firedancer.development.runtime.max_stake_accounts_fallback ) ) FD_LOG_ERR(( "trying to join a live cluster, but configuration sets [development.runtime.max_stake_accounts_fallback] which is a development only feature" ));
+    if( FD_UNLIKELY( config->is_firedancer && config->firedancer.development.runtime.max_vote_accounts ) )  FD_LOG_ERR(( "trying to join a live cluster, but configuration sets [development.runtime.max_vote_accounts] which is a development only feature" ));
   }
 
   /* When running a local cluster, some options are overridden by default

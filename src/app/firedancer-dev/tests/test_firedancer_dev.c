@@ -11,6 +11,7 @@
 #include "../../shared_dev/commands/wksp.h"
 #include "../../shared_dev/commands/dev.h"
 #include "../../../discof/genesis/fd_genesi_tile.h"
+#include "fd_test_child.h"
 
 #include <errno.h>
 #include <unistd.h>
@@ -19,12 +20,6 @@
 #include <sched.h>
 #include <sys/wait.h>
 #include <sys/mman.h>
-
-struct child_info {
-  char const * name;
-  int          pipefd;
-  int          pid;
-};
 
 static int
 firedancer_dev_configure( config_t * config,
@@ -105,57 +100,6 @@ firedancer_dev_dev( config_t * config,
   FD_TEST( !fd_cap_chk_err_cnt( chk ) );
   dev_cmd_fn( &args, config, NULL );
   return 0;
-}
-
-static struct child_info
-fork_child( char const * name,
-            config_t * config,
-            int (* child)( config_t * config, int pipefd ) ) {
-  int pipefd[2] = {0};
-  if( FD_UNLIKELY( -1==pipe( pipefd ) ) ) FD_LOG_ERR(( "pipe failed (%i-%s)", errno, fd_io_strerror( errno ) ));
-  int pid = fork();
-  if( FD_UNLIKELY( -1==pid ) ) FD_LOG_ERR(( "fork failed (%i-%s)", errno, fd_io_strerror( errno ) ));
-  if( !pid ) {
-    if( FD_UNLIKELY( -1==close( pipefd[ 0 ] ) ) ) FD_LOG_ERR(( "close failed (%i-%s)", errno, fd_io_strerror( errno ) ));
-    int result = child( config, pipefd[ 1 ] );
-    fd_sys_util_exit_group( result );
-  }
-  if( FD_UNLIKELY( -1==close( pipefd[ 1 ] ) ) ) FD_LOG_ERR(( "close failed (%i-%s)", errno, fd_io_strerror( errno ) ));
-  return (struct child_info){ .name = name, .pipefd = pipefd[ 0 ], .pid = pid };
-}
-
-static ulong
-wait_children( struct child_info * children,
-               ulong               children_cnt,
-               ulong               timeout_seconds ) {
-  struct pollfd pfd[ 256 ];
-  FD_TEST( children_cnt<=256 );
-  for( ulong i=0; i<children_cnt; i++ ) {
-    pfd[ i ] = (struct pollfd){
-      .fd      = children[ i ].pipefd,
-      .events  = 0,
-    };
-  }
-
-  int exited_child_cnt = poll( pfd, children_cnt, (int)(timeout_seconds*1000UL) );
-  if( FD_UNLIKELY( -1==exited_child_cnt ) ) FD_LOG_ERR(( "poll failed (%i-%s)", errno, fd_io_strerror( errno ) ));
-  if( FD_UNLIKELY( !exited_child_cnt ) ) FD_LOG_ERR(( "`%s` timed out", children[ 0 ].name ));
-
-  ulong exited_child;
-  for( exited_child=0; exited_child<children_cnt; exited_child++ ) {
-    if( FD_UNLIKELY( pfd[ exited_child ].revents & POLLHUP ) ) break;
-  }
-  FD_TEST( exited_child<children_cnt );
-
-  int wstatus;
-  int exited_pid = waitpid( children[ exited_child ].pid, &wstatus, __WALL );
-  if( FD_UNLIKELY( -1==exited_pid ) ) FD_LOG_ERR(( "waitpid failed (%i-%s)", errno, fd_io_strerror( errno ) ));
-  else if( FD_UNLIKELY( !exited_pid ) ) FD_LOG_ERR(( "`%s` did not exit", children[ exited_child ].name ));
-  else if( FD_UNLIKELY( !WIFEXITED( wstatus ) ) ) FD_LOG_ERR(( "`%s` failed with signal %d (%s)", children[ exited_child ].name, WTERMSIG( wstatus ), strsignal( WTERMSIG( wstatus ) ) ));
-  else if( FD_UNLIKELY( WEXITSTATUS( wstatus ) ) ) FD_LOG_ERR(( "`%s` failed with status %d", children[ exited_child ].name, WEXITSTATUS( wstatus ) ));
-
-  if( FD_UNLIKELY( -1==close( children[ exited_child ].pipefd ) ) ) FD_LOG_ERR(( "close failed (%i-%s)", errno, fd_io_strerror( errno ) ));
-  return exited_child;
 }
 
 static void

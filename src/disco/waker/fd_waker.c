@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <sched.h>
 #include <stdlib.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/epoll.h>
 #include <sys/syscall.h>
@@ -17,9 +18,35 @@
    unpatched v5.5-v5.12), and (b) EPOLL_CTL_MOD re-polls, so a rearm
    with readiness pending re-fires (what makes clear/drain/rearm
    lost-wake-proof).  (a) only shows with a sleeping waiter, so fork
-   a child that waits until /proc/<parent>/syscall shows us blocked
+   a child that waits until the parent's procfs syscall file shows us blocked
    in epoll_pwait, then makes an inner fd ready, and require the
    wake.  Runs once pre-fork; logs err on a broken kernel. */
+
+static int
+self_test_wait_blocked( int syscall_fd ) {
+  if( FD_UNLIKELY( -1==syscall_fd ) ) return 0;
+
+  /* Bound observation by elapsed time, not an iteration count: a slow
+     or restricted procfs must not consume the parent's 2 second wait. */
+  struct timespec start, now;
+  if( FD_UNLIKELY( clock_gettime( CLOCK_MONOTONIC, &start ) ) ) return 0;
+  do {
+    char buf[ 64 ];
+    long rd = pread( syscall_fd, buf, sizeof(buf)-1UL, 0 );
+    if( FD_UNLIKELY( rd<=0L ) ) return 0;
+    buf[ rd ] = '\0';
+    char * end;
+    long nr = strtol( buf, &end, 10 );
+    int is_epoll_wait = nr==__NR_epoll_pwait;
+#ifdef __NR_epoll_wait
+    is_epoll_wait |= nr==__NR_epoll_wait;
+#endif
+    if( FD_LIKELY( end!=buf && is_epoll_wait ) ) return 1;
+    sched_yield();
+    if( FD_UNLIKELY( clock_gettime( CLOCK_MONOTONIC, &now ) ) ) return 0;
+  } while( (now.tv_sec-start.tv_sec)*1000000000L+now.tv_nsec-start.tv_nsec<100000000L );
+  return 0;
+}
 
 static void
 self_test( void ) {
@@ -35,36 +62,31 @@ self_test( void ) {
   ev = (struct epoll_event){ .events = EPOLLIN|EPOLLONESHOT };
   if( FD_UNLIKELY( -1==epoll_ctl( outer, EPOLL_CTL_ADD, inner, &ev ) ) ) FD_LOG_ERR(( "epoll_ctl(ADD) failed (%i-%s)", errno, fd_io_strerror( errno ) ));
 
-  char path[ 32 ];
-  FD_TEST( fd_cstr_printf_check( path, sizeof(path), NULL, "/proc/%d/syscall", (int)getpid() ) );
+  /* Open before fork, so the inherited fd refers to this thread even
+     when /proc belongs to an ancestor PID namespace.  A path formed
+     from getpid() can refer to an unrelated host process instead. */
+  int syscall_fd = open( "/proc/thread-self/syscall", O_RDONLY|O_CLOEXEC );
 
   pid_t pid = fork();
   if( FD_UNLIKELY( -1==pid ) ) FD_LOG_ERR(( "fork() failed (%i-%s)", errno, fd_io_strerror( errno ) ));
   if( FD_UNLIKELY( !pid ) ) {
-    /* child: spin until the parent is observably blocked in the outer
-       epoll_pwait (first field of /proc/<pid>/syscall is the syscall
-       number, or "running"), then make the inner fd ready.  Bounded;
-       on exhaustion write anyway and report the coverage as
-       unconfirmed (exit 2). */
-    int blocked = 0;
-    for( ulong i=0UL; i<1000000UL; i++ ) {
-      int fd = open( path, O_RDONLY );
-      if( FD_UNLIKELY( -1==fd ) ) break;
-      char buf[ 64 ];
-      long rd = read( fd, buf, sizeof(buf)-1UL );
-      close( fd );
-      if( FD_UNLIKELY( rd<=0L ) ) break;
-      buf[ rd ] = '\0';
-      long nr = strtol( buf, NULL, 10 );
-      int is_epoll_wait = nr==__NR_epoll_pwait;
-#ifdef __NR_epoll_wait
-      is_epoll_wait |= nr==__NR_epoll_wait;
-#endif
-      if( FD_LIKELY( is_epoll_wait ) ) { blocked = 1; break; }
-      sched_yield();
+    int blocked = self_test_wait_blocked( syscall_fd );
+    if( FD_UNLIKELY( !blocked ) ) {
+      /* Give the parent time to block when procfs observation is not
+         available.  Still exercise the wake, but report coverage as
+         unconfirmed (exit 2). */
+      struct timespec delay = { .tv_nsec = 10000000L };
+      while( nanosleep( &delay, &delay ) ) {
+        if( FD_UNLIKELY( errno!=EINTR ) ) _exit( 1 );
+      }
     }
-    long n = write( pfd[ 1 ], "x", 1UL );
+    long n;
+    do n = write( pfd[ 1 ], "x", 1UL );
+    while( FD_UNLIKELY( -1L==n && errno==EINTR ) );
     _exit( 1L!=n ? 1 : ( blocked ? 0 : 2 ) );
+  }
+  if( FD_LIKELY( -1!=syscall_fd ) ) {
+    if( FD_UNLIKELY( close( syscall_fd ) ) ) FD_LOG_ERR(( "close() failed (%i-%s)", errno, fd_io_strerror( errno ) ));
   }
 
   int n;
@@ -72,15 +94,17 @@ self_test( void ) {
   while( FD_UNLIKELY( -1==n && errno==EINTR ) );
   if( FD_UNLIKELY( -1==n ) ) FD_LOG_ERR(( "epoll_pwait() failed (%i-%s)", errno, fd_io_strerror( errno ) ));
   int wstatus;
-  if( FD_UNLIKELY( pid!=waitpid( pid, &wstatus, 0 ) ) ) FD_LOG_ERR(( "waitpid() failed (%i-%s)", errno, fd_io_strerror( errno ) ));
+  pid_t waited;
+  do waited = waitpid( pid, &wstatus, 0 );
+  while( FD_UNLIKELY( -1==waited && errno==EINTR ) );
+  if( FD_UNLIKELY( pid!=waited ) ) FD_LOG_ERR(( "waitpid() failed (%i-%s)", errno, fd_io_strerror( errno ) ));
   if( FD_UNLIKELY( !WIFEXITED( wstatus ) || WEXITSTATUS( wstatus )==1 ) ) FD_LOG_ERR(( "waker self test child failed" ));
   if( FD_UNLIKELY( WEXITSTATUS( wstatus )==2 ) )
-    FD_LOG_WARNING(( "waker self test could not observe the parent blocked in epoll_pwait via %s; blocked-waiter coverage unconfirmed", path ));
+    FD_LOG_WARNING(( "waker self test could not observe the parent blocked in epoll_pwait via its procfs syscall fd; blocked-waiter coverage unconfirmed" ));
   if( FD_UNLIKELY( 1!=n ) )
-    FD_LOG_ERR(( "waker self test failed: an event inside a nested epoll set did not wake a blocked "
-                 "epoll_wait on the outer set.  This kernel is missing the nested-epoll wakeup fixes "
-                 "(present in v5.13+ and in the 5.4.y/5.10.y stable series); the waker tile would "
-                 "lose wakes on it." ));
+    FD_LOG_ERR(( "waker self test failed: nested-epoll event was not delivered within 2 seconds "
+                 "(blocked waiter %s); check process scheduling and kernel nested-epoll wakeup support",
+                 WEXITSTATUS( wstatus )==0 ? "observed" : "unconfirmed" ));
 
   /* (b) entry now disarmed, inner set still ready (byte unread):
      must stay silent until the MOD rearm re-fires it. */

@@ -69,6 +69,8 @@ test_stem_publish( ulong out_idx, ulong sig, ulong chunk, ulong sz ) {
 #include "../../ballet/bmtree/fd_bmtree.h"
 #include "../../ballet/sha256/fd_sha256.h"
 
+#include <sys/mman.h>
+
 /* ---------------------------------------------------------------------
    Request log: every packet the tile sends on repair_net, parsed. */
 
@@ -2628,10 +2630,29 @@ int
 main( int argc, char ** argv ) {
   fd_boot( &argc, &argv );
 
+  int          lazy    = fd_env_strip_cmdline_contains( &argc, &argv, "--lazy" );
   char const * _page_sz = fd_env_strip_cmdline_cstr ( &argc, &argv, "--page-sz",  NULL, "gigantic"               );
   ulong        page_cnt = fd_env_strip_cmdline_ulong( &argc, &argv, "--page-cnt", NULL, 1UL                      );
   ulong        numa_idx = fd_env_strip_cmdline_ulong( &argc, &argv, "--numa-idx", NULL, fd_shmem_numa_idx( 0UL ) );
-  fd_wksp_t * wksp      = fd_wksp_new_anonymous( fd_cstr_to_shmem_page_sz( _page_sz ), page_cnt, fd_shmem_cpu_idx( numa_idx ), "wksp", 0UL );
+  /* Unit tests can use pageable memory on hosts without huge pages or
+     a large memlock allowance.  Keep the same workspace capacity. */
+  ulong page_sz = fd_cstr_to_shmem_page_sz( _page_sz );
+  FD_TEST( page_sz && page_cnt && page_cnt<=ULONG_MAX/page_sz );
+  ulong footprint = page_cnt*page_sz;
+  void * mem = NULL;
+  fd_wksp_t * wksp;
+  if( lazy ) {
+    mem = mmap( NULL, footprint, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0 );
+    FD_TEST( mem!=MAP_FAILED );
+    ulong part_max = fd_wksp_part_max_est( footprint, 64UL<<10 );
+    ulong data_max = fd_wksp_data_max_est( footprint, part_max );
+    wksp = fd_wksp_join( fd_wksp_new( mem, "wksp", 0U, part_max, data_max ) );
+    FD_TEST( wksp );
+    FD_TEST( !fd_shmem_join_anonymous( "wksp", FD_SHMEM_JOIN_MODE_READ_WRITE, wksp, mem,
+                                      FD_SHMEM_NORMAL_PAGE_SZ, footprint/FD_SHMEM_NORMAL_PAGE_SZ ) );
+  } else {
+    wksp = fd_wksp_new_anonymous( page_sz, page_cnt, fd_shmem_cpu_idx( numa_idx ), "wksp", 0UL );
+  }
   FD_TEST( wksp );
 
   test_turbine_shreds( wksp );
@@ -2678,6 +2699,14 @@ main( int argc, char ** argv ) {
 
   fd_wksp_reset( wksp, 1U );
   test_slot_complete_before_trailing_fec( wksp );
+
+  if( lazy ) {
+    FD_TEST( !fd_shmem_leave_anonymous( wksp, NULL ) );
+    FD_TEST( fd_wksp_delete( fd_wksp_leave( wksp ) )==mem );
+    FD_TEST( !munmap( mem, footprint ) );
+  } else {
+    fd_wksp_delete_anonymous( wksp );
+  }
 
   FD_LOG_NOTICE(( "pass" ));
   fd_halt();

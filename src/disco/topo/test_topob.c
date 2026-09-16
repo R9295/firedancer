@@ -684,6 +684,34 @@ FD_UNIT_TEST( test_parse_affinity_bounds ) {
 
 /* ======================================================================== */
 
+FD_UNIT_TEST( test_huge_page_stack_numa ) {
+  static fd_topo_t topo;
+  memset( &topo, 0, sizeof(topo) );
+  ulong numa_cnt = fd_shmem_numa_cnt();
+  ulong stack_pages = FD_TILE_PRIVATE_STACK_SZ/FD_SHMEM_HUGE_PAGE_SZ+2UL;
+  topo.tile_cnt = numa_cnt+2UL;
+  for( ulong i=0UL; i<numa_cnt; i++ ) topo.tiles[ i ].cpu_idx = fd_shmem_cpu_idx( i );
+  topo.tiles[ numa_cnt   ].cpu_idx = ULONG_MAX;
+  topo.tiles[ numa_cnt+1 ].cpu_idx = USHRT_MAX;
+  topo.wksp_cnt = 2UL;
+  topo.workspaces[ 0 ].numa_idx = 0UL;
+  topo.workspaces[ 0 ].page_sz  = FD_SHMEM_HUGE_PAGE_SZ;
+  topo.workspaces[ 0 ].page_cnt = 17UL;
+  topo.workspaces[ 1 ].numa_idx = numa_cnt-1UL;
+  topo.workspaces[ 1 ].page_sz  = FD_SHMEM_GIGANTIC_PAGE_SZ;
+  topo.workspaces[ 1 ].page_cnt = 3UL;
+
+  ulong total = 0UL;
+  for( ulong i=0UL; i<numa_cnt; i++ ) {
+    ulong expected = stack_pages + (i==fd_shmem_numa_idx( 0UL ) ? 2UL*stack_pages : 0UL) + (i==0UL ? 17UL : 0UL);
+    FD_TEST( fd_topo_huge_page_cnt( &topo, i, 0 )==expected );
+    FD_TEST( fd_topo_huge_page_cnt( &topo, i, 1 )==expected );
+    total += expected;
+  }
+  FD_TEST( total==17UL+topo.tile_cnt*stack_pages );
+  FD_TEST( !fd_topo_huge_page_cnt( &topo, numa_cnt, 0 ) );
+}
+
 int
 main( int     argc,
       char ** argv ) {

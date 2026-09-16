@@ -452,6 +452,11 @@ fd_config_to_json( fd_config_t const * config,
     jw_bool( &w, "hard_fork_fatal", f->development.hard_fork_fatal );
     jw_bool( &w, "fixed_fec_sets",  f->development.fixed_fec_sets );
     jw_bool( &w, "alpenglow",       f->development.alpenglow );
+    jw_obj_open( &w, "runtime" );
+      jw_ulong( &w, "max_stake_accounts", f->development.runtime.max_stake_accounts );
+      jw_ulong( &w, "max_stake_accounts_fallback", f->development.runtime.max_stake_accounts_fallback );
+      jw_ulong( &w, "max_vote_accounts",  f->development.runtime.max_vote_accounts );
+    jw_obj_close( &w );
     jw_obj_open( &w, "votor" );
       jw_ulong( &w, "quic_client_listen_port", f->development.votor.quic_client_listen_port );
       jw_ulong( &w, "quic_server_listen_port", f->development.votor.quic_server_listen_port );

@@ -1955,6 +1955,33 @@ telemetry = true
     # `firedancer-dev`.
     alpenglow = false
 
+    [development.runtime]
+        # The `banks` workspace holds, for every live bank, the stake
+        # delegations, vote stakes, epoch leader schedules and stake
+        # rewards of the whole cluster.  It is therefore sized by how
+        # many stake and vote accounts the cluster could have, not by
+        # how many it does have, and on mainnet parameters that is
+        # several gigabytes even for a validator that only ever sees a
+        # handful of accounts.
+        #
+        # A local development cluster knows its own scale, so these
+        # override the built-in mainnet bounds.  Zero, the default,
+        # keeps the built-in bound.  Setting either below what the
+        # cluster actually has will make the validator exit when the
+        # extra accounts do not fit, so leave headroom.
+        #
+        # These are development only; a validator joining a live
+        # cluster must leave them at zero.
+        max_stake_accounts = 0
+
+        # The dominant term is the pubkey pool, which is sized by the
+        # number of stake accounts the network could ever hold rather
+        # than the number it holds now.  On mainnet parameters that pool
+        # alone is several gigabytes.
+        max_stake_accounts_fallback = 0
+
+        max_vote_accounts = 0
+
     [development.votor]
         # The votor tile makes outgoing QUIC connections from this port
         # to broadcast the votes it produces.  Peers see it as the

@@ -47,6 +47,60 @@ static char const * PAGE_NAMES[ 2 ] = {
   "gigantic"
 };
 
+/* Grow a NUMA-local pool only by its free-page shortfall.  A caller
+   reserving a new mount must also account for global reservations. */
+static void
+reserve_pages( ulong numa_idx,
+               ulong page_kind,
+               ulong required_pages ) {
+  if( !required_pages ) return;
+
+  char free_page_path[ PATH_MAX ];
+  char total_page_path[ PATH_MAX ];
+  FD_TEST( fd_cstr_printf_check( free_page_path,  PATH_MAX, NULL, FREE_HUGE_PAGE_PATH [ page_kind ], numa_idx ) );
+  FD_TEST( fd_cstr_printf_check( total_page_path, PATH_MAX, NULL, TOTAL_HUGE_PAGE_PATH[ page_kind ], numa_idx ) );
+  uint free_pages;
+  if( FD_UNLIKELY( -1==fd_file_util_read_uint( free_page_path, &free_pages ) ) )
+    FD_LOG_ERR(( "could not read `%s` (%i-%s)", free_page_path, errno, fd_io_strerror( errno ) ));
+  if( free_pages>=required_pages ) return;
+
+  uint total_pages;
+  if( FD_UNLIKELY( -1==fd_file_util_read_uint( total_page_path, &total_pages ) ) )
+    FD_LOG_ERR(( "could not read `%s` (%i-%s)", total_page_path, errno, fd_io_strerror( errno ) ));
+  ulong additional_pages = required_pages-free_pages;
+  if( FD_UNLIKELY( additional_pages>UINT_MAX-total_pages ) )
+    FD_LOG_ERR(( "huge-page pool on NUMA node %lu would exceed UINT_MAX pages", numa_idx ));
+  uint target_pages = total_pages+(uint)additional_pages;
+
+  for( int attempt=0; attempt<2; attempt++ ) {
+    FD_LOG_NOTICE(( "%sRUN: `echo \"%u\" > %s`%s", fd_log_style_dim(), target_pages, total_page_path, fd_log_style_normal() ));
+    if( FD_UNLIKELY( -1==fd_file_util_write_uint( total_page_path, target_pages ) ) )
+      FD_LOG_ERR(( "could not increase the number of %s pages on NUMA node %lu (%i-%s)",
+                   PAGE_NAMES[ page_kind ], numa_idx, errno, fd_io_strerror( errno ) ));
+    uint raised_free_pages;
+    if( FD_UNLIKELY( -1==fd_file_util_read_uint( free_page_path, &raised_free_pages ) ) )
+      FD_LOG_ERR(( "could not read `%s` (%i-%s)", free_page_path, errno, fd_io_strerror( errno ) ));
+    if( raised_free_pages>=required_pages ) return;
+    if( attempt ) {
+      FD_LOG_ERR(( "ENOMEM-Out of memory reserving %s pages on NUMA node %lu: need %lu free pages, "
+                   "but only %u are available (initially %u). Ensure the host has enough memory; "
+                   "fragmentation may require reserving huge pages at boot.",
+                   PAGE_NAMES[ page_kind ], numa_idx, required_pages, raised_free_pages, free_pages ));
+    }
+
+    FD_LOG_WARNING(( "ENOMEM reserving %s pages on NUMA node %lu. Compacting memory before trying again.",
+                     PAGE_NAMES[ page_kind ], numa_idx ));
+    char const * paths[] = { "/proc/sys/vm/compact_memory", "/proc/sys/vm/drop_caches", "/proc/sys/vm/compact_memory" };
+    uint values[] = { 1U, 3U, 1U };
+    for( ulong k=0UL; k<3UL; k++ ) {
+      FD_LOG_NOTICE(( "%sRUN: `echo \"%u\" > %s`%s", fd_log_style_dim(), values[ k ], paths[ k ], fd_log_style_normal() ));
+      if( FD_UNLIKELY( -1==fd_file_util_write_uint( paths[ k ], values[ k ] ) ) )
+        FD_LOG_ERR(( "could not write to `%s` (%i-%s)", paths[ k ], errno, fd_io_strerror( errno ) ));
+      FD_TEST( -1!=fd_sys_util_nanosleep( 0, 500000000 ) );
+    }
+  }
+}
+
 static void
 init( config_t const * config ) {
   char const * mount_path[ 2 ] = {
@@ -55,90 +109,61 @@ init( config_t const * config ) {
   };
 
   ulong numa_node_cnt = fd_shmem_numa_cnt();
+  ulong total_required[ 2 ] = {0};
+  ulong preferred_node[ 2 ] = {0};
+  ulong preferred_pages[ 2 ] = {0};
   for( ulong i=0UL; i<numa_node_cnt; i++ ) {
     ulong required_pages[ 2 ] = {
       fd_topo_huge_page_cnt( &config->topo, i, 0 ),
       fd_topo_gigantic_page_cnt( &config->topo, i ),
     };
-
     for( ulong j=0UL; j<2UL; j++ ) {
-      char free_page_path[ PATH_MAX ];
-      FD_TEST( fd_cstr_printf_check( free_page_path, PATH_MAX, NULL, FREE_HUGE_PAGE_PATH[ j ], i ) );
-      uint free_pages;
-      if( FD_UNLIKELY( -1==fd_file_util_read_uint( free_page_path, &free_pages ) ) )
-        FD_LOG_ERR(( "could not read `%s`, please confirm your host is configured for gigantic pages (%i-%s)", free_page_path, errno, fd_io_strerror( errno ) ));
-
-      /* There is a TOCTOU race condition here, but it's not avoidable. There's
-         no way to atomically increment the page count. */
-      FD_TEST( required_pages[ j ]<=UINT_MAX );
-      if( FD_UNLIKELY( free_pages<required_pages[ j ] ) ) {
-        char total_page_path[ PATH_MAX ];
-        FD_TEST( fd_cstr_printf_check( total_page_path, PATH_MAX, NULL, TOTAL_HUGE_PAGE_PATH[ j ], i ) );
-        uint total_pages;
-        if( FD_UNLIKELY( -1==fd_file_util_read_uint( total_page_path, &total_pages ) ) )
-          FD_LOG_ERR(( "could not read `%s`, please confirm your host is configured for gigantic pages (%i-%s)", total_page_path, errno, fd_io_strerror( errno ) ));
-
-        ulong additional_pages_needed = required_pages[ j ]-free_pages;
-
-        FD_LOG_NOTICE(( "%sRUN: `echo \"%u\" > %s`%s", fd_log_style_dim(), (uint)(total_pages+additional_pages_needed), total_page_path , fd_log_style_normal() ));
-        if( FD_UNLIKELY( -1==fd_file_util_write_uint( total_page_path, (uint)(total_pages+additional_pages_needed) ) ) )
-          FD_LOG_ERR(( "could not increase the number of %s pages on NUMA node %lu (%i-%s)", PAGE_NAMES[ j ], i, errno, fd_io_strerror( errno ) ));
-
-        uint raised_free_pages;
-        if( FD_UNLIKELY( -1==fd_file_util_read_uint( free_page_path, &raised_free_pages ) ) )
-          FD_LOG_ERR(( "could not read `%s`, please confirm your host is configured for gigantic pages (%i-%s)", free_page_path, errno, fd_io_strerror( errno ) ));
-
-        if( FD_UNLIKELY( raised_free_pages<required_pages[ j ] ) ) {
-          /* Well.. usually this is due to memory being fragmented,
-             rather than not having enough memory.  See something like
-             https://tatref.github.io/blog/2023-visual-linux-memory-compact/
-             for the sequence we do here. */
-          FD_LOG_WARNING(( "ENOMEM-Out of memory when trying to reserve %s pages for Firedancer on NUMA node %lu. Compacting memory before trying again.",
-                           PAGE_NAMES[ j ],
-                           i ));
-          FD_LOG_NOTICE(( "%sRUN: `echo \"1\" > /proc/sys/vm/compact_memory%s", fd_log_style_dim() , fd_log_style_normal() ));
-          if( FD_UNLIKELY( -1==fd_file_util_write_uint( "/proc/sys/vm/compact_memory", 1 ) ) )
-            FD_LOG_ERR(( "could not write to `%s` (%i-%s)", "/proc/sys/vm/compact_memory", errno, fd_io_strerror( errno ) ));
-          /* Sleep a little to give the OS some time to perform the
-             compaction. */
-          FD_TEST( -1!=fd_sys_util_nanosleep( 0, 500000000 /* 500 millis */ ) );
-          FD_LOG_NOTICE(( "%sRUN: `echo \"3\" > /proc/sys/vm/drop_caches%s", fd_log_style_dim() , fd_log_style_normal() ));
-          if( FD_UNLIKELY( -1==fd_file_util_write_uint( "/proc/sys/vm/drop_caches", 3 ) ) )
-            FD_LOG_ERR(( "could not write to `%s` (%i-%s)", "/proc/sys/vm/drop_caches", errno, fd_io_strerror( errno ) ));
-          FD_TEST( -1!=fd_sys_util_nanosleep( 0, 500000000 /* 500 millis */ ) );
-          FD_LOG_NOTICE(( "%sRUN: `echo \"1\" > /proc/sys/vm/compact_memory%s", fd_log_style_dim() , fd_log_style_normal() ));
-          if( FD_UNLIKELY( -1==fd_file_util_write_uint( "/proc/sys/vm/compact_memory", 1 ) ) )
-            FD_LOG_ERR(( "could not write to `%s` (%i-%s)", "/proc/sys/vm/compact_memory", errno, fd_io_strerror( errno ) ));
-          FD_TEST( -1!=fd_sys_util_nanosleep( 0, 500000000 /* 500 millis */ ) );
-        }
-
-        FD_LOG_NOTICE(( "%sRUN: `echo \"%u\" > %s`%s", fd_log_style_dim(), (uint)(total_pages+additional_pages_needed), total_page_path , fd_log_style_normal() ));
-        if( FD_UNLIKELY( -1==fd_file_util_write_uint( total_page_path, (uint)(total_pages+additional_pages_needed) ) ) )
-          FD_LOG_ERR(( "could not increase the number of %s pages on NUMA node %lu (%i-%s)", PAGE_NAMES[ j ], i, errno, fd_io_strerror( errno ) ));
-        if( FD_UNLIKELY( -1==fd_file_util_read_uint( free_page_path, &raised_free_pages ) ) )
-          FD_LOG_ERR(( "could not read `%s`, please confirm your host is configured for gigantic pages (%i-%s)", free_page_path, errno, fd_io_strerror( errno ) ));
-        if( FD_UNLIKELY( raised_free_pages<required_pages[ j ] ) ) {
-          FD_LOG_ERR(( "ENOMEM-Out of memory when trying to reserve %s pages for Firedancer on NUMA node %lu. Your Firedancer "
-                       "configuration requires %lu GiB of memory total consisting of %lu gigantic (1GiB) pages and %lu huge (2MiB) "
-                       "pages on this NUMA node but only %u %s pages were available according to `%s` (raised from %u). If your "
-                       "system has the required amount of memory, this can be because it is not configured with %s page support, or "
-                       "Firedancer cannot increase the value of `%s` at runtime. You might need to enable huge pages in grub at boot "
-                       "time. This error can also happen because system uptime is high and memory is fragmented. You can fix this by "
-                       "rebooting the machine and running the `hugetlbfs` stage immediately on boot.",
-                       PAGE_NAMES[ j ],
-                       i,
-                       required_pages[ 1 ] + (required_pages[ 0 ] / 512),
-                       required_pages[ 1 ],
-                       required_pages[ 0 ],
-                       raised_free_pages,
-                       PAGE_NAMES[ j ],
-                       free_page_path,
-                       free_pages,
-                       PAGE_NAMES[ j ],
-                       total_page_path ));
-        }
+      reserve_pages( i, j, required_pages[ j ] );
+      total_required[ j ] += required_pages[ j ];
+      if( required_pages[ j ]>preferred_pages[ j ] ) {
+        preferred_pages[ j ] = required_pages[ j ];
+        preferred_node [ j ] = i;
       }
     }
+  }
+
+  /* NUMA free_hugepages includes pages already promised to other
+     mounts/files.  Those reservations are tracked only globally.
+     Meeting each NUMA-local requirement above therefore does not imply
+     that a new min_size reservation can succeed.  Top up only the global
+     shortfall, on the NUMA node this topology uses most for that size.
+     This also leaves unreserved capacity when min_size is disabled.
+
+     The counters and mount are not atomic; another concurrent configure
+     or huge-page user can still race this reservation. */
+  for( ulong j=0UL; j<2UL; j++ ) {
+    if( !total_required[ j ] ) continue;
+    char global_free_path[ PATH_MAX ];
+    char reserved_path[ PATH_MAX ];
+    FD_TEST( fd_cstr_printf_check( global_free_path, PATH_MAX, NULL,
+                                  "/sys/kernel/mm/hugepages/hugepages-%lukB/free_hugepages", FD_PAGE_SIZE[ j ]>>10 ) );
+    FD_TEST( fd_cstr_printf_check( reserved_path, PATH_MAX, NULL,
+                                  "/sys/kernel/mm/hugepages/hugepages-%lukB/resv_hugepages", FD_PAGE_SIZE[ j ]>>10 ) );
+    ulong free_pages;
+    ulong reserved_pages;
+    if( FD_UNLIKELY( -1==fd_file_util_read_ulong( global_free_path, &free_pages ) ) )
+      FD_LOG_ERR(( "could not read `%s` (%i-%s)", global_free_path, errno, fd_io_strerror( errno ) ));
+    if( FD_UNLIKELY( -1==fd_file_util_read_ulong( reserved_path, &reserved_pages ) ) )
+      FD_LOG_ERR(( "could not read `%s` (%i-%s)", reserved_path, errno, fd_io_strerror( errno ) ));
+    ulong available_pages = free_pages>reserved_pages ? free_pages-reserved_pages : 0UL;
+    if( available_pages>=total_required[ j ] ) continue;
+
+    ulong shortfall = total_required[ j ]-available_pages;
+    char node_free_path[ PATH_MAX ];
+    FD_TEST( fd_cstr_printf_check( node_free_path, PATH_MAX, NULL, FREE_HUGE_PAGE_PATH[ j ], preferred_node[ j ] ) );
+    uint node_free_pages;
+    if( FD_UNLIKELY( -1==fd_file_util_read_uint( node_free_path, &node_free_pages ) ) )
+      FD_LOG_ERR(( "could not read `%s` (%i-%s)", node_free_path, errno, fd_io_strerror( errno ) ));
+    if( FD_UNLIKELY( shortfall>UINT_MAX-node_free_pages ) )
+      FD_LOG_ERR(( "global %s page shortfall is too large: %lu", PAGE_NAMES[ j ], shortfall ));
+    FD_LOG_NOTICE(( "%lu free %s pages are already reserved; adding %lu pages for this topology",
+                    reserved_pages, PAGE_NAMES[ j ], shortfall ));
+    reserve_pages( preferred_node[ j ], j, node_free_pages+shortfall );
   }
 
   /* Do NOT include anonymous huge pages in the min_size count that

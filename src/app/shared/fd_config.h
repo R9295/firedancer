@@ -177,6 +177,12 @@ struct fd_configf {
     int alpenglow;
 
     struct {
+      ulong max_stake_accounts;
+      ulong max_stake_accounts_fallback;
+      ulong max_vote_accounts;
+    } runtime;
+
+    struct {
       ushort quic_client_listen_port;
       ushort quic_server_listen_port;
     } votor;
