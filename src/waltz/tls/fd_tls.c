@@ -4,6 +4,9 @@
 #include "../../ballet/ed25519/fd_ed25519.h"
 #include "../../ballet/ed25519/fd_x25519.h"
 #include "../../ballet/hmac/fd_hmac.h"
+#include "../../ballet/secp256r1/fd_secp256r1.h"
+#include "../../ballet/x509/fd_x509.h"
+#include "../../ballet/x509/fd_x509_verify.h"
 
 /* Pre-generated keys */
 
@@ -12,7 +15,7 @@ char const fd_tls13_cli_sign_prefix[ 98 ] =
   "                                "  /* 32 spaces */
   "TLS 1.3, client CertificateVerify";
 
-static char const fd_tls13_srv_sign_prefix[ 98 ] =
+char const fd_tls13_srv_sign_prefix[ 98 ] =
   "                                "  /* 32 spaces */
   "                                "  /* 32 spaces */
   "TLS 1.3, server CertificateVerify";
@@ -199,18 +202,18 @@ fd_tls_has_alpn( uchar const * list,
 static inline long __attribute__((warn_unused_result))
 fd_tls_alert( fd_tls_estate_base_t * hs,
               uint                   alert,
-              ushort                 reason ) {
-  hs->reason = reason;
+              ushort                 reason ) { /* hint if not yet set */
+  if( !hs->reason ) hs->reason = reason;
   return -(long)alert;
 }
 
 /* fd_tls_send_cert_verify generates and sends a CertificateVerify
    message.  Returns 0L on success and negated TLS alert number on
    failure.  this is the local client or server object.  hs is the
-   local handshake object.  transcript is the SHA state of the
-   transcript hasher immediately preceding the CertificateVerify (where
-   last entry is Certificate).  is_client is 1 if the local role is a
-   client, 0 otherwise. */
+   local handshake object.  transcript is the hash state immediately
+   preceding the CertificateVerify (where last entry is Certificate).
+   cs describes the negotiated cipher suite.  is_client is 1 if the
+   local role is a client, 0 otherwise. */
 
 static long
 fd_tls_send_cert_verify( fd_tls_t const *       this,
@@ -254,9 +257,10 @@ fd_tls_send_cert_verify( fd_tls_t const *       this,
     /* Construct CertificateVerify */
 
     fd_tls_cert_verify_t cv = {
-      .sig_alg = FD_TLS_SIGNATURE_ED25519
+      .algorithm = FD_TLS_SIGNATURE_ED25519,
+      .signature_len = 64,
     };
-    fd_memcpy( cv.sig, cert_verify_sig, 64UL );
+    fd_memcpy( cv.signature, cert_verify_sig, 64UL );
 
     /* Encode CertificateVerify */
 
@@ -456,11 +460,17 @@ fd_tls_server_hs_start( fd_tls_t const *      const server,
     if( FD_UNLIKELY( msg_hdr.type != FD_TLS_MSG_CLIENT_HELLO ) )
       return fd_tls_alert( &handshake->base, FD_TLS_ALERT_UNEXPECTED_MESSAGE, FD_TLS_REASON_CH_EXPECTED );
 
+    ulong msg_sz = fd_tls_u24_to_uint( msg_hdr.sz );
+    if( FD_UNLIKELY( msg_sz > (ulong)(wire_end-wire) ) )
+      return fd_tls_alert( &handshake->base, FD_TLS_ALERT_DECODE_ERROR, FD_TLS_REASON_CH_PARSE );
+
     /* Decode Client Hello */
 
-    decode_res = fd_tls_decode_client_hello( &ch, wire, (ulong)(wire_end-wire) );
+    decode_res = fd_tls_decode_client_hello( &ch, wire, msg_sz );
     if( FD_UNLIKELY( decode_res<0L ) )
       return fd_tls_alert( &handshake->base, (uint)(-decode_res), FD_TLS_REASON_CH_PARSE );
+    if( FD_UNLIKELY( (ulong)decode_res != msg_sz ) )
+      return fd_tls_alert( &handshake->base, FD_TLS_ALERT_DECODE_ERROR, FD_TLS_REASON_CH_PARSE );
     wire += (ulong)decode_res;
 
     read_sz = (ulong)(wire - record);
@@ -469,7 +479,7 @@ fd_tls_server_hs_start( fd_tls_t const *      const server,
   /* Check for cryptographic compatibility */
 
   if( FD_UNLIKELY( !ch.supported_versions.tls13 ) )
-    return fd_tls_alert( &handshake->base, FD_TLS_ALERT_HANDSHAKE_FAILURE, FD_TLS_REASON_CH_NEG_VER );
+    return fd_tls_alert( &handshake->base, FD_TLS_ALERT_PROTOCOL_VERSION, FD_TLS_REASON_CH_NEG_VER );
   if( FD_UNLIKELY( !ch.supported_groups.x25519 ) )
     return fd_tls_alert( &handshake->base, FD_TLS_ALERT_HANDSHAKE_FAILURE, FD_TLS_REASON_CH_NEG_KX );
   if( FD_UNLIKELY( !ch.signature_algorithms.ed25519 ) )
@@ -522,8 +532,7 @@ fd_tls_server_hs_start( fd_tls_t const *      const server,
   /* Create server random */
 
   uchar server_random[ 32 ];
-  if( FD_UNLIKELY( !fd_tls_rand( &server->rand, server_random, 32UL ) ) )
-    return fd_tls_alert( &handshake->base, FD_TLS_ALERT_HANDSHAKE_FAILURE, FD_TLS_REASON_RAND_FAIL );
+  fd_chacha_rng_read32( server->rng, server_random );
 
   /* Create server hello message */
 
@@ -546,7 +555,7 @@ fd_tls_server_hs_start( fd_tls_t const *      const server,
       .key_share    = { .has_x25519 = 1 },
       .session_id   = ch.session_id,
     };
-    memcpy( sh.random,           server_random,          32UL );
+    memcpy( sh.random,           server_random,            32UL );
     memcpy( sh.key_share.x25519, server->kex_public_key, 32UL );
 
     /* Encode server hello */
@@ -591,14 +600,19 @@ fd_tls_server_hs_start( fd_tls_t const *      const server,
   if( FD_UNLIKELY( !ecdh_ikm ) )
     return fd_tls_alert( &handshake->base, FD_TLS_ALERT_HANDSHAKE_FAILURE, FD_TLS_REASON_X25519_FAIL );
 
-  /* Derive main handshake secret */
+  /* RFC 8446 Section 7.1: Handshake Secret = HKDF-Extract(
+       salt = Derive-Secret(Early Secret, "derived", ""),
+       IKM  = (EC)DHE shared secret)
+     RFC 5869 Section 2.2: PRK = HMAC-Hash(key=salt, data=IKM) */
 
   uchar handshake_secret[ 32 ];
-  fd_hmac_sha256( /* data */ ecdh_ikm,          32UL,
+  fd_hmac_sha256( /* IKM  */ ecdh_ikm,          32UL,
                   /* salt */ handshake_derived, 32UL,
                   /* out  */ handshake_secret );
 
-  /* Derive client/server handshake secrets */
+  /* RFC 8446 Section 7.1: client_handshake_traffic_secret =
+       Derive-Secret(Handshake Secret, "c hs traffic",
+                     ClientHello...ServerHello) */
 
   uchar client_hs_secret[ 32UL ];
   fd_tls_hkdf_expand_label( client_hs_secret, 32UL,
@@ -606,6 +620,10 @@ fd_tls_server_hs_start( fd_tls_t const *      const server,
                             "c hs traffic",  12UL,
                             transcript_hash, 32UL );
   memcpy( handshake->client_hs_secret, client_hs_secret, 32UL );
+
+  /* RFC 8446 Section 7.1: server_handshake_traffic_secret =
+       Derive-Secret(Handshake Secret, "s hs traffic",
+                     ClientHello...ServerHello) */
 
   uchar server_hs_secret[ 32UL ];
   fd_tls_hkdf_expand_label( server_hs_secret, 32UL,
@@ -628,9 +646,14 @@ fd_tls_server_hs_start( fd_tls_t const *      const server,
                             "derived",   7UL,
                             empty_hash, 32UL );
 
+  /* RFC 8446 Section 7.1: Master Secret = HKDF-Extract(
+       salt = Derive-Secret(Handshake Secret, "derived", ""),
+       IKM  = 0)
+     RFC 5869 Section 2.2: PRK = HMAC-Hash(key=salt, data=IKM) */
+
   static uchar const zeros[ 32 ] = {0};
   uchar master_secret[ 32 ];
-  fd_hmac_sha256( /* data */ zeros,         32UL,
+  fd_hmac_sha256( /* IKM  */ zeros,         32UL,
                   /* salt */ master_derive, 32UL,
                   /* out  */ master_secret );
 
@@ -760,15 +783,16 @@ fd_tls_server_hs_start( fd_tls_t const *      const server,
   transcript_clone = transcript;
   fd_sha256_fini( &transcript_clone, transcript_hash );
 
-  /* Derive "Finished" key */
+  /* RFC 8446 Section 4.4.4:
+       finished_key = HKDF-Expand-Label(BaseKey, "finished", "", Hash.length)
+       verify_data  = HMAC(finished_key, Transcript-Hash(
+                       Handshake Context, Certificate*, CertificateVerify*)) */
 
   uchar finished_key[ 32 ];
   fd_tls_hkdf_expand_label( finished_key, 32UL,
                             server_hs_secret,
                             "finished", 8UL,
                             NULL,       0UL );
-
-  /* Derive "Finished" verify data */
 
   fd_hmac_sha256( /* data */ transcript_hash, 32UL,
                   /* salt */ finished_key,    32UL,
@@ -794,13 +818,21 @@ fd_tls_server_hs_start( fd_tls_t const *      const server,
   transcript_clone = transcript;
   fd_sha256_fini( &transcript_clone, transcript_hash );
 
-  /* Derive client/server application secrets */
+  /* RFC 8446 Section 7.1:
+       client_application_traffic_secret_0 =
+         Derive-Secret(Master Secret, "c ap traffic",
+                       ClientHello...server Finished) */
 
   uchar client_app_secret[ 32UL ];
   fd_tls_hkdf_expand_label( client_app_secret, 32UL,
                             master_secret,
                             "c ap traffic",  12UL,
                             transcript_hash, 32UL );
+
+  /* RFC 8446 Section 7.1:
+       server_application_traffic_secret_0 =
+         Derive-Secret(Master Secret, "s ap traffic",
+                       ClientHello...server Finished) */
 
   uchar server_app_secret[ 32UL ];
   fd_tls_hkdf_expand_label( server_app_secret, 32UL,
@@ -834,7 +866,10 @@ fd_tls_handle_cert_chain( fd_tls_estate_base_t * const base,
                           uchar const *          const cert_chain,
                           ulong                  const cert_chain_sz,
                           uchar const *          const expected_pubkey,
-                          uchar *                const out_pubkey ) {
+                          uchar *                const out_pubkey,
+                          ulong                  const pubkey_bufsz,
+                          ulong *                const out_pubkey_len,
+                          uchar *                const out_key_type ) {
 
   fd_tls_extract_cert_pubkey_res_t extract =
   fd_tls_extract_cert_pubkey( cert_chain, cert_chain_sz );
@@ -845,11 +880,17 @@ fd_tls_handle_cert_chain( fd_tls_estate_base_t * const base,
     return fd_tls_alert( base, alert, reason );
   }
 
+  if( FD_UNLIKELY( extract.pubkey_len > pubkey_bufsz ) )
+    return fd_tls_alert( base, FD_TLS_ALERT_UNSUPPORTED_CERTIFICATE, FD_TLS_REASON_CERT_KEY_TYPE );
   if( expected_pubkey )
-    if( FD_UNLIKELY( 0!=memcmp( extract.pubkey, expected_pubkey, 32UL ) ) )
+    if( FD_UNLIKELY( 0!=memcmp( extract.pubkey, expected_pubkey, extract.pubkey_len ) ) )
       return fd_tls_alert( base, FD_TLS_ALERT_HANDSHAKE_FAILURE, FD_TLS_REASON_WRONG_PUBKEY );
   if( out_pubkey )
-    fd_memcpy( out_pubkey, extract.pubkey, 32UL );
+    fd_memcpy( out_pubkey, extract.pubkey, extract.pubkey_len );
+  if( out_pubkey_len )
+    *out_pubkey_len = extract.pubkey_len;
+  if( out_key_type )
+    *out_key_type = extract.key_type;
 
   /* Skip extensions */
   /* Skip remaining certificate chain */
@@ -858,12 +899,14 @@ fd_tls_handle_cert_chain( fd_tls_estate_base_t * const base,
 }
 
 static long
-fd_tls_handle_cert_verify( fd_tls_estate_base_t * hs,
-                           fd_sha256_t const *    transcript,
-                           uchar const *          record,
-                           ulong                  record_sz,
-                           uchar const            pubkey[ static 32 ],
-                           int                    is_client ) {
+fd_tls_handle_cert_verify( fd_tls_estate_base_t *    hs,
+                           fd_sha256_t const *       transcript,
+                           uchar const *             record,
+                           ulong                     record_sz,
+                           uchar const *             pubkey,
+                           ulong                     pubkey_len,
+                           uchar                     key_type,
+                           int                       is_client ) {
 
   /* Read CertificateVerify *******************************************/
 
@@ -878,26 +921,28 @@ fd_tls_handle_cert_verify( fd_tls_estate_base_t * hs,
 
     fd_tls_msg_hdr_t msg_hdr = {0};
     long decode_res = fd_tls_decode_msg_hdr( &msg_hdr, wire, (ulong)(wire_end-wire) );
-    if( FD_UNLIKELY( ( decode_res<0L ) |
-                     ( fd_tls_u24_to_uint( msg_hdr.sz ) != 0x44UL ) ) )
+    if( FD_UNLIKELY( decode_res<0L ) )
       return fd_tls_alert( hs, FD_TLS_ALERT_DECODE_ERROR, FD_TLS_REASON_CV_PARSE );
     wire += (ulong)decode_res;
 
     if( FD_UNLIKELY( msg_hdr.type != FD_TLS_MSG_CERT_VERIFY ) )
       return fd_tls_alert( hs, FD_TLS_ALERT_UNEXPECTED_MESSAGE, FD_TLS_REASON_CV_EXPECTED );
 
+    ulong msg_sz = fd_tls_u24_to_uint( msg_hdr.sz );
+    if( FD_UNLIKELY( msg_sz > (ulong)(wire_end-wire) ) )
+      return fd_tls_alert( hs, FD_TLS_ALERT_DECODE_ERROR, FD_TLS_REASON_CV_PARSE );
+
     /* Decode CertificateVerify */
 
-    decode_res = fd_tls_decode_cert_verify( vfy, wire, (ulong)(wire_end-wire) );
+    decode_res = fd_tls_decode_cert_verify( vfy, wire, msg_sz );
     if( FD_UNLIKELY( decode_res<0L ) )
       return fd_tls_alert( hs, (uint)(-decode_res), FD_TLS_REASON_CV_PARSE );
+    if( FD_UNLIKELY( (ulong)decode_res != msg_sz ) )
+      return fd_tls_alert( hs, FD_TLS_ALERT_DECODE_ERROR, FD_TLS_REASON_CV_PARSE );
     wire += (ulong)decode_res;
 
     read_sz = (ulong)(wire - record);
   } while(0);
-
-  if( FD_UNLIKELY( vfy->sig_alg != FD_TLS_SIGNATURE_ED25519 ) )
-    return fd_tls_alert( hs, FD_TLS_ALERT_HANDSHAKE_FAILURE, FD_TLS_REASON_CV_SIGALG );
 
   /* Verify signature *************************************************/
 
@@ -909,17 +954,49 @@ fd_tls_handle_cert_verify( fd_tls_estate_base_t * hs,
              is_client ? fd_tls13_cli_sign_prefix : fd_tls13_srv_sign_prefix,
              98UL );
 
-  fd_sha256_t transcript_clone = *transcript;
-  fd_sha256_fini( &transcript_clone, sign_msg+98 );
+  fd_sha256_t cv_transcript_clone = *transcript;
+  fd_sha256_fini( &cv_transcript_clone, sign_msg+98 );
 
   /* Verify certificate signature
      > If the verification fails, the receiver MUST terminate the handshake
      > with a "decrypt_error" alert. */
 
-  fd_sha512_t sha512[1];
-  int sig_err = fd_ed25519_verify( sign_msg, 130UL, vfy->sig, pubkey, sha512 );
-  if( FD_UNLIKELY( sig_err != FD_ED25519_SUCCESS ) )
-    return fd_tls_alert( hs, FD_TLS_ALERT_DECRYPT_ERROR, FD_TLS_REASON_ED25519_FAIL );
+  switch( vfy->algorithm ) {
+
+  case FD_TLS_SIGNATURE_ED25519: {
+    if( FD_UNLIKELY( key_type != FD_TLS_KEY_ED25519 ) )
+      return fd_tls_alert( hs, FD_TLS_ALERT_HANDSHAKE_FAILURE, FD_TLS_REASON_CV_SIGALG );
+    fd_sha512_t sha512[1];
+    int sig_err = fd_ed25519_verify( sign_msg, 130UL, vfy->signature, pubkey, sha512 );
+    if( FD_UNLIKELY( sig_err != FD_ED25519_SUCCESS ) )
+      return fd_tls_alert( hs, FD_TLS_ALERT_DECRYPT_ERROR, FD_TLS_REASON_ED25519_FAIL );
+    break;
+  }
+
+  case FD_TLS_SIGNATURE_ECDSA_SECP256R1_SHA256: {
+    if( FD_UNLIKELY( key_type != FD_TLS_KEY_ECDSA_P256 ) )
+      return fd_tls_alert( hs, FD_TLS_ALERT_HANDSHAKE_FAILURE, FD_TLS_REASON_CV_SIGALG );
+
+    uchar raw_sig[64];
+    if( FD_UNLIKELY( fd_x509_decode_ecdsa_sig( vfy->signature, vfy->signature_len, raw_sig, 32 ) ) )
+      return fd_tls_alert( hs, FD_TLS_ALERT_DECRYPT_ERROR, FD_TLS_REASON_CV_PARSE );
+
+    uchar compressed_pk[33];
+    if( FD_UNLIKELY( pubkey_len != 65 ) )
+      return fd_tls_alert( hs, FD_TLS_ALERT_DECRYPT_ERROR, FD_TLS_REASON_CV_PARSE );
+    if( FD_UNLIKELY( fd_x509_ec_point_compress( pubkey, 32, compressed_pk ) ) )
+      return fd_tls_alert( hs, FD_TLS_ALERT_DECRYPT_ERROR, FD_TLS_REASON_CV_PARSE );
+
+    fd_sha256_t sha256[1];
+    int sig_err = fd_secp256r1_verify_allow_high_s( sign_msg, 130UL, raw_sig, compressed_pk, sha256 );
+    if( FD_UNLIKELY( sig_err != FD_SECP256R1_SUCCESS ) )
+      return fd_tls_alert( hs, FD_TLS_ALERT_DECRYPT_ERROR, FD_TLS_REASON_SECP256R1_FAIL );
+    break;
+  }
+
+  default:
+    return fd_tls_alert( hs, FD_TLS_ALERT_HANDSHAKE_FAILURE, FD_TLS_REASON_CV_SIGALG );
+  }
 
   return (long)read_sz;
 }
@@ -960,7 +1037,10 @@ fd_tls_server_hs_wait_cert( fd_tls_t const *      server,
 
     /* Decode Certificate */
 
-    decode_res = fd_tls_handle_cert_chain( &handshake->base, wire, msg_sz, NULL, handshake->client_pubkey );
+    decode_res = fd_tls_handle_cert_chain( &handshake->base, wire, msg_sz, NULL,
+                                           handshake->client_pubkey,
+                                           sizeof(handshake->client_pubkey),
+                                           NULL, NULL );
     if( FD_UNLIKELY( decode_res<0L ) )
       return fd_tls_alert( &handshake->base, (uint)(-decode_res), FD_TLS_REASON_CERT_PARSE );
     wire += (ulong)decode_res;
@@ -997,7 +1077,9 @@ fd_tls_server_hs_wait_cert_verify( fd_tls_t const *      server,
 
   /* Decode incoming client CertificateVerify *************************/
 
-  long res = fd_tls_handle_cert_verify( &hs->base, &transcript_clone, record, record_sz, hs->client_pubkey, 1 );
+  long res = fd_tls_handle_cert_verify( &hs->base, &transcript_clone,
+                                        record, record_sz,
+                                        hs->client_pubkey, 32UL, FD_TLS_KEY_ED25519, 1 );
   if( FD_UNLIKELY( res<0L ) ) return res;
 
   fd_sha256_append( &transcript, record, (ulong)res );
@@ -1066,15 +1148,16 @@ fd_tls_server_hs_wait_finished( fd_tls_t const *      server,
   uchar transcript_hash[ 32 ];
   fd_sha256_fini( &transcript, transcript_hash );
 
-  /* Derive "Finished" key */
+  /* RFC 8446 Section 4.4.4:
+       finished_key = HKDF-Expand-Label(BaseKey, "finished", "", Hash.length)
+       verify_data  = HMAC(finished_key, Transcript-Hash(
+                       Handshake Context, Certificate*, CertificateVerify*)) */
 
   uchar finished_key[ 32 ];
   fd_tls_hkdf_expand_label( finished_key, 32UL,
                             handshake->client_hs_secret,
                             "finished", 8UL,
                             NULL,       0UL );
-
-  /* Derive "Finished" verify data */
 
   uchar finished_expected[ 32 ];
   fd_hmac_sha256( /* data */ transcript_hash, 32UL,
@@ -1141,6 +1224,9 @@ static long
 fd_tls_client_hs_start( fd_tls_t const * const      client,
                         fd_tls_estate_cli_t * const handshake ) {
 
+  if( FD_UNLIKELY( client->server_name_len>=sizeof(client->server_name) ) )
+    return fd_tls_alert( &handshake->base, FD_TLS_ALERT_INTERNAL_ERROR, FD_TLS_REASON_CH_ENCODE );
+
   /* Request QUIC transport params */
   uchar quic_tp[ FD_TLS_EXT_QUIC_PARAMS_SZ_MAX ];
   long  quic_tp_sz = -1L;
@@ -1149,11 +1235,10 @@ fd_tls_client_hs_start( fd_tls_t const * const      client,
   if( FD_UNLIKELY( quic_tp_sz > (long)FD_TLS_EXT_QUIC_PARAMS_SZ_MAX ) )
     return fd_tls_alert( &handshake->base, FD_TLS_ALERT_DECODE_ERROR, FD_TLS_REASON_QUIC_TP_OVERSZ );
 
-  /* Message buffer */
-# define MSG_BUFSZ 512UL
+  /* Message buffer (sized for session_id + SNI) */
+# define MSG_BUFSZ 1024UL
   uchar msg_buf[ MSG_BUFSZ ];
 
-  /* Transcript hasher */
   fd_sha256_init( &handshake->transcript );
 
   /* Send ClientHello *************************************************/
@@ -1161,11 +1246,21 @@ fd_tls_client_hs_start( fd_tls_t const * const      client,
   /* Create client random */
 
   uchar client_random[ 32 ];
-  if( FD_UNLIKELY( !fd_tls_rand( &client->rand, client_random, 32UL ) ) )
-    return fd_tls_alert( &handshake->base, FD_TLS_ALERT_INTERNAL_ERROR, FD_TLS_REASON_RAND_FAIL );
+  fd_chacha_rng_read32( client->rng, client_random );
 
   /* Remember client random for SSLKEYLOGFILE */
   fd_memcpy( handshake->base.client_random, client_random, 32UL );
+
+  /* Generate session_id for TCP middlebox compat (RFC 8446 Section 4.1.2) */
+
+  uchar session_id_buf[ 32 ];
+  uchar session_id_sz = 0;
+  if( !client->quic ) {
+    fd_chacha_rng_read32( client->rng, session_id_buf );
+    session_id_sz = 32;
+    fd_memcpy( handshake->session_id, session_id_buf, 32UL );
+    handshake->session_id_sz = 32;
+  }
 
   /* Create client hello message */
 
@@ -1186,9 +1281,21 @@ fd_tls_client_hs_start( fd_tls_t const * const      client,
     fd_tls_client_hello_t ch = {
       .supported_versions   = { .tls13=1 },
       .supported_groups     = { .x25519=1 },
-      .signature_algorithms = { .ed25519=1 },
+      /* TPU/QUIC peers always present Ed25519 identities.  Only the
+         TCP-based TLS client talks to CAs issuing ECDSA certs. */
+      .signature_algorithms =
+        { .ed25519 = 1,
+          .ecdsa_secp256r1_sha256 = !client->quic },
+      .signature_algorithms_cert =
+        { .ed25519                = !client->quic,
+          .ecdsa_secp256r1_sha256 = !client->quic,
+          .ecdsa_secp384r1_sha384 = !client->quic },
       .cipher_suites        = { .aes_128_gcm_sha256=1 },
       .key_share            = { .has_x25519=1 },
+      .session_id = {
+        .buf   = session_id_sz ? session_id_buf : NULL,
+        .bufsz = session_id_sz,
+      },
       .quic_tp = {
         .buf   = (quic_tp_sz>=0L) ? quic_tp            : NULL,
         .bufsz = (quic_tp_sz>=0L) ? (ushort)quic_tp_sz : 0,
@@ -1200,6 +1307,13 @@ fd_tls_client_hs_start( fd_tls_t const * const      client,
     };
     memcpy( ch.random,           client_random,          32UL );
     memcpy( ch.key_share.x25519, client->kex_public_key, 32UL );
+
+    /* Copy SNI from config if set */
+    if( client->server_name_len ) {
+      ch.server_name.host_name_len = client->server_name_len;
+      fd_memcpy( ch.server_name.host_name, client->server_name, client->server_name_len );
+      ch.server_name.host_name[ client->server_name_len ] = '\0';
+    }
 
     /* Encode client hello */
 
@@ -1264,26 +1378,39 @@ fd_tls_client_hs_wait_sh( fd_tls_t const *      const client,
     if( FD_UNLIKELY( msg_hdr.type != FD_TLS_MSG_SERVER_HELLO ) )
       return fd_tls_alert( &handshake->base, FD_TLS_ALERT_UNEXPECTED_MESSAGE, FD_TLS_REASON_SH_EXPECTED );
 
+    ulong msg_sz = fd_tls_u24_to_uint( msg_hdr.sz );
+    if( FD_UNLIKELY( msg_sz > (ulong)(wire_end-wire) ) )
+      return fd_tls_alert( &handshake->base, FD_TLS_ALERT_DECODE_ERROR, FD_TLS_REASON_SH_PARSE );
+
     /* Decode Server Hello */
 
-    decode_res = fd_tls_decode_server_hello( sh, wire, (ulong)(wire_end-wire) );
+    decode_res = fd_tls_decode_server_hello( sh, wire, msg_sz );
     if( FD_UNLIKELY( decode_res<0L ) )
       return fd_tls_alert( &handshake->base, (uint)(-decode_res), FD_TLS_REASON_SH_PARSE );
+    if( FD_UNLIKELY( (ulong)decode_res != msg_sz ) )
+      return fd_tls_alert( &handshake->base, FD_TLS_ALERT_DECODE_ERROR, FD_TLS_REASON_SH_PARSE );
     wire += (ulong)decode_res;
 
     read_sz = (ulong)(wire - record);
   } while(0);
 
+  /* legacy_session_id_echo must match the session_id sent in the
+     ClientHello (RFC 8446 Section 4.1.3).  Empty in QUIC mode. */
+
+  if( FD_UNLIKELY( ( sh->session_id.bufsz != handshake->session_id_sz ) ||
+                   ( 0!=memcmp( sh->session_id.buf, handshake->session_id, handshake->session_id_sz ) ) ) )
+    return fd_tls_alert( &handshake->base, FD_TLS_ALERT_ILLEGAL_PARAMETER, FD_TLS_REASON_SH_SESSION_ID );
+
+  /* Server must select a cipher suite offered by ClientHello. */
+
+  if( FD_UNLIKELY( sh->cipher_suite != FD_TLS_CIPHER_SUITE_AES_128_GCM_SHA256 ) )
+    return fd_tls_alert( &handshake->base, FD_TLS_ALERT_ILLEGAL_PARAMETER, FD_TLS_REASON_SH_NEG_CIPHER );
+
   /* Record server hello in transcript hash */
 
   fd_sha256_append( &handshake->transcript, record, read_sz );
 
-  /* TODO: For now, cryptographic parameters are hardcoded in the
-           decoder.  Thus, we skip checks. */
-
   /* Derive handshake secrets *****************************************/
-
-  /* TODO: This code is duplicated server-side */
 
   /* Export handshake transcript hash */
 
@@ -1300,19 +1427,28 @@ fd_tls_client_hs_wait_sh( fd_tls_t const *      const client,
   if( FD_UNLIKELY( !ecdh_ikm ) )
     return fd_tls_alert( &handshake->base, FD_TLS_ALERT_HANDSHAKE_FAILURE, FD_TLS_REASON_X25519_FAIL );
 
-  /* Derive main handshake secret */
+  /* RFC 8446 Section 7.1: Handshake Secret = HKDF-Extract(
+       salt = Derive-Secret(Early Secret, "derived", ""),
+       IKM  = (EC)DHE shared secret)
+     RFC 5869 Section 2.2: PRK = HMAC-Hash(key=salt, data=IKM) */
 
   uchar handshake_secret[ 32 ];
-  fd_hmac_sha256( /* data */ ecdh_ikm,          32UL,
+  fd_hmac_sha256( /* IKM  */ ecdh_ikm,          32UL,
                   /* salt */ handshake_derived, 32UL,
                   /* out  */ handshake_secret );
 
-  /* Derive client/server handshake secrets */
+  /* RFC 8446 Section 7.1: client_handshake_traffic_secret =
+       Derive-Secret(Handshake Secret, "c hs traffic",
+                     ClientHello...ServerHello) */
 
   fd_tls_hkdf_expand_label( handshake->client_hs_secret, 32UL,
                             handshake_secret,
                             "c hs traffic",  12UL,
                             transcript_hash, 32UL );
+
+  /* RFC 8446 Section 7.1: server_handshake_traffic_secret =
+       Derive-Secret(Handshake Secret, "s hs traffic",
+                     ClientHello...ServerHello) */
 
   fd_tls_hkdf_expand_label( handshake->server_hs_secret, 32UL,
                             handshake_secret,
@@ -1331,11 +1467,16 @@ fd_tls_client_hs_wait_sh( fd_tls_t const *      const client,
   uchar master_derive[ 32 ];
   fd_tls_hkdf_expand_label( master_derive, 32UL,
                             handshake_secret,
-                            "derived",   7UL,
+                            "derived",  7UL,
                             empty_hash, 32UL );
 
+  /* RFC 8446 Section 7.1: Master Secret = HKDF-Extract(
+       salt = Derive-Secret(Handshake Secret, "derived", ""),
+       IKM  = 0)
+     RFC 5869 Section 2.2: PRK = HMAC-Hash(key=salt, data=IKM) */
+
   static uchar const zeros[ 32 ] = {0};
-  fd_hmac_sha256( /* data */ zeros,         32UL,
+  fd_hmac_sha256( /* IKM  */ zeros,         32UL,
                   /* salt */ master_derive, 32UL,
                   /* out  */ handshake->master_secret );
 
@@ -1376,11 +1517,17 @@ fd_tls_client_hs_wait_ee( fd_tls_t const *      const client,
     if( FD_UNLIKELY( msg_hdr.type != FD_TLS_MSG_ENCRYPTED_EXT ) )
       return fd_tls_alert( &handshake->base, FD_TLS_ALERT_UNEXPECTED_MESSAGE, FD_TLS_REASON_EE_EXPECTED );
 
+    ulong msg_sz = fd_tls_u24_to_uint( msg_hdr.sz );
+    if( FD_UNLIKELY( msg_sz > (ulong)(wire_end-wire) ) )
+      return fd_tls_alert( &handshake->base, FD_TLS_ALERT_DECODE_ERROR, FD_TLS_REASON_EE_PARSE );
+
     /* Decode EncryptedExtensions */
 
-    decode_res = fd_tls_decode_enc_ext( ee, wire, (ulong)(wire_end-wire) );
+    decode_res = fd_tls_decode_enc_ext( ee, wire, msg_sz );
     if( FD_UNLIKELY( decode_res<0L ) )
       return fd_tls_alert( &handshake->base, (uint)(-decode_res), FD_TLS_REASON_EE_PARSE );
+    if( FD_UNLIKELY( (ulong)decode_res != msg_sz ) )
+      return fd_tls_alert( &handshake->base, FD_TLS_ALERT_DECODE_ERROR, FD_TLS_REASON_EE_PARSE );
     wire += (ulong)decode_res;
 
     read_sz = (ulong)(wire - record);
@@ -1392,6 +1539,11 @@ fd_tls_client_hs_wait_ee( fd_tls_t const *      const client,
 
   /* QUIC mode */
 
+  if( FD_UNLIKELY( ( ee->server_name && !client->server_name_len ) ||
+                   ( ee->quic_tp.buf && !client->quic            ) ||
+                   ( ee->alpn.buf && !client->alpn_sz            ) ) )
+    return fd_tls_alert( &handshake->base, FD_TLS_ALERT_UNSUPPORTED_EXTENSION, FD_TLS_REASON_EE_PARSE );
+
   if( client->quic ) {
     /* QUIC transport parameters are mandatory in QUIC mode */
     if( FD_UNLIKELY( !ee->quic_tp.buf ) )
@@ -1401,15 +1553,21 @@ fd_tls_client_hs_wait_ee( fd_tls_t const *      const client,
     client->quic_tp_peer_fn( handshake, ee->quic_tp.buf, ee->quic_tp.bufsz );
   }
 
-  /* Check ALPN */
+  /* Check ALPN.
 
-  if( client->alpn_sz ) {
-    if( FD_UNLIKELY( !ee->alpn.bufsz ) )
-      return fd_tls_alert( &handshake->base, FD_TLS_ALERT_MISSING_EXTENSION, FD_TLS_REASON_NO_ALPN );
+     In QUIC mode, ALPN is mandatory (RFC 9001 Section 8.1).
+     In TCP mode, many HTTP servers omit the ALPN extension from
+     EncryptedExtensions, permitted by RFC 8446 Section 4.2.
+     We only enforce ALPN matching when the server actually sends it. */
+
+  if( client->alpn_sz && ee->alpn.bufsz ) {
     if( FD_UNLIKELY( ee->alpn.bufsz != client->alpn_sz ||
                      0!=memcmp( ee->alpn.buf, client->alpn, client->alpn_sz ) ) )
       return fd_tls_alert( &handshake->base, FD_TLS_ALERT_HANDSHAKE_FAILURE, FD_TLS_REASON_ALPN_NEG );
+    handshake->alpn_negotiated = 1;
   }
+  if( client->quic && client->alpn_sz && !ee->alpn.bufsz )
+    return fd_tls_alert( &handshake->base, FD_TLS_ALERT_MISSING_EXTENSION, FD_TLS_REASON_NO_ALPN );
 
   /* Finish up ********************************************************/
 
@@ -1423,10 +1581,12 @@ fd_tls_client_handle_cert_req( fd_tls_estate_cli_t * const handshake,
                                uchar const *         const req,
                                ulong                 const req_sz ) {
 
-  /* For now, just ignore the content of the certificate request.
-     TODO: This is obviously not compliant. */
-  (void)req;
+  fd_tls_ext_signature_algorithms_t sigalgs = {0};
+  long res = fd_tls_decode_cert_req( &sigalgs, req, req_sz );
+  if( FD_UNLIKELY( res<0L ) ) return res;
+  if( FD_UNLIKELY( (ulong)res != req_sz ) ) return -(long)FD_TLS_ALERT_DECODE_ERROR;
 
+  handshake->client_cert_empty = !sigalgs.ed25519;
   handshake->client_cert = 1;
   handshake->base.state  = FD_TLS_HS_WAIT_CERT;
 
@@ -1434,7 +1594,8 @@ fd_tls_client_handle_cert_req( fd_tls_estate_cli_t * const handshake,
 }
 
 static long
-fd_tls_client_handle_cert_chain( fd_tls_estate_cli_t * const hs,
+fd_tls_client_handle_cert_chain( fd_tls_t const *      const client,
+                                 fd_tls_estate_cli_t * const hs,
                                  uchar const *         const cert_chain,
                                  ulong                 const cert_chain_sz ) {
   /* pubkey pinning is ...
@@ -1442,7 +1603,29 @@ fd_tls_client_handle_cert_chain( fd_tls_estate_cli_t * const hs,
        ... disabled => update the handshake's public key value based on cert */
   uchar const * expected_pubkey = ( hs->server_pubkey_pin) ? (hs->server_pubkey) : NULL;
   uchar *       out_pubkey      = (!hs->server_pubkey_pin) ? (hs->server_pubkey) : NULL;
-  return fd_tls_handle_cert_chain( &hs->base, cert_chain, cert_chain_sz, expected_pubkey, out_pubkey );
+  long res = fd_tls_handle_cert_chain( &hs->base, cert_chain, cert_chain_sz,
+                                       expected_pubkey, out_pubkey,
+                                       sizeof(hs->server_pubkey),
+                                       &hs->server_pubkey_len, &hs->server_key_type );
+  if( FD_UNLIKELY( res < 0L ) ) return res;
+
+  /* QUIC mode offers Ed25519 only, so a P-256 cert is not acceptable. */
+  if( FD_UNLIKELY( client->quic && hs->server_key_type!=FD_TLS_KEY_ED25519 ) )
+    return fd_tls_alert( &hs->base, FD_TLS_ALERT_UNSUPPORTED_CERTIFICATE, FD_TLS_REASON_CERT_KEY_TYPE );
+
+  /* Verify the chain against the trust store and the SNI we sent */
+  if( client->ca_store ) {
+    int verify_err = fd_x509_verify_tls_cert_msg( cert_chain, cert_chain_sz, client->ca_store,
+                                                  client->server_name, client->server_name_len,
+                                                  fd_x509_unix_now_seconds() );
+    hs->cert_verify_err = (uchar)verify_err;
+    if( FD_UNLIKELY( verify_err ) ) {
+      FD_LOG_WARNING(( "certificate verification failed (%i) for %s", verify_err, client->server_name ));
+      return fd_tls_alert( &hs->base, FD_TLS_ALERT_BAD_CERTIFICATE, FD_TLS_REASON_CERT_VERIFY );
+    }
+  }
+
+  return res;
 }
 
 static long
@@ -1478,13 +1661,11 @@ fd_tls_client_hs_wait_cert_cr( fd_tls_t const *      const client,
 
     switch( msg_hdr.type ) {
     case FD_TLS_MSG_CERT_REQ:
-      if( FD_UNLIKELY( !client->cert_x509_sz ) )
-        return fd_tls_alert( &handshake->base, FD_TLS_ALERT_UNSUPPORTED_CERTIFICATE, FD_TLS_REASON_NO_X509 );
-      decode_res = fd_tls_client_handle_cert_req ( handshake, wire, msg_sz );
+      decode_res = fd_tls_client_handle_cert_req( handshake, wire, msg_sz );
       next_state = FD_TLS_HS_WAIT_CERT;
       break;
     case FD_TLS_MSG_CERT:
-      decode_res = fd_tls_client_handle_cert_chain( handshake, wire, msg_sz );
+      decode_res = fd_tls_client_handle_cert_chain( client, handshake, wire, msg_sz );
       next_state = FD_TLS_HS_WAIT_CV;
       break;
     default:
@@ -1513,8 +1694,6 @@ fd_tls_client_hs_wait_cert( fd_tls_t const *      const client,
                             ulong                 const record_sz,
                             uint                  const encryption_level ) {
 
-  (void)client;
-
   if( FD_UNLIKELY( encryption_level != FD_TLS_LEVEL_HANDSHAKE ) )
     return fd_tls_alert( &handshake->base, FD_TLS_ALERT_INTERNAL_ERROR, FD_TLS_REASON_WRONG_ENC_LVL );
 
@@ -1542,7 +1721,7 @@ fd_tls_client_hs_wait_cert( fd_tls_t const *      const client,
 
     /* Decode Certificate */
 
-    decode_res = fd_tls_client_handle_cert_chain( handshake, wire, msg_sz );
+    decode_res = fd_tls_client_handle_cert_chain( client, handshake, wire, msg_sz );
     if( FD_UNLIKELY( decode_res<0L ) )
       return fd_tls_alert( &handshake->base, (uint)(-decode_res), FD_TLS_REASON_CERT_PARSE );
     wire += (ulong)decode_res;
@@ -1572,7 +1751,9 @@ fd_tls_client_hs_wait_cert_verify( fd_tls_t const *      const client,
 
   /* Decode incoming server CertificateVerify *************************/
 
-  long res = fd_tls_handle_cert_verify( &hs->base, &hs->transcript, record, record_sz, hs->server_pubkey, 0 );
+  long res = fd_tls_handle_cert_verify( &hs->base, &hs->transcript,
+                                        record, record_sz,
+                                        hs->server_pubkey, hs->server_pubkey_len, hs->server_key_type, 0 );
   if( FD_UNLIKELY( res<0L ) ) return res;
 
   fd_sha256_append( &hs->transcript, record, (ulong)res );
@@ -1599,15 +1780,16 @@ fd_tls_client_hs_wait_finished( fd_tls_t const *      const client,
   uchar transcript_hash[ 32 ];
   fd_sha256_fini( &transcript_clone, transcript_hash );
 
-  /* Derive "Finished" key */
+  /* RFC 8446 Section 4.4.4:
+       finished_key = HKDF-Expand-Label(BaseKey, "finished", "", Hash.length)
+       verify_data  = HMAC(finished_key, Transcript-Hash(
+                       Handshake Context, Certificate*, CertificateVerify*)) */
 
   uchar server_finished_key[ 32 ];
   fd_tls_hkdf_expand_label( server_finished_key, 32UL,
                             hs->server_hs_secret,
                             "finished", 8UL,
                             NULL,       0UL );
-
-  /* Derive "Finished" verify data */
 
   uchar server_finished_expected[ 32 ];
   fd_hmac_sha256( /* data */ transcript_hash,     32UL,
@@ -1667,7 +1849,10 @@ fd_tls_client_hs_wait_finished( fd_tls_t const *      const client,
   transcript_clone = hs->transcript;
   fd_sha256_fini( &transcript_clone, transcript_hash );
 
-  /* Derive client/server application secrets */
+  /* RFC 8446 Section 7.1:
+       client_application_traffic_secret_0 =
+         Derive-Secret(Master Secret, "c ap traffic",
+                       ClientHello...server Finished) */
 
   uchar client_app_secret[ 32UL ];
   fd_tls_hkdf_expand_label( client_app_secret, 32UL,
@@ -1675,11 +1860,16 @@ fd_tls_client_hs_wait_finished( fd_tls_t const *      const client,
                             "c ap traffic",  12UL,
                             transcript_hash, 32UL );
 
+  /* RFC 8446 Section 7.1:
+       server_application_traffic_secret_0 =
+         Derive-Secret(Master Secret, "s ap traffic",
+                       ClientHello...server Finished) */
+
   uchar server_app_secret[ 32UL ];
   fd_tls_hkdf_expand_label( server_app_secret, 32UL,
-                            hs->master_secret,
-                            "s ap traffic",  12UL,
-                            transcript_hash, 32UL );
+                               hs->master_secret,
+                               "s ap traffic",  12UL,
+                               transcript_hash, 32UL );
 
   /* Call back with application secrets */
 
@@ -1688,25 +1878,38 @@ fd_tls_client_hs_wait_finished( fd_tls_t const *      const client,
                       /* write secret */ client_app_secret,
                       FD_TLS_LEVEL_APPLICATION );
 
-  if( hs->client_cert ) {
+  if( hs->client_cert && ( hs->client_cert_empty || !client->cert_x509_sz || !client->sign.sign_fn ) ) {
+
+    /* RFC 8446 Section 4.4.2: a client that was asked for a certificate
+       but has none to offer sends a Certificate message with an empty
+       certificate_list and no CertificateVerify.  The server decides
+       whether to continue. */
+
+    static uchar const empty_cert[] = {
+      FD_TLS_MSG_CERT,   /* msg_type */
+      0x00, 0x00, 0x04,  /* msg sz */
+      0x00,              /* certificate_request_context */
+      0x00, 0x00, 0x00,  /* certificate_list */
+    };
+
+    if( FD_UNLIKELY( !client->sendmsg_fn(
+          hs,
+          empty_cert, sizeof(empty_cert),
+          FD_TLS_LEVEL_HANDSHAKE,
+          /* flush */ 0 ) ) )
+      return fd_tls_alert( &hs->base, FD_TLS_ALERT_INTERNAL_ERROR, FD_TLS_REASON_SENDMSG_FAIL );
+
+    fd_sha256_append( &hs->transcript, empty_cert, sizeof(empty_cert) );
+
+  } else if( hs->client_cert ) {
 
     /* Send client Certificate ****************************************/
 
-    /* TODO deduplicate this */
-
     /* Message buffer */
-#   define MSG_BUFSZ 512UL
-    uchar msg_buf[ MSG_BUFSZ ];
-
-    /* TODO: fd_tls does not support certificate_request_context.
-       It is an opaque string that the server may send in the cert
-       request.  The client is supposed to echo it back in its cert
-       message.  However, the server is not supposed to send it in the
-       first place, unless post-handshake auth is used (which is not
-       the case) */
-
-    long cert_msg_sz = fd_tls_encode_cert_x509( client->cert_x509, client->cert_x509_sz, msg_buf, MSG_BUFSZ );
-    FD_TEST( cert_msg_sz>=0L );
+    uchar msg_buf[ FD_TLS_SERVER_CERT_MSG_SZ_MAX ];
+    long cert_msg_sz = fd_tls_encode_cert_x509( client->cert_x509, client->cert_x509_sz, msg_buf, sizeof(msg_buf) );
+    if( FD_UNLIKELY( cert_msg_sz<0L ) )
+      return fd_tls_alert( &hs->base, FD_TLS_ALERT_INTERNAL_ERROR, FD_TLS_REASON_SENDMSG_FAIL );
 
     /* Send certificate message */
 
@@ -1725,8 +1928,6 @@ fd_tls_client_hs_wait_finished( fd_tls_t const *      const client,
 
     long cvfy_res = fd_tls_send_cert_verify( client, &hs->base, &hs->transcript, 1 );
     if( FD_UNLIKELY( !!cvfy_res ) ) return cvfy_res;
-
-#   undef MSG_BUFSZ
 
   }
 
@@ -1747,15 +1948,16 @@ fd_tls_client_hs_wait_finished( fd_tls_t const *      const client,
 
   fd_sha256_fini( &hs->transcript, transcript_hash );
 
-  /* Derive "Finished" key */
+  /* RFC 8446 Section 4.4.4:
+       finished_key = HKDF-Expand-Label(BaseKey, "finished", "", Hash.length)
+       verify_data  = HMAC(finished_key, Transcript-Hash(
+                       Handshake Context, Certificate*, CertificateVerify*)) */
 
   uchar client_finished_key[ 32 ];
   fd_tls_hkdf_expand_label( client_finished_key, 32UL,
                             hs->client_hs_secret,
                             "finished", 8UL,
                             NULL,       0UL );
-
-  /* Derive "Finished" verify data */
 
   fd_hmac_sha256( /* data */ transcript_hash,     32UL,
                   /* salt */ client_finished_key, 32UL,
@@ -1845,8 +2047,6 @@ fd_tls_reason_cstr( uint reason ) {
     return "sendmsg callback failed";
   case FD_TLS_REASON_WRONG_ENC_LVL:
     return "wrong encryption level";
-  case FD_TLS_REASON_RAND_FAIL:
-    return "rand function failed";
   case FD_TLS_REASON_CH_EXPECTED:
     return "expected ClientHello, but got other message type";
   case FD_TLS_REASON_CH_PARSE:
@@ -1873,6 +2073,8 @@ fd_tls_reason_cstr( uint reason ) {
     return "peer identity does not match expected public key";
   case FD_TLS_REASON_ED25519_FAIL:
     return "Ed25519 signature verification failed";
+  case FD_TLS_REASON_SECP256R1_FAIL:
+    return "ECDSA P-256 signature verification failed";
   case FD_TLS_REASON_FINI_FAIL:
     return "unexpected 'Finished' data (transcript hash fail)";
   case FD_TLS_REASON_QUIC_TP_OVERSZ:
@@ -1884,7 +2086,7 @@ fd_tls_reason_cstr( uint reason ) {
   case FD_TLS_REASON_CV_EXPECTED:
     return "expected CertificateVerify, but got other message type";
   case FD_TLS_REASON_CV_SIGALG:
-    return "peer CertificateVerify contains uses incorrect signature algorithm";
+    return "peer CertificateVerify uses a signature algorithm incompatible with its cert";
   case FD_TLS_REASON_FINI_PARSE:
     return "failed to parse 'Finished' message";
   case FD_TLS_REASON_SH_EXPECTED:
@@ -1893,18 +2095,26 @@ fd_tls_reason_cstr( uint reason ) {
     return "failed to decode ServerHello";
   case FD_TLS_REASON_SH_ENCODE:
     return "failed to encode ServerHello";
+  case FD_TLS_REASON_SH_NEG_CIPHER:
+    return "ServerHello selected a cipher suite not offered by ClientHello";
+  case FD_TLS_REASON_SH_SESSION_ID:
+    return "ServerHello legacy_session_id_echo does not match ClientHello";
   case FD_TLS_REASON_EE_EXPECTED:
     return "expected EncryptedExtensions, but got other message type";
   case FD_TLS_REASON_EE_PARSE:
     return "failed to decode EncryptedExtensions";
   case FD_TLS_REASON_EE_ENCODE:
     return "failed to encode EncryptedExtensions";
+  case FD_TLS_REASON_CERT_KEY_TYPE:
+    return "unsupported certificate key type";
   case FD_TLS_REASON_CERT_EXPECTED:
     return "expected Certificate, but got other message type";
   case FD_TLS_REASON_CERT_PARSE:
    return "failed to decode Certificate";
   case FD_TLS_REASON_CERT_ENCODE:
     return "failed to encode Certificate";
+  case FD_TLS_REASON_CERT_VERIFY:
+    return "certificate chain failed verification";
   case FD_TLS_REASON_FINI_EXPECTED:
     return "expected Finished, but got other message type";
   case FD_TLS_REASON_CERT_CR_EXPECTED:
@@ -1925,6 +2135,30 @@ fd_tls_reason_cstr( uint reason ) {
     return "ALPN negotiation failed";
   case FD_TLS_REASON_NO_ALPN:
     return "peer did not send ALPN extension";
+  case FD_TLS_REASON_POST_HS_MSG:
+    return "unexpected post-handshake message type";
+  case FD_TLS_REASON_KEY_UPDATE_PARSE:
+    return "failed to parse KeyUpdate";
+  case FD_TLS_REASON_CCS:
+    return "unexpected ChangeCipherSpec record";
+  case FD_TLS_REASON_ALERT_PARSE:
+    return "malformed alert record";
+  case FD_TLS_REASON_PEER_ALERT:
+    return "peer sent a fatal alert";
+  case FD_TLS_REASON_HS_INTERLEAVED:
+    return "record interleaved with a fragmented handshake message";
+  case FD_TLS_REASON_REC_TYPE:
+    return "unexpected record layer content type";
+  case FD_TLS_REASON_REC_OVERFLOW:
+    return "record larger than the protocol allows";
+  case FD_TLS_REASON_HS_KEY_CHANGE:
+    return "handshake data follows a key change in the same record";
+  case FD_TLS_REASON_HS_MSG_SIZE:
+    return "handshake message length invalid";
+  case FD_TLS_REASON_REC_MAC:
+    return "record failed authentication";
+  case FD_TLS_REASON_REC_PADDING:
+    return "record has no content type byte";
   default:
     FD_LOG_WARNING(( "Missing fd_tls_reason_cstr code for %u (memory corruption?)", reason ));
     __attribute__((fallthrough));

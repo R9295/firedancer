@@ -34,6 +34,7 @@ static uchar          mock_store_data[ 4096 ];
 static ulong          mock_store_view_call_cnt;
 static ulong          mock_store_view_success_cnt;
 static ulong          mock_store_view_release_cnt;
+static int            mock_store_view_fail;
 
 fd_store_fec_t *
 mock_store_query_fn( fd_store_map_t *  map FD_PARAM_UNUSED,
@@ -47,6 +48,12 @@ mock_store_fec_data_view_fn( fd_store_t *               store FD_PARAM_UNUSED,
                              fd_store_fec_t *           fec FD_PARAM_UNUSED,
                              fd_store_fec_data_view_t * view ) {
   mock_store_view_call_cnt++;
+  if( FD_UNLIKELY( mock_store_view_fail ) ) {
+    view->data  = NULL;
+    view->fec   = NULL;
+    view->flags = 0U;
+    return -1;
+  }
   view->data = mock_store_data;
   view->fec = &mock_store_fec;
   view->flags = 0U;
@@ -69,7 +76,6 @@ mock_store_fec_data_view_release_fn( fd_store_t *                     store FD_P
 
 /* ---- Mock sched ---- */
 
-static fd_sched_fec_t mock_sched_last_fec;
 static ulong          mock_sched_fec_ingest_cnt;
 static ulong          mock_sched_abandon_cnt;
 static ulong          mock_sched_abandon_idx;
@@ -85,8 +91,8 @@ static ulong          mock_sched_task_done_txn_idx;
 static ulong          mock_sched_task_done_exec_idx;
 static long           mock_sched_task_done_tick;
 
-int mock_sched_fec_ingest_fn( fd_sched_t * s FD_PARAM_UNUSED, fd_sched_fec_t * f ) {
-  mock_sched_last_fec = *f;
+int mock_sched_fec_ingest_fn( fd_sched_t * s, fd_sched_fec_t * f ) {
+  (void)s; (void)f;
   mock_sched_fec_ingest_cnt++;
   return 1;
 }
@@ -208,12 +214,14 @@ mock_runtime_block_execute_prepare_fn( fd_banks_t *         banks FD_PARAM_UNUSE
   }
 
   mock_epoch_boundary_fork_cnt++;
-  bank->stake_rewards_fork_id = fd_stake_rewards_init( fd_bank_stake_rewards_modify( bank ),
-                                                       bank->f.epoch,
+  fd_stake_rewards_t * stake_rewards = fd_bank_stake_rewards_modify( bank );
+  bank->stake_rewards_fork_id = fd_stake_rewards_init( stake_rewards,
                                                        &bank->f.prev_bank_hash,
                                                        bank->f.block_height,
                                                        1U,
+                                                       0U,
                                                        0UL );
+  fd_stake_rewards_fini( stake_rewards, bank->stake_rewards_fork_id );
 }
 
 #define fd_multi_epoch_leaders_get_next_slot mock_multi_epoch_leaders_next_slot_fn
@@ -322,11 +330,17 @@ static void
 setup_timing( fd_replay_tile_t * ctx,
               fd_wksp_t *        wksp ) {
   fd_clock_tile_init( ctx->clock );
+  ctx->max_txn_per_slot     = FD_MAX_TXN_PER_SLOT;
+  ctx->max_shreds_per_block = FD_SHRED_BLK_MAX;
   void * mem = fd_wksp_alloc_laddr( wksp, fd_timing_slot_pool_align(), fd_timing_slot_pool_footprint( FD_REPLAY_TXN_TIMING_SLOTS ), 1UL );
   ctx->timing_slot_pool = fd_timing_slot_pool_join( fd_timing_slot_pool_new( mem, FD_REPLAY_TXN_TIMING_SLOTS ) );
   FD_TEST( ctx->timing_slot_pool );
+  ctx->timing_rec = fd_wksp_alloc_laddr( wksp, alignof(fd_replay_txn_timing_t), FD_REPLAY_TXN_TIMING_SLOTS*ctx->max_txn_per_slot*sizeof(fd_replay_txn_timing_t), 1UL );
+  FD_TEST( ctx->timing_rec );
   ctx->timing_slot_of_bank = test_timing_of_bank;
   for( ulong i=0UL; i<TEST_BANKS_MAX; i++ ) ctx->timing_slot_of_bank[ i ] = fd_timing_slot_pool_idx_null( ctx->timing_slot_pool );
+  ctx->backfill_path = fd_wksp_alloc_laddr( wksp, alignof(fd_reasm_fec_t *), (ctx->max_shreds_per_block/FD_FEC_SHRED_CNT)*sizeof(fd_reasm_fec_t *), 1UL );
+  FD_TEST( ctx->backfill_path );
 }
 
 static void
@@ -337,6 +351,7 @@ setup_ctx_with_fork_width( fd_replay_tile_t * ctx,
   mock_store_view_call_cnt    = 0UL;
   mock_store_view_success_cnt = 0UL;
   mock_store_view_release_cnt = 0UL;
+  mock_store_view_fail        = 0;
   memset( ctx, 0, sizeof(*ctx) );
   setup_timing( ctx, wksp );
 
@@ -965,7 +980,7 @@ test_consensus_root_notification_handoff( fd_wksp_t * wksp ) {
 
   void * store_mem = fd_wksp_alloc_laddr( wksp, fd_store_align(), fd_store_footprint( 2UL, 1UL, 0UL, 0UL, 0UL ), 1UL );
   FD_TEST( store_mem );
-  ctx->store = fd_store_join( fd_store_new( store_mem, 2UL, 1UL, 0UL, 0UL, 0UL, "/tmp/test_replay_tile_fec_payload.db", 0UL ) );
+  ctx->store = fd_store_join( fd_store_new( store_mem, 2UL, 1UL, 0UL, 0UL, 0UL, FD_SHRED_BLK_MAX, 0UL ) );
   FD_TEST( ctx->store );
   FD_TEST( fd_store_map_ljoin( ctx->store, ctx->map_join ) );
   ctx->store_disk_fd = -1;
@@ -1715,7 +1730,8 @@ test_epoch_boundary_fork_width_evict( fd_wksp_t * wksp ) {
 
   static fd_replay_tile_t ctx[ 1 ];
   ulong const max_fork_width = 4UL;
-  ulong const max_boundary_child_forks = max_fork_width - 1UL; /* stake rewards reserves one fork for root */
+  /* Leave one fork-width slot for the non-boundary sibling below. */
+  ulong const max_boundary_child_forks = max_fork_width - 1UL;
   setup_ctx_with_fork_width( ctx, wksp, max_fork_width );
 
   mock_epoch_boundary_enabled = 1;
@@ -1888,6 +1904,166 @@ test_banks_full_prune_leaf( fd_wksp_t * wksp ) {
   FD_TEST( !fd_banks_can_start_bank( ctx->banks ) );
 
   FD_LOG_NOTICE(( "pass: test_banks_full_prune_leaf" ));
+}
+
+static void
+test_reused_parent_bank_idx_not_leader_bank( fd_wksp_t * wksp ) {
+  static fd_replay_tile_t ctx[ 1 ];
+  setup_ctx( ctx, wksp );
+
+  fd_hash_t mr_root   = { .ul = { 100UL } };
+  fd_hash_t mr_parent = { .ul = { 200UL } };
+  fd_hash_t mr_child  = { .ul = { 300UL } };
+  init_root_fec( ctx, &mr_root );
+
+  ingest_fec_complete( ctx, &mr_parent, &mr_root, 1UL, 0U, 1U, 32U, 1, 1 );
+  fd_reasm_fec_t * parent = drive_one_fec( ctx, 1UL, 0U );
+  fd_bank_t *      bank   = fd_banks_bank_query( ctx->banks, parent->bank_idx );
+  FD_TEST( bank );
+  bank->refcnt = 0UL;
+
+  fd_reasm_fec_t * child = ingest_fec_complete( ctx, &mr_child, &mr_parent, 2UL, 0U, 1U, 32U, 1, 1 );
+  FD_TEST( fd_reasm_parent( ctx->reasm, child )==parent );
+
+  uint  old_bank_idx = parent->bank_idx;
+  ulong old_bank_seq = parent->bank_seq;
+  FD_TEST( fd_banks_get_evictable_bank( ctx->banks, NULL )==old_bank_idx );
+  fd_banks_prune_cancel_info_t cancel[ 1 ];
+  FD_TEST( fd_banks_prune_one_bank( ctx->banks, cancel ) );
+
+  fd_bank_t * leader_bank = fd_banks_new_bank( ctx->banks, fd_banks_root( ctx->banks )->idx, 0L, 1 );
+  FD_TEST( leader_bank->idx==old_bank_idx );
+  FD_TEST( leader_bank->bank_seq!=old_bank_seq );
+  ctx->leader_bank = leader_bank;
+  ctx->is_leader   = 1;
+
+  ulong leader_bid_wait = ctx->metrics.leader_bid_wait;
+  int   evict_banks     = 0;
+  FD_TEST( can_process_fec( ctx, &evict_banks ) );
+  FD_TEST( ctx->metrics.leader_bid_wait==leader_bid_wait );
+  FD_TEST( !evict_banks );
+
+  /* The rotor path resolves the same stale parent through the Alpenglow
+     block-id map.  It must detect the recycled generation and drop the
+     FEC instead of treating the current leader as its parent. */
+
+  ulong  chain_cnt  = fd_ag_block_id_map_chain_cnt_est( TEST_BANKS_MAX );
+  void * ag_map_mem = fd_wksp_alloc_laddr( wksp, fd_ag_block_id_map_align(), fd_ag_block_id_map_footprint( chain_cnt ), 1UL );
+  FD_TEST( ag_map_mem );
+  ctx->ag_block_id_map_seed = 7UL;
+  ctx->ag_block_id_map      = fd_ag_block_id_map_join( fd_ag_block_id_map_new( ag_map_mem, chain_cnt, ctx->ag_block_id_map_seed ) );
+  FD_TEST( ctx->ag_block_id_map );
+
+  fd_block_id_ele_t * parent_ele = &ctx->block_id_arr[ old_bank_idx ];
+  parent_ele->block_info = ag_block_id( 1UL, mr_parent.uc );
+  FD_TEST( fd_ag_block_id_map_ele_insert( ctx->ag_block_id_map, parent_ele, ctx->block_id_arr ) );
+
+  ulong chunk = ctx->in[ TEST_REPAIR_IN_IDX ].chunk0;
+  fd_rotor_replay_fec_t * rotor_fec = fd_chunk_to_laddr( ctx->in[ TEST_REPAIR_IN_IDX ].mem, chunk );
+  *rotor_fec = (fd_rotor_replay_fec_t) {
+    .slot            = 2UL,
+    .fec_set_idx     = 0U,
+    .parent_slot     = 1UL,
+    .parent_block_id = mr_parent
+  };
+  ulong out_idx = ctx->replay_out->idx;
+  ulong seq0    = test_stem_seqs[ out_idx ];
+  FD_TEST( !returnable_frag( ctx, TEST_REPAIR_IN_IDX, 0UL, ROTOR_SIG_FEC_REPLAY, chunk,
+                             sizeof(fd_rotor_replay_fec_t), 0UL, 0UL,
+                             fd_frag_meta_ts_comp( fd_tickcount() ), test_stem ) );
+  FD_TEST( ctx->drain_rotor_fecs );
+  FD_TEST( test_stem_seqs[ out_idx ]==seq0+1UL );
+  fd_frag_meta_t const * m = test_stem_mcaches[ out_idx ] + fd_mcache_line_idx( seq0, test_stem_depths[ out_idx ] );
+  FD_TEST( m->sig==REPLAY_SIG_MISSING_FEC );
+  FD_TEST( ctx->metrics.leader_bid_wait==leader_bid_wait );
+  FD_TEST( !evict_banks );
+
+  FD_LOG_NOTICE(( "pass: test_reused_parent_bank_idx_not_leader_bank" ));
+}
+
+static ulong
+replay_out_sig( fd_replay_tile_t * ctx,
+                ulong              seq );
+
+/* Backfilling an evicted block installs its block id mapping when the
+   slot-complete FEC is inserted, which is before sched runs BLOCK_START
+   and clones the bank from its parent.  A non-forward optimistic
+   confirmation arriving in that window resolves a mapping whose bank
+   holds no runtime state yet: vote_stakes_fork_id is still the
+   ULONG_MAX sentinel, and reading metrics off it indexes the t-1 vote
+   stakes pools at width id 65535, way past the max_fork_width+1
+   allocation.  The confirmation must be skipped until the bank has
+   completed replay, after SLOT_COMPLETED has been ordered ahead of it
+   on the replay output. */
+
+static void
+test_oc_skips_unfrozen_bank( fd_wksp_t * wksp ) {
+  static fd_replay_tile_t ctx[ 1 ];
+  setup_ctx( ctx, wksp );
+
+  static fd_node_info_box_t node_info_box[ 1 ];
+  ctx->node_info = fd_node_info_box_join( fd_node_info_box_new( node_info_box ) );
+  FD_TEST( ctx->node_info );
+
+  fd_hash_t mr_root = { .ul = { 100UL } };
+  init_root_fec( ctx, &mr_root );
+
+  fd_bank_t * root_bank = fd_banks_root( ctx->banks );
+  fd_bank_t * bank      = fd_banks_new_bank( ctx->banks, root_bank->idx, 0L, 0 );
+  FD_TEST( bank );
+  FD_TEST( bank->state==FD_BANK_STATE_INIT );
+  FD_TEST( bank->vote_stakes_fork_id==ULONG_MAX );
+
+  fd_hash_t           block_id = { .ul = { 777UL } };
+  fd_block_id_ele_t * ele      = &ctx->block_id_arr[ bank->idx ];
+  ele->block_id_seen  = 1;
+  ele->slot           = 1UL;
+  ele->bank_seq       = bank->bank_seq;
+  ele->latest_fec_idx = 0U;
+  ele->latest_mr      = block_id;
+  ele->dmr            = block_id;
+  FD_TEST( fd_block_id_map_ele_insert( ctx->block_id_map, ele, ctx->block_id_arr ) );
+
+  ctx->rpc_enabled = 1;
+
+  fd_tower_slot_confirmed_t msg = {
+    .level    = FD_TOWER_SLOT_CONFIRMED_OPTIMISTIC,
+    .fwd      = 0,
+    .slot     = 1UL,
+    .block_id = block_id
+  };
+
+  ulong out_idx = ctx->replay_out->idx;
+  ulong seq0    = test_stem_seqs[ out_idx ];
+  ulong refcnt0 = bank->refcnt;
+
+  process_tower_optimistic_confirmed( ctx, test_stem, &msg );
+
+  FD_TEST( test_stem_seqs[ out_idx ]==seq0 );
+  FD_TEST( bank->refcnt==refcnt0 );
+
+  /* REPLAYABLE is also too early: RPC does not populate its bank
+     metadata until replay publishes SLOT_COMPLETED. */
+
+  bank->vote_stakes_fork_id = root_bank->vote_stakes_fork_id;
+  bank->state               = FD_BANK_STATE_REPLAYABLE;
+
+  process_tower_optimistic_confirmed( ctx, test_stem, &msg );
+
+  FD_TEST( test_stem_seqs[ out_idx ]==seq0 );
+  FD_TEST( bank->refcnt==refcnt0 );
+
+  /* Once the block is frozen the confirmation is published. */
+
+  bank->state = FD_BANK_STATE_FROZEN;
+
+  process_tower_optimistic_confirmed( ctx, test_stem, &msg );
+
+  FD_TEST( test_stem_seqs[ out_idx ]==seq0+1UL );
+  FD_TEST( replay_out_sig( ctx, seq0 )==REPLAY_SIG_OC_ADVANCED );
+  FD_TEST( bank->refcnt==refcnt0+1UL );
+
+  FD_LOG_NOTICE(( "pass: test_oc_skips_unfrozen_bank" ));
 }
 
 /* Out-queue misordering on eqvoc + confirm.
@@ -2225,9 +2401,9 @@ deliver_rotor_fec_bid( fd_replay_tile_t * ctx,
 
    Observability: the skip returns at the top of process_rotor_fec,
    before the store lock, so store_query_cnt does NOT advance for a
-   skipped FEC but DOES advance for one that is processed (it reaches
-   the store query, then drops for want of a store FEC -- the point is
-   only that it was not skipped). */
+   skipped FEC.  The control FEC forces payload pinning to fail after a
+   successful lookup and verifies replay abandons it before creating a
+   bank or changing the block-id map. */
 static void
 test_process_rotor_fec_skip_replayed( fd_wksp_t * wksp ) {
   static fd_replay_tile_t ctx[ 1 ];
@@ -2286,13 +2462,24 @@ test_process_rotor_fec_skip_replayed( fd_wksp_t * wksp ) {
   FD_TEST( ele5->block_id_seen==1 );                        /* existing ele untouched */
 
   /* (2) Redelivered FEC for a NOT-yet-replayed block {6, C}: processed
-     past the skip check, reaching the store query (dropped there for
-     want of a store FEC -- but NOT skipped). */
+     past the skip check.  Model rotor removing the FEC between delivery
+     and replay's payload acquisition.  This must be treated as a pruned
+     slice, not an assertion failure, and must not leave a bank behind. */
   fd_hash_t C   = { .ul = { 0x6160UL } };
   fd_hash_t mrY = { .ul = { 601 } };
+  ag_block_id_t C_key = ag_block_id( 6UL, C.uc );
+  ulong view0    = mock_store_view_call_cnt;
+  ulong missing0 = ctx->metrics.store_query_missing_cnt;
+  mock_store_view_fail = 1;
   r = deliver_rotor_fec_bid( ctx, 6UL, 0U, 0UL, &parent_bid, &C, &mrY, 1, 1 );
+  mock_store_view_fail = 0;
   FD_TEST( r==0 );
-  FD_TEST( ctx->metrics.store_query_cnt==q0+1UL );          /* reached the store: not skipped */
+  FD_TEST( ctx->metrics.store_query_cnt==q0+1UL );
+  FD_TEST( ctx->metrics.store_query_missing_cnt==missing0+1UL );
+  FD_TEST( mock_store_view_call_cnt==view0+1UL );
+  FD_TEST( mock_store_view_success_cnt==mock_store_view_release_cnt );
+  FD_TEST( fd_banks_pool_used_cnt( ctx->banks )==used0 );
+  FD_TEST( !fd_ag_block_id_map_ele_query( ctx->ag_block_id_map, &C_key, NULL, ctx->block_id_arr ) );
 
   FD_LOG_NOTICE(( "pass: test_process_rotor_fec_skip_replayed" ));
 }
@@ -2783,6 +2970,8 @@ main( int     argc,
   test_consensus_root_notification_handoff( wksp ); fd_wksp_reset( wksp, 42U );
   test_epoch_boundary_fork_width_evict( wksp );     fd_wksp_reset( wksp, 42U );
   test_banks_full_prune_leaf( wksp );               fd_wksp_reset( wksp, 42U );
+  test_reused_parent_bank_idx_not_leader_bank( wksp ); fd_wksp_reset( wksp, 42U );
+  test_oc_skips_unfrozen_bank( wksp );              fd_wksp_reset( wksp, 42U );
   test_banks_evict_backfill( wksp );                fd_wksp_reset( wksp, 42U );
   test_backfill_partial_sched_capacity( wksp );     fd_wksp_reset( wksp, 42U );
   test_double_confirm_backfill( wksp );             fd_wksp_reset( wksp, 42U );

@@ -2,7 +2,7 @@
 #define HEADER_fd_src_choreo_votor_ag_votor_h
 
 #include "ag_votor_base.h"
-#include "ag_bls.h"
+#include "../../ballet/bls/fd_bls.h"
 #include "ag_event.h"
 
 typedef struct ag_votor ag_votor_t;
@@ -20,29 +20,6 @@ ag_votor_new( void * mem,
               ulong  slot_max,
               ulong  seed );
 
-void
-ag_votor_advance_epoch( ag_votor_t * self,
-                        ulong        epoch_rank,
-                        ulong        epoch_slot );
-
-void
-ag_votor_set_bls_key( ag_votor_t *       self,
-                      ag_bls_sec_t const bls_key );
-
-void
-ag_votor_set_shred_version( ag_votor_t * self,
-                            ushort       shred_version );
-
-/* init before any event is handled or polled; genesis is slot 0 */
-
-void
-ag_votor_init( ag_votor_t * self,
-               ulong        slot,
-               long         now );
-
-void
-ag_votor_fini( ag_votor_t * self );
-
 ag_votor_t *
 ag_votor_join( void * mem );
 
@@ -51,6 +28,22 @@ ag_votor_leave( ag_votor_t const * votor );
 
 void *
 ag_votor_delete( void * mem );
+
+void
+ag_votor_init( ag_votor_t *   self,
+               ulong          slot,
+               long           now,
+               ushort         shred_version,
+               fd_bls_sign_fn sign_fn,
+               void *         sign_ctx );
+
+void
+ag_votor_fini( ag_votor_t * self );
+
+void
+ag_votor_advance_epoch( ag_votor_t * self,
+                        ulong        epoch_rank,
+                        ulong        epoch_slot );
 
 void
 ag_votor_handle_pool_event( ag_votor_t *            self,

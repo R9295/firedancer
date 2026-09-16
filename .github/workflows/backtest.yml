@@ -4,7 +4,7 @@ on:
     inputs:
       machine:
         type: string
-        default: linux_gcc_zen2
+        default: native
       extras:
         type: string
         default: handholding
@@ -18,7 +18,7 @@ on:
     inputs:
       machine:
         type: string
-        default: linux_gcc_zen2
+        default: native
       extras:
         type: string
         default: handholding
@@ -47,8 +47,6 @@ jobs:
       - uses: actions/checkout@v7
 
       - uses: ./.github/actions/submodule-init
-
-      - uses: ./.github/actions/deps
 
       - uses: ./.github/actions/hugepages
         with:

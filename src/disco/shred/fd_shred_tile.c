@@ -32,6 +32,13 @@
 #include "../../flamenco/runtime/fd_slot_params.h"
 #include "../../discof/tower/fd_tower_slot_rooted.h"
 #include "../../discof/votor/fd_votor_rooted.h"
+#if FD_HAS_AVX
+#include "../../util/simd/fd_nt_memcpy.h"
+#else
+#define fd_memcpy_tn         fd_memcpy
+#define fd_memcpy_nt_nofence fd_memcpy
+#define _mm_sfence()         do {} while( 0 )
+#endif
 
 /* The shred tile handles shreds from two data sources: shreds generated
    from microblocks from the leader pipeline, and shreds retransmitted
@@ -227,6 +234,7 @@ typedef struct {
   fd_store_t    * store;
   fd_store_map_t  map_join[1];
   int             disk_fd;
+  int             store_maintenance;
 
   fd_gossip_update_message_t gossip_upd_buf[1];
 
@@ -236,7 +244,7 @@ typedef struct {
     fd_histf_t batch_microblock_cnt[ 1 ];
     fd_histf_t shredding_timing[ 1 ];
     fd_histf_t add_shred_timing[ 1 ];
-    fd_histf_t disk_write_timing[ 1 ];
+    fd_histf_t fec_fallback_write_timing[ 1 ];
     ulong shred_processing_result[ FD_FEC_RESOLVER_ADD_SHRED_RETVAL_CNT+FD_SHRED_ADD_SHRED_EXTRA_RETVAL_CNT ];
     ulong invalid_block_id_cnt;
     ulong shred_rejected_unchained_cnt;
@@ -245,9 +253,8 @@ typedef struct {
     ulong turbine_rcv_cnt;
     ulong turbine_rcv_bytes;
     ulong bad_nonce;
-    ulong disk_inserted;
-    ulong disk_write_failed;
-    ulong disk_write_bytes;
+    ulong fec_fallback_write_cnt;
+    ulong fec_fallback_write_bytes;
   } metrics[ 1 ];
 
   struct {
@@ -288,7 +295,7 @@ typedef struct {
   ulong                          next_max_shred_idx;
   ulong                          current_max_shred_idx_start_slot;
   ulong                          next_max_shred_idx_start_slot;
-  int                            larger_shred_limits_per_block;
+  ulong                          bench_max_shred_idx; /* [development.bench.max_shreds_per_block], floors the chain's limits */
   /* too large to be left in the stack */
   fd_shred_dest_idx_t scratchpad_dests[ FD_SHRED_DEST_MAX_FANOUT*(FD_REEDSOL_DATA_SHREDS_MAX+FD_REEDSOL_PARITY_SHREDS_MAX) ];
 
@@ -373,15 +380,14 @@ metrics_write( fd_shred_ctx_t * ctx ) {
   FD_MHIST_COPY( SHRED, MICROBLOCK_PER_BATCH,       ctx->metrics->batch_microblock_cnt         );
   FD_MHIST_COPY( SHRED, SHREDDING_DURATION_SECONDS, ctx->metrics->shredding_timing             );
   FD_MHIST_COPY( SHRED, ADD_SHRED_DURATION_SECONDS, ctx->metrics->add_shred_timing             );
-  FD_MHIST_COPY( SHRED, DISK_WRITE_SECONDS,         ctx->metrics->disk_write_timing            );
+  FD_MHIST_COPY( SHRED, FEC_FALLBACK_WRITE_SECONDS, ctx->metrics->fec_fallback_write_timing    );
   FD_MCNT_SET  ( SHRED, SHRED_REPAIR_RX,            ctx->metrics->repair_rcv_cnt               );
   FD_MCNT_SET  ( SHRED, SHRED_REPAIR_RX_BYTES,      ctx->metrics->repair_rcv_bytes             );
   FD_MCNT_SET  ( SHRED, SHRED_TURBINE_RX,           ctx->metrics->turbine_rcv_cnt              );
   FD_MCNT_SET  ( SHRED, SHRED_TURBINE_RX_BYTES,     ctx->metrics->turbine_rcv_bytes            );
   FD_MCNT_SET  ( SHRED, NONCE_INVALID,              ctx->metrics->bad_nonce                    );
-  FD_MCNT_SET  ( SHRED, DISK_SHRED_INSERTED,        ctx->metrics->disk_inserted                );
-  FD_MCNT_SET  ( SHRED, DISK_WRITE_FAILED,          ctx->metrics->disk_write_failed            );
-  FD_MCNT_SET  ( SHRED, DISK_WRITE_BYTES,           ctx->metrics->disk_write_bytes             );
+  FD_MCNT_SET  ( SHRED, FEC_FALLBACK_WRITE,          ctx->metrics->fec_fallback_write_cnt       );
+  FD_MCNT_SET  ( SHRED, FEC_FALLBACK_WRITE_BYTES,    ctx->metrics->fec_fallback_write_bytes     );
 
   FD_MCNT_SET  ( SHRED, BLOCK_ID_INVALID,           ctx->metrics->invalid_block_id_cnt         );
   FD_MCNT_SET  ( SHRED, SHRED_UNCHAINED_REJECTED,   ctx->metrics->shred_rejected_unchained_cnt );
@@ -390,28 +396,12 @@ metrics_write( fd_shred_ctx_t * ctx ) {
 }
 
 static void
-persist_data_shred( fd_shred_ctx_t *    ctx,
-                    fd_shred_t const * shred ) {
-  if( FD_UNLIKELY( !ctx->store || !fd_store_has_disk( ctx->store ) || ctx->disk_fd<0 ) ) return;
-  long disk_write_timing = -fd_tickcount();
-  int  disk_result       = fd_store_disk_insert( ctx->store, ctx->disk_fd, shred );
-  disk_write_timing     += fd_tickcount();
-  fd_histf_sample( ctx->metrics->disk_write_timing, (ulong)disk_write_timing );
-
-  if( FD_LIKELY( disk_result==FD_STORE_DISK_INSERT_SUCCESS ) ) {
-    ctx->metrics->disk_inserted++;
-    ctx->metrics->disk_write_bytes += sizeof(fd_shredb_entry_t);
-  } else {
-    ctx->metrics->disk_write_failed++;
-  }
-}
-
-static void
 after_credit( fd_shred_ctx_t *    ctx,
               fd_stem_context_t * stem FD_PARAM_UNUSED,
               int *               opt_poll_in FD_PARAM_UNUSED,
               int *               charge_busy ) {
-  if( FD_LIKELY( ctx->store && ctx->disk_fd>=0 && fd_store_disk_maintain( ctx->store, ctx->disk_fd ) ) )
+  if( FD_UNLIKELY( ctx->store_maintenance && ctx->disk_fd>=0 &&
+                   fd_store_disk_maintain( ctx->store, ctx->disk_fd ) ) )
     *charge_busy = 1;
 }
 
@@ -574,28 +564,26 @@ during_frag( fd_shred_ctx_t * ctx,
 
     *ctx->epoch_schedule = epoch_msg->epoch_schedule;
 
-    if( FD_LIKELY( !ctx->larger_shred_limits_per_block ) ) {
-      fd_slot_params_t slot_params = fd_slot_params_lookup( &FD_SLOT_PARAMS_400MS,
-                                                            &epoch_msg->features,
-                                                            &epoch_msg->epoch_schedule,
-                                                            epoch_msg->start_slot );
+    fd_slot_params_t slot_params = fd_slot_params_lookup( &FD_SLOT_PARAMS_400MS,
+                                                          &epoch_msg->features,
+                                                          &epoch_msg->epoch_schedule,
+                                                          epoch_msg->start_slot );
 
-      ctx->current_max_shred_idx            = slot_params.max_shred_idx;
-      ctx->current_max_shred_idx_start_slot = fd_slot_params_effective_slot( &slot_params,
-                                                                             &epoch_msg->features,
-                                                                             &epoch_msg->epoch_schedule );
-      ctx->next_max_shred_idx_start_slot    = fd_slot_params_next_effective_slot( &slot_params,
-                                                                                  &epoch_msg->features,
-                                                                                  &epoch_msg->epoch_schedule );
-      ctx->prev_max_shred_idx               = fd_slot_params_lookup( &FD_SLOT_PARAMS_400MS,
-                                                                     &epoch_msg->features,
-                                                                     &epoch_msg->epoch_schedule,
-                                                                     fd_ulong_sat_sub( ctx->current_max_shred_idx_start_slot, 1UL ) ).max_shred_idx;
-      ctx->next_max_shred_idx               = fd_slot_params_lookup( &FD_SLOT_PARAMS_400MS,
-                                                                     &epoch_msg->features,
-                                                                     &epoch_msg->epoch_schedule,
-                                                                     ctx->next_max_shred_idx_start_slot ).max_shred_idx;
-    }
+    ctx->current_max_shred_idx            = fd_ulong_max( slot_params.max_shred_idx, ctx->bench_max_shred_idx );
+    ctx->current_max_shred_idx_start_slot = fd_slot_params_effective_slot( &slot_params,
+                                                                           &epoch_msg->features,
+                                                                           &epoch_msg->epoch_schedule );
+    ctx->next_max_shred_idx_start_slot    = fd_slot_params_next_effective_slot( &slot_params,
+                                                                                &epoch_msg->features,
+                                                                                &epoch_msg->epoch_schedule );
+    ctx->prev_max_shred_idx               = fd_ulong_max( fd_slot_params_lookup( &FD_SLOT_PARAMS_400MS,
+                                                                                 &epoch_msg->features,
+                                                                                 &epoch_msg->epoch_schedule,
+                                                                                 fd_ulong_sat_sub( ctx->current_max_shred_idx_start_slot, 1UL ) ).max_shred_idx, ctx->bench_max_shred_idx );
+    ctx->next_max_shred_idx               = fd_ulong_max( fd_slot_params_lookup( &FD_SLOT_PARAMS_400MS,
+                                                                                 &epoch_msg->features,
+                                                                                 &epoch_msg->epoch_schedule,
+                                                                                 ctx->next_max_shred_idx_start_slot ).max_shred_idx, ctx->bench_max_shred_idx );
     ctx->features_activation->enforce_fixed_fec_set = fd_shred_get_feature_activation_slot0(
       epoch_msg->features.enforce_fixed_fec_set, ctx );
 
@@ -646,14 +634,12 @@ during_frag( fd_shred_ctx_t * ctx,
 
       *ctx->features_activation = msg->features_activation;
 
-      if( FD_LIKELY( !ctx->larger_shred_limits_per_block ) ) {
-        fd_shred_slot_limits_t const * lim    = &msg->slot_limits;
-        ctx->prev_max_shred_idx               = lim->prev_max_shred_idx;
-        ctx->current_max_shred_idx            = lim->current_max_shred_idx;
-        ctx->next_max_shred_idx               = lim->next_max_shred_idx;
-        ctx->current_max_shred_idx_start_slot = lim->current_start_slot;
-        ctx->next_max_shred_idx_start_slot    = lim->next_start_slot;
-      }
+      fd_shred_slot_limits_t const * lim    = &msg->slot_limits;
+      ctx->prev_max_shred_idx               = fd_ulong_max( lim->prev_max_shred_idx,    ctx->bench_max_shred_idx );
+      ctx->current_max_shred_idx            = fd_ulong_max( lim->current_max_shred_idx, ctx->bench_max_shred_idx );
+      ctx->next_max_shred_idx               = fd_ulong_max( lim->next_max_shred_idx,    ctx->bench_max_shred_idx );
+      ctx->current_max_shred_idx_start_slot = lim->current_start_slot;
+      ctx->next_max_shred_idx_start_slot    = lim->next_start_slot;
     }
     else { /* (fd_disco_poh_sig_pkt_type( sig )==POH_PKT_TYPE_MICROBLOCK) */
       /* This is a frag from the PoH tile.  We'll copy it to our pending
@@ -789,7 +775,7 @@ during_frag( fd_shred_ctx_t * ctx,
       if( FD_LIKELY( include_in_current_batch ) ) {
         if( FD_UNLIKELY( SHOULD_PROCESS_THESE_SHREDS ) ) {
           /* Ugh, yet another memcpy */
-          fd_memcpy( ctx->pending_batch.payload + ctx->pending_batch.pos, entry, entry_sz );
+          fd_memcpy_tn( ctx->pending_batch.payload + ctx->pending_batch.pos, entry, entry_sz );
         }
         ctx->pending_batch.pos            += entry_sz;
         ctx->pending_batch.microblock_cnt += 1UL;
@@ -866,7 +852,7 @@ alpenglow_marker:
            need to be removed (or adjusted). */
         if( FD_UNLIKELY( SHOULD_PROCESS_THESE_SHREDS ) ) {
           /* Ugh, yet another memcpy */
-          fd_memcpy( is_marker ? ctx->pending_batch.raw : ctx->pending_batch.payload + 0UL /* verbose */, entry, entry_sz );
+          fd_memcpy_tn( is_marker ? ctx->pending_batch.raw : ctx->pending_batch.payload + 0UL /* verbose */, entry, entry_sz );
         }
         ctx->pending_batch.slot           = target_slot;
         ctx->pending_batch.pos            = fd_ulong_if( is_marker, entry_sz-sizeof(ulong), entry_sz );
@@ -960,27 +946,9 @@ send_shred( fd_shred_ctx_t                 * ctx,
      to use non-temporal writes here.  We need to make sure we don't
      touch the cache line containing the network headers that we just
      wrote to though.  We know the destination is 64 byte aligned.  */
-  FD_STATIC_ASSERT( sizeof(*hdr)<64UL, non_temporal );
-  /* src[0:sizeof(hdrs)] is invalid, but now we want to copy
-     dest[i]=src[i] for i>=sizeof(hdrs), so it simplifies the code. */
-  uchar const * src = (uchar const *)((ulong)shred - sizeof(fd_ip4_udp_hdrs_t));
-  memcpy( packet+sizeof(fd_ip4_udp_hdrs_t), src+sizeof(fd_ip4_udp_hdrs_t), 64UL-sizeof(fd_ip4_udp_hdrs_t) );
-
-  ulong end_offset = shred_sz + sizeof(fd_ip4_udp_hdrs_t);
-  ulong i;
-  for( i=64UL; end_offset-i<64UL; i+=64UL ) {
-#  if FD_HAS_AVX512
-    _mm512_stream_si512( (void *)(packet+i     ), _mm512_loadu_si512( (void const *)(src+i     ) ) );
-#  else
-    _mm256_stream_si256( (void *)(packet+i     ), _mm256_loadu_si256( (void const *)(src+i     ) ) );
-    _mm256_stream_si256( (void *)(packet+i+32UL), _mm256_loadu_si256( (void const *)(src+i+32UL) ) );
-#  endif
-  }
-  _mm_sfence();
-  fd_memcpy( packet+i, src+i, end_offset-i ); /* Copy the last partial cache line */
-
+  fd_memcpy_nt( packet+sizeof(fd_ip4_udp_hdrs_t), shred, shred_sz );
 #else
-  fd_memcpy( packet+sizeof(fd_ip4_udp_hdrs_t), shred, shred_sz );
+  fd_memcpy   ( packet+sizeof(fd_ip4_udp_hdrs_t), shred, shred_sz );
 #endif
 
   ulong pkt_sz = shred_sz + sizeof(fd_ip4_udp_hdrs_t);
@@ -1169,12 +1137,6 @@ after_frag( fd_shred_ctx_t *    ctx,
       } while( 0 );
     }
 
-    if( FD_LIKELY( fd_shred_is_data( fd_shred_type( shred->variant ) )
-                   && ( (rv==FD_FEC_RESOLVER_SHRED_OKAY)
-                      | (rv==FD_FEC_RESOLVER_SHRED_COMPLETES) ) ) ) {
-      persist_data_shred( ctx, shred );
-    }
-
     if( FD_LIKELY( rv!=FD_FEC_RESOLVER_SHRED_COMPLETES ) ) return;
 
     FD_TEST( ctx->fec_sets <= *out_fec_set );
@@ -1241,20 +1203,12 @@ after_frag( fd_shred_ctx_t *    ctx,
       }
     } while( 0 );
 
-    /* Persist locally produced and recovered data shreds. */
-    for( ulong i=0UL; i<FD_FEC_SHRED_CNT; i++ )
-      if( FD_UNLIKELY( !fd_uint_extract_bit( set->data_shred_rcvd, (int)i ) ) )
-        persist_data_shred( ctx, set->data_shreds[ i ].s );
-
     /* Compute merkle root and chained merkle root. */
 
     int replay_fwd = 1;
     if( FD_LIKELY( ctx->store ) ) { /* firedancer-only */
 
       set->leader_bank = NULL; /* un-used by firedancer */
-
-      /* Insert shreds into the store. We do this regardless of whether
-         we are leader. */
 
       fd_hash_t * mr = (fd_hash_t *)fd_type_pun( &ctx->out_merkle_roots[fset_k] );
 
@@ -1265,7 +1219,13 @@ after_frag( fd_shred_ctx_t *    ctx,
       } else {
         FD_TEST( !insert_err && fec );
 
-        uchar * fec_data = fd_store_fec_data_acquire( ctx->store, ctx->disk_fd, fec );
+        fd_store_fec_spill_stats_t spill[1];
+        uchar * fec_data = fd_store_fec_data_acquire_ex( ctx->store, ctx->disk_fd, fec, spill );
+        if( FD_UNLIKELY( spill->write_cnt ) ) {
+          fd_histf_sample( ctx->metrics->fec_fallback_write_timing, spill->write_ticks );
+          ctx->metrics->fec_fallback_write_cnt   += spill->write_cnt;
+          ctx->metrics->fec_fallback_write_bytes += spill->write_bytes;
+        }
         if( FD_UNLIKELY( !fec_data ) )
           FD_LOG_CRIT(( "Store could not allocate a FEC payload" ));
         for( ulong i=0UL; i<FD_FEC_SHRED_CNT; i++ ) {
@@ -1275,43 +1235,46 @@ after_frag( fd_shred_ctx_t *    ctx,
 
             FD_LOG_CRIT(( "Shred tile %lu: completed FEC set %lu %u data_sz: %lu exceeds data_max: %lu", ctx->round_robin_id, data_shred->slot, data_shred->fec_set_idx, fec->data_sz + payload_sz, ctx->store->fec_data_max ));
           }
-          fd_memcpy( fec_data + fec->data_sz, fd_shred_data_payload( data_shred ), payload_sz );
+          fd_memcpy_nt_nofence( fec_data + fec->data_sz, fd_shred_data_payload( data_shred ), payload_sz );
           fec->data_sz += payload_sz;
           if( FD_LIKELY( i<32UL ) ) fec->shred_offs[ i ] = (uint)payload_sz +  (i==0UL ? 0U : fec->shred_offs[ i-1UL ]);
         }
+        _mm_sfence();
         fd_store_fec_data_publish( ctx->store, fec );
       }
     }
 
     if( FD_LIKELY( ctx->shred_out_idx!=ULONG_MAX && replay_fwd ) ) { /* firedancer-only */
 
-      /* Send all of the data shred headers we recovered (weren't received) */
+      /* Send all of the data shreds we recovered (weren't received).
+         The chunks are all written before any is published, so the
+         link burst must cover them or a chunk could be reused while
+         an unreliable consumer still sees its old seq. */
+      FD_STATIC_ASSERT( FD_SHRED_STEM_BURST>=32UL, shred_out_burst );
+      ulong missing_chunk[ 32 ];
+      ulong missing_cnt = 0UL;
       for( int i=0; i<32; i++ ) {
         if( fd_uint_extract_bit( set->data_shred_rcvd, i )==0 ) {
           fd_shred_t * const missing = &set->data_shreds[ i ].s[0];
 
-          ulong sig = ((ulong)FD_FEC_RESOLVER_SHRED_COMPLETES << 32UL) | SHRED_SIG_SRC_RECONSTRUCTED;
-
           fd_shred_base_t * shred_msg = (fd_shred_base_t *)fd_chunk_to_laddr( ctx->shred_out_mem, ctx->shred_out_chunk );
-          memcpy(  shred_msg->shred_, missing, fd_shred_sz( missing ) );
+          fd_memcpy_nt_nofence( shred_msg->shred_, missing, fd_shred_sz( missing ) );
           memcpy( &shred_msg->merkle_root, ctx->out_merkle_roots[fset_k].hash, sizeof(fd_hash_t) );
 
-          ulong tspub = fd_frag_meta_ts_comp( fd_tickcount() );
-          fd_stem_publish( stem, ctx->shred_out_idx, sig, ctx->shred_out_chunk, sizeof(fd_shred_base_t), 0UL, ctx->tsorig, tspub );
+          missing_chunk[ missing_cnt++ ] = ctx->shred_out_chunk;
           ctx->shred_out_chunk = fd_dcache_compact_next( ctx->shred_out_chunk, sizeof(fd_shred_base_t), ctx->shred_out_chunk0, ctx->shred_out_wmark );
         }
       }
 
-      /* Additionally, publish a frag to notify repair and replay that
-         the FEC set is complete.  Note the ordering wrt store shred
-         insertion above is intentional: shreds are inserted into the
-         store before notifying repair and replay.  This is because the
-         replay tile assumes the shreds are already in the store when
-         replay gets a notification from the shred tile that the FEC is
-         complete.  We we don't know whether shred will finish inserting
-         into store first or repair will finish validating the FEC set
-         first.  The header and merkle root of the last shred in the FEC
-         set are sent as part of this frag.
+      if( FD_LIKELY( missing_cnt ) ) {
+        _mm_sfence();
+        ulong sig   = ((ulong)FD_FEC_RESOLVER_SHRED_COMPLETES << 32UL) | SHRED_SIG_SRC_RECONSTRUCTED;
+        ulong tspub = fd_frag_meta_ts_comp( fd_tickcount() );
+        for( ulong i=0UL; i<missing_cnt; i++ ) fd_stem_publish( stem, ctx->shred_out_idx, sig, missing_chunk[ i ], sizeof(fd_shred_base_t), 0UL, ctx->tsorig, tspub );
+      }
+
+      /* Replay requires the FEC payload before this notification.
+         Wire-shred persistence on rserve is asynchronous.
 
          This message, the shred msg, and the FEC evict msg constitute
          the max 3 possible messages to repair/replay per after_frag.
@@ -1407,11 +1370,9 @@ privileged_init( fd_topo_t const *      topo,
   if( FD_LIKELY( store_obj_id!=ULONG_MAX ) ) {
     fd_store_t * store = fd_store_join( fd_topo_obj_laddr( topo, store_obj_id ) );
     FD_TEST( store );
-    if( FD_UNLIKELY( !tile->kind_id && fd_store_file_init( store ) ) )
-      FD_LOG_ERR(( "failed to initialize store file %s (%i-%s)", store->db_path, errno, fd_io_strerror( errno ) ));
-    ctx->disk_fd = fd_store_file_open( store, O_RDWR );
-    if( FD_UNLIKELY( ctx->disk_fd<0 ) )
-      FD_LOG_ERR(( "open(%s) failed (%i-%s)", store->db_path, errno, fd_io_strerror( errno ) ));
+    ctx->disk_fd = FD_STORE_FD_RW;
+    if( FD_UNLIKELY( fcntl( ctx->disk_fd, F_GETFD )<0 ) )
+      FD_LOG_ERR(( "store file descriptor was not inherited (%i-%s)", errno, fd_io_strerror( errno ) ));
   }
 
 }
@@ -1456,6 +1417,10 @@ unprivileged_init( fd_topo_t const *      topo,
     FD_TEST( ctx->store->magic==FD_STORE_MAGIC );
     FD_TEST( fd_store_map_ljoin( ctx->store, ctx->map_join ) );
   }
+  /* With rserve disabled, shred:0 remains responsible for punching
+     reclaimed spill pages, and will charge busy. */
+  ctx->store_maintenance = !!ctx->store && !ctx->round_robin_id &&
+                           fd_topo_find_tile( topo, "rserve", 0UL )==ULONG_MAX;
 
   /* If the default partial_depth is ever changed, correspondingly
      change the size of the fd_fec_intra_pool in fd_fec_repair. */
@@ -1556,10 +1521,11 @@ unprivileged_init( fd_topo_t const *      topo,
                                                             sign_out->dcache,
                                                             sign_in->mcache,
                                                             sign_in->dcache,
-                                                            sign_out->mtu ) ) );
+                                                            sign_out->mtu,
+                                                            sign_in->mtu ) ) );
 
-  ctx->larger_shred_limits_per_block = tile->shred.larger_shred_limits_per_block;
-  ulong shred_limit                  = fd_ulong_if( tile->shred.larger_shred_limits_per_block, 32UL*32UL*1024UL, 32UL*1024UL );
+  ctx->bench_max_shred_idx           = tile->shred.bench_max_shreds_per_block;
+  ulong shred_limit                  = tile->shred.max_shreds_per_block;
   ctx->shred_limit                   = shred_limit;
   fd_fec_set_t * resolver_sets       = fec_sets + fec_exposure + FD_SHRED_BATCH_FEC_SETS_MAX;
   ctx->shredder = NONNULL( fd_shredder_join     ( fd_shredder_new     ( _shredder, fd_shred_signer, ctx->keyguard_client ) ) );
@@ -1646,6 +1612,9 @@ unprivileged_init( fd_topo_t const *      topo,
     ctx->shred_out_wmark       = fd_dcache_compact_wmark ( ctx->shred_out_mem, shred_out->dcache, shred_out->mtu );
     ctx->shred_out_chunk       = ctx->shred_out_chunk0;
     FD_TEST( fd_dcache_compact_is_safe( ctx->shred_out_mem, shred_out->dcache, shred_out->mtu, shred_out->depth ) );
+    /* An unreliable consumer ignores credits, so the dcache must hold
+       a full STEM_BURST beyond the mcache depth. */
+    FD_TEST( shred_out->burst>=FD_SHRED_STEM_BURST );
   }
 
   if( FD_LIKELY( ctx->store_out_idx!=ULONG_MAX ) ) { /* frankendancer-only */
@@ -1683,8 +1652,9 @@ unprivileged_init( fd_topo_t const *      topo,
                                                                    FD_MHIST_SECONDS_MAX( SHRED, SHREDDING_DURATION_SECONDS ) ) );
   fd_histf_join( fd_histf_new( ctx->metrics->add_shred_timing,     FD_MHIST_SECONDS_MIN( SHRED, ADD_SHRED_DURATION_SECONDS ),
                                                                    FD_MHIST_SECONDS_MAX( SHRED, ADD_SHRED_DURATION_SECONDS ) ) );
-  fd_histf_join( fd_histf_new( ctx->metrics->disk_write_timing,    FD_MHIST_SECONDS_MIN( SHRED, DISK_WRITE_SECONDS ),
-                                                                   FD_MHIST_SECONDS_MAX( SHRED, DISK_WRITE_SECONDS ) ) );
+  fd_histf_join( fd_histf_new( ctx->metrics->fec_fallback_write_timing,
+                               FD_MHIST_SECONDS_MIN( SHRED, FEC_FALLBACK_WRITE_SECONDS ),
+                               FD_MHIST_SECONDS_MAX( SHRED, FEC_FALLBACK_WRITE_SECONDS ) ) );
   memset( ctx->metrics->shred_processing_result, '\0', sizeof(ctx->metrics->shred_processing_result) );
   ctx->metrics->invalid_block_id_cnt         = 0UL;
   ctx->metrics->shred_rejected_unchained_cnt = 0UL;
@@ -1693,9 +1663,8 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->metrics->turbine_rcv_cnt              = 0UL;
   ctx->metrics->turbine_rcv_bytes            = 0UL;
   ctx->metrics->bad_nonce                    = 0UL;
-  ctx->metrics->disk_inserted                = 0UL;
-  ctx->metrics->disk_write_failed            = 0UL;
-  ctx->metrics->disk_write_bytes             = 0UL;
+  ctx->metrics->fec_fallback_write_cnt       = 0UL;
+  ctx->metrics->fec_fallback_write_bytes     = 0UL;
 
   ctx->pending_batch.microblock_cnt = 0UL;
   ctx->pending_batch.txn_cnt        = 0UL;
@@ -1760,6 +1729,10 @@ populate_allowed_fds( fd_topo_t const *      topo,
 
 /* See explanation in fd_pack */
 #define STEM_LAZY  (128L*3000L)
+
+/* When leader, poh_shred carries a stream of one microblock per frag
+   and the other links are near empty; keep draining it. */
+#define STEM_STICKY_POLL_MAX (16UL)
 
 #define STEM_CALLBACK_CONTEXT_TYPE  fd_shred_ctx_t
 #define STEM_CALLBACK_CONTEXT_ALIGN alignof(fd_shred_ctx_t)

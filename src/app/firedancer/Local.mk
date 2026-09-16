@@ -2,7 +2,6 @@ ifdef FD_HAS_HOSTED
 ifdef FD_HAS_THREADS
 ifdef FD_HAS_ALLOCA
 ifdef FD_HAS_DOUBLE
-ifdef FD_HAS_ZSTD
 
 $(OBJDIR)/obj/app/firedancer/config.o: src/app/firedancer/config/default.toml
 $(OBJDIR)/obj/app/firedancer/config.o: src/app/firedancer/config/testnet.toml
@@ -28,15 +27,13 @@ $(call add-objs,commands/get_identity,fd_firedancer)
 $(call add-objs,commands/adminctl_client,fd_firedancer)
 $(call add-objs,commands/monitor_gossip/monitor_gossip commands/monitor_gossip/gossip_diag,fd_firedancer)
 
-# ifdef FD_HAS_BLST -- will be a required dependency soon
-ifdef FD_HAS_S2NBIGNUM
-$(call make-bin,firedancer,main,fd_firedancer fdctl_shared fdctl_platform fd_discof fd_disco fd_choreo fd_flamenco fd_quic fd_tls fd_reedsol fd_waltz fd_tango fd_ballet fd_util,$(OPENSSL_LIBS))
-endif
-# endif
+ifdef FD_ARCH_SUPPORTS_SANDBOX
+$(call make-bin,firedancer,main,fd_firedancer fdctl_shared fdctl_platform fd_discof fd_disco fd_choreo fd_flamenco fd_quic fd_tls fd_reedsol fd_waltz fd_tango fd_ballet fd_util)
 
-else
-$(warning firedancer build disabled due to lack of zstd)
+$(call make-unit-test,test_topo_progcache,test_topo_progcache,fd_firedancer fdctl_shared fdctl_platform fd_discof fd_disco fd_choreo fd_flamenco fd_quic fd_tls fd_reedsol fd_waltz fd_tango fd_ballet fd_util)
+$(call run-unit-test,test_topo_progcache)
 endif
+
 endif
 endif
 endif

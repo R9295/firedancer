@@ -5,21 +5,18 @@
 #include "ag_cert.h"
 #include "ag_epoch_info.h"
 #include "ag_event.h"
+#include "ag_slot_state.h"
 #include "ag_vote.h"
 
 #define AG_POOL_SUCCESS                ( 0)
 #define AG_POOL_ERR_SLOT_OUT_OF_BOUNDS (-1)
 #define AG_POOL_ERR_DUPLICATE          (-2)
 #define AG_POOL_ERR_SLASHABLE          (-3)
-
-#define AG_POOL_ERR_HASH_CAPACITY      (-4)
+#define AG_POOL_ERR_CERT_VERIFY        (-4)
 
 typedef struct ag_pool ag_pool_t;
 
 FD_PROTOTYPES_BEGIN
-
-FD_FN_CONST char const *
-ag_pool_strerror( int err );
 
 FD_FN_CONST ulong
 ag_pool_align( void );
@@ -46,11 +43,14 @@ ag_pool_delete( void * mem );
    notar-fallback-or-stronger parent for the first live leader window. */
 
 void
-ag_pool_init( ag_pool_t * self,
+ag_pool_init( ag_pool_t *           self,
               ag_block_id_t const * boot_block );
 
 void
 ag_pool_fini( ag_pool_t * self );
+
+FD_FN_CONST char const *
+ag_pool_strerror( int err );
 
 void
 ag_pool_advance_epoch( ag_pool_t *             self,
@@ -60,19 +60,48 @@ ag_pool_advance_epoch( ag_pool_t *             self,
 
 int
 ag_pool_add_cert( ag_pool_t *       self,
-                  ag_cert_t const * cert );
+                  ag_cert_t const * cert,
+                  fd_bls_set_t *    bad );
 
 int
 ag_pool_add_vote( ag_pool_t *       self,
-                  ag_vote_t const * vote );
+                  ag_vote_t const * vote,
+                  fd_bls_set_t *    bad );
 
-void
+int
 ag_pool_add_block( ag_pool_t *           self,
                    ag_block_id_t const * block_id,
-                   ag_block_id_t const * parent_id );
+                   ag_block_id_t const * parent_id,
+                   fd_bls_set_t *        bad );
+
+ag_slot_state_t const *
+ag_pool_slot_state( ag_pool_t const * self,
+                    ulong             slot );
+
+/* ag_pool_standstill is called when no new finalization has been
+   observed for AG_DELTA_STANDSTILL_NS, and again every
+   AG_DELTA_STANDSTILL_NS for as long as that lasts.  Schedules every
+   slot above the finalized slot that currently holds a cert or one of
+   our own votes for ag_pool_refresh, and emits an
+   AG_EVENT_POOL_STANDSTILL naming the finalized slot so Votor extends
+   its skip timeouts.  Mirrors Agave's Standstill event and its refresh
+   of votes and certs into the StandstillRefreshQueue. */
 
 void
-ag_pool_recover_from_standstill( ag_pool_t * self );
+ag_pool_standstill( ag_pool_t * self );
+
+/* ag_pool_refresh is called every AG_REFRESH_INTERVAL_NS.  If any slot
+   scheduled by ag_pool_standstill is still above the finalized slot,
+   emits an AG_EVENT_POOL_REFRESH with at most AG_REFRESH_MSG_MAX
+   messages to rebroadcast: the certs that finalized the finalized slot,
+   then whole slots of certs and own votes, resuming after the slot the
+   previous refresh ended on and wrapping around once.  Does nothing
+   while the previous refresh event has not been polled, as the event
+   points into pool scratch.  Mirrors Agave's
+   VotingService::maybe_handle_standstill_queue. */
+
+void
+ag_pool_refresh( ag_pool_t * self );
 
 FD_FN_PURE ulong
 ag_pool_finalized_slot( ag_pool_t const * self );
@@ -90,10 +119,6 @@ ag_pool_parents_ready( ag_pool_t * self,
 ag_block_id_t
 ag_pool_wait_for_parent_ready( ag_pool_t * self,
                                ulong       slot );
-
-/* ag_pool_poll_pool_event and ag_pool_poll_repair_event drain the pool's
-   two outbound event streams.  Each dequeues at most one event per call,
-   returning 1 and writing it to event, or 0 if the stream is empty. */
 
 int
 ag_pool_poll_pool_event( ag_pool_t *       self,

@@ -6,7 +6,7 @@
 #include "../program/fd_precompiles.h"
 #include "../fd_system_ids.h"
 #include "../../progcache/fd_progcache_admin.h"
-#include "../../rewards/fd_alpen_rewards.h"
+#include "../../alpenglow/fd_alpenglow.h"
 #include "../../log_collector/fd_log_collector.h"
 
 void
@@ -81,7 +81,7 @@ fd_solfuzz_pb_instr_ctx_create( fd_solfuzz_runner_t *                runner,
 
     ulong payload_sz = fd_ulong_min( test_ctx->data->size, sizeof(txn->payload) );
     memcpy( txn->payload, test_ctx->data->bytes, payload_sz );
-    txn->payload_sz = payload_sz;
+    txn->payload_sz = (ushort)payload_sz;
   }
   txn_descriptor->transaction_version = FD_TXN_VLEGACY;
   txn_descriptor->acct_addr_cnt       = (ushort)test_ctx->accounts_count;
@@ -377,9 +377,6 @@ fd_solfuzz_pb_instr_ctx_destroy( fd_solfuzz_runner_t * runner,
   int charge_busy = 0;
   fd_accdb_background( runner->accdb, &charge_busy );
 
-  /* Compact the progcache allocator so empty superblocks are returned
-     to the workspace.  Required for the leak check to pass. */
-  fd_alloc_compact( runner->progcache->join->alloc );
 }
 
 /* Txn index for addr among the compiled-message accounts [0,cnt).

@@ -25,6 +25,7 @@
 #define AG_EVENT_POOL_SAFE_TO_SKIP  (2)
 #define AG_EVENT_POOL_CERT_CREATED  (3)
 #define AG_EVENT_POOL_STANDSTILL    (4)
+#define AG_EVENT_POOL_REFRESH       (5)
 
 struct ag_event_pool {
   ulong seq;
@@ -35,7 +36,8 @@ struct ag_event_pool {
     ag_block_id_t     safe_to_notar;
     ulong             safe_to_skip;
     ag_cert_t         cert_created;
-    ag_standstill_t   standstill;
+    ulong             standstill; /* highest finalized slot when standstill was detected */
+    ag_refresh_t      refresh;    /* points into ag_pool scratch, valid until the next refresh */
   };
 };
 typedef struct ag_event_pool ag_event_pool_t;

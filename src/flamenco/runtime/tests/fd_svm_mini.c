@@ -30,6 +30,7 @@
 
 #define SENTINEL ((fd_accdb_fork_id_t){ .val = USHORT_MAX })
 
+
 static fd_wksp_t *
 fd_wksp_new_lazy( ulong footprint,
                   ulong addl_part_cnt ) {
@@ -103,8 +104,8 @@ fd_svm_mini_wksp_data_max( fd_svm_mini_limits_t const * limits ) {
   ulong txn_max     = limits->max_live_slots;
   ulong joiner_cnt  = fd_ulong_max( limits->accdb_joiner_cnt, 1UL );
 
-  ulong pcache_sz         = fd_progcache_shmem_footprint( txn_max, limits->max_progcache_recs );
-  ulong txncache_shmem_sz = fd_txncache_shmem_footprint( txn_max, limits->max_txn_per_slot, 0 );
+  ulong pcache_sz         = fd_progcache_shmem_footprint( txn_max, fd_progcache_shmem_min_sz( txn_max ) );
+  ulong txncache_shmem_sz = fd_txncache_shmem_footprint( txn_max, limits->max_txn_per_slot );
   ulong txncache_sz       = fd_txncache_footprint( txn_max );
   ulong banks_sz          = fd_banks_footprint( txn_max, limits->max_fork_width, limits->max_stake_accounts, limits->max_fallback_stake_accounts, limits->max_vote_accounts );
   ulong runtime_stack_sz  = fd_runtime_stack_footprint( limits->max_vote_accounts, limits->max_vote_accounts, limits->max_stake_accounts );
@@ -127,7 +128,6 @@ fd_svm_mini_wksp_data_max( fd_svm_mini_limits_t const * limits ) {
   sz += WKSP_ALLOC( alignof(fd_runtime_t),      sizeof(fd_runtime_t)             );
   sz += WKSP_ALLOC( fd_runtime_stack_align(),   runtime_stack_sz                 );
   sz += WKSP_ALLOC( fd_vm_align(),              fd_vm_footprint()                );
-  sz += WKSP_ALLOC( 1UL,                        limits->max_progcache_heap_bytes );
   sz += WKSP_ALLOC( 16UL,                       limits->wksp_addl_sz             );
 # undef WKSP_ALLOC
 
@@ -142,8 +142,9 @@ fd_svm_mini_create( fd_wksp_t *                  wksp,
   ulong const txn_max     = limits->max_live_slots;
   ulong const joiner_cnt  = fd_ulong_max( limits->accdb_joiner_cnt, 1UL );
 
-  ulong pcache_sz        = fd_progcache_shmem_footprint( txn_max, limits->max_progcache_recs );
-  ulong txncache_shmem_sz = fd_txncache_shmem_footprint( txn_max, limits->max_txn_per_slot, 0 );
+  ulong progcache_sz      = fd_progcache_shmem_min_sz( txn_max );
+  ulong pcache_sz         = fd_progcache_shmem_footprint( txn_max, progcache_sz );
+  ulong txncache_shmem_sz = fd_txncache_shmem_footprint( txn_max, limits->max_txn_per_slot );
   ulong txncache_sz       = fd_txncache_footprint( txn_max );
   ulong banks_sz         = fd_banks_footprint( txn_max, limits->max_fork_width,
                                                limits->max_stake_accounts, limits->max_fallback_stake_accounts,
@@ -174,7 +175,7 @@ fd_svm_mini_create( fd_wksp_t *                  wksp,
   fd_memset( mini, 0, sizeof(fd_svm_mini_t) );
   mini->wksp = wksp;
 
-  fd_txncache_shmem_t * shtxncache = fd_txncache_shmem_join( fd_txncache_shmem_new( txncache_shmem, txn_max, limits->max_txn_per_slot, 0, 0UL ) );
+  fd_txncache_shmem_t * shtxncache = fd_txncache_shmem_join( fd_txncache_shmem_new( txncache_shmem, txn_max, limits->max_txn_per_slot, 0UL ) );
   if( FD_UNLIKELY( !shtxncache ) ) FD_LOG_ERR(( "fd_txncache_shmem_new failed" ));
 
   /* Create accdb backed by memfd */
@@ -197,7 +198,7 @@ fd_svm_mini_create( fd_wksp_t *                  wksp,
   mini->accdb_max_live_slots = limits->max_live_slots;
   mini->accdb_joiner_cnt     = joiner_cnt;
 
-  void * shpcache = fd_progcache_shmem_new( pcache_mem, wksp_tag, 1UL, txn_max, limits->max_progcache_recs );
+  void * shpcache = fd_progcache_shmem_new( pcache_mem, wksp_tag, 1UL, txn_max, progcache_sz );
   if( FD_UNLIKELY( !shpcache ) ) FD_LOG_ERR(( "fd_progcache_shmem_new failed" ));
 
   FD_TEST( fd_progcache_join( mini->progcache, pcache_mem, scratch, FD_PROGCACHE_SCRATCH_FOOTPRINT ) );
@@ -237,6 +238,7 @@ fd_svm_mini_create( fd_wksp_t *                  wksp,
 
   FD_TEST( fd_sha256_join( fd_sha256_new( mini->sha256 ) ) );
 
+  fd_memset( vm_mem, 0, fd_vm_footprint() );
   mini->vm = fd_vm_join( fd_vm_new( vm_mem ) );
   FD_TEST( mini->vm );
 
@@ -684,7 +686,7 @@ fd_svm_mini_freeze( fd_svm_mini_t * mini,
   /* Derive a mock POH hash so each frozen slot registers a unique
      blockhash.  (Real POH is computed by the PoH tile.) */
   fd_sha256_hash( bank->f.poh.hash, 32UL, bank->f.poh.hash );
-  fd_runtime_block_execute_finalize( bank, mini->runtime->accdb, NULL, NULL, 0UL );
+  fd_runtime_block_execute_finalize( bank, mini->runtime->accdb, NULL, NULL, (ushort)0 );
   fd_hash_t const * block_hash = fd_blockhashes_peek_last_hash( &bank->f.block_hash_queue );
   FD_TEST( block_hash );
   fd_txncache_finalize_fork( mini->txncache, bank->txncache_fork_id, 0UL, block_hash->uc );

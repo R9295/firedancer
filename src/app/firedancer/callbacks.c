@@ -30,9 +30,8 @@ banks_align( fd_topo_t const *     topo FD_FN_UNUSED,
 static void
 banks_new( fd_topo_t const *     topo,
            fd_topo_obj_t const * obj ) {
-  int larger_max_cost_per_block = fd_pod_queryf_int( topo->props, 0, "obj.%lu.larger_max_cost_per_block", obj->id );
   ulong seed = fd_pod_queryf_ulong( topo->props, 0UL, "obj.%lu.seed", obj->id );
-  FD_TEST( fd_banks_new( fd_topo_obj_laddr( topo, obj->id ), VAL("max_live_slots"), VAL("max_fork_width"), FD_RUNTIME_MAX_STAKE_ACCOUNTS, FD_RUNTIME_MAX_STAKE_ACCOUNTS_FALLBACK, FD_RUNTIME_MAX_VAT_VOTE_ACCOUNTS, larger_max_cost_per_block, seed ) );
+  FD_TEST( fd_banks_new( fd_topo_obj_laddr( topo, obj->id ), VAL("max_live_slots"), VAL("max_fork_width"), FD_RUNTIME_MAX_STAKE_ACCOUNTS, FD_RUNTIME_MAX_STAKE_ACCOUNTS_FALLBACK, FD_RUNTIME_MAX_VAT_VOTE_ACCOUNTS, VAL("bench_max_cost_per_block"), seed ) );
 }
 
 fd_topo_obj_callbacks_t fd_obj_cb_banks = {
@@ -52,13 +51,7 @@ progcache_align( fd_topo_t const *     topo,
 static ulong
 progcache_footprint( fd_topo_t const *     topo,
                      fd_topo_obj_t const * obj ) {
-  return fd_progcache_shmem_footprint( VAL("txn_max"), VAL("rec_max") );
-}
-
-static ulong
-progcache_loose( fd_topo_t const *     topo,
-                 fd_topo_obj_t const * obj ) {
-  return VAL("heap_max");
+  return fd_progcache_shmem_footprint( VAL("txn_max"), VAL("progcache_sz") );
 }
 
 static void
@@ -66,13 +59,12 @@ progcache_new( fd_topo_t const *     topo,
                fd_topo_obj_t const * obj ) {
   ulong seed = fd_pod_queryf_ulong( topo->props, 0UL, "obj.%lu.seed", obj->id );
   if( !seed ) FD_TEST( fd_rng_secure( &seed, sizeof(ulong) ) );
-  FD_TEST( fd_progcache_shmem_new( fd_topo_obj_laddr( topo, obj->id ), 2UL, seed, VAL("txn_max"), VAL("rec_max") ) );
+  FD_TEST( fd_progcache_shmem_new( fd_topo_obj_laddr( topo, obj->id ), 2UL, seed, VAL("txn_max"), VAL("progcache_sz") ) );
 }
 
 fd_topo_obj_callbacks_t fd_obj_cb_progcache = {
   .name      = "progcache",
   .footprint = progcache_footprint,
-  .loose     = progcache_loose,
   .align     = progcache_align,
   .new       = progcache_new,
 };
@@ -146,13 +138,12 @@ store_align( fd_topo_t const *     topo FD_FN_UNUSED,
 static void
 store_new( fd_topo_t const *     topo,
            fd_topo_obj_t const * obj ) {
-  char const * db_path   = fd_pod_queryf_cstr( topo->props, NULL, "obj.%lu.disk_path", obj->id );
   ulong        disk_seed = fd_pod_queryf_ulong( topo->props, 0UL, "obj.%lu.seed",      obj->id );
   FD_TEST( fd_store_new( fd_topo_obj_laddr( topo, obj->id ),
                          VAL("fec_max"), VAL("fec_data_max"),
                          VAL("shred_storage_gib"), VAL("shred_cache_bytes"),
-                         VAL("fec_set_cnt"),
-                         db_path, disk_seed ) );
+                         VAL("fec_set_cnt"), VAL("max_shreds_per_block"),
+                         disk_seed ) );
 }
 
 fd_topo_obj_callbacks_t fd_obj_cb_store = {
@@ -190,8 +181,7 @@ fd_topo_obj_callbacks_t fd_obj_cb_accdb = {
 static ulong
 txncache_footprint( fd_topo_t const *     topo,
                     fd_topo_obj_t const * obj ) {
-  int larger_max_cost_per_block = fd_pod_queryf_int( topo->props, 0, "obj.%lu.larger_max_cost_per_block", obj->id );
-  return fd_txncache_shmem_footprint( VAL("max_live_slots"), VAL("max_txn_per_slot"), larger_max_cost_per_block );
+  return fd_txncache_shmem_footprint( VAL("max_live_slots"), VAL("max_txn_per_slot") );
 }
 
 static ulong
@@ -203,8 +193,7 @@ txncache_align( fd_topo_t const *     topo FD_FN_UNUSED,
 static void
 txncache_new( fd_topo_t const *     topo,
               fd_topo_obj_t const * obj ) {
-  int larger_max_cost_per_block = fd_pod_queryf_int( topo->props, 0, "obj.%lu.larger_max_cost_per_block", obj->id );
-  FD_TEST( fd_txncache_shmem_new( fd_topo_obj_laddr( topo, obj->id ), VAL("max_live_slots"), VAL("max_txn_per_slot"), larger_max_cost_per_block, VAL("seed") ) );
+  FD_TEST( fd_txncache_shmem_new( fd_topo_obj_laddr( topo, obj->id ), VAL("max_live_slots"), VAL("max_txn_per_slot"), VAL("seed") ) );
 }
 
 fd_topo_obj_callbacks_t fd_obj_cb_txncache = {

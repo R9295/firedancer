@@ -68,6 +68,7 @@
 #include "../../disco/stem/fd_stem.h"
 #include "../../disco/topo/fd_topo.h"
 #include "../../disco/events/generated/fd_event_gen.h"
+#include "../../flamenco/runtime/fd_system_ids.h"
 #include "../../tango/fseq/fd_fseq.h"
 
 #include <time.h> /* CLOCK_REALTIME */
@@ -156,8 +157,13 @@ struct fd_snapmk {
 
   ulong manifest_pad;
   ulong manifest_sz;
-  ulong status_cache_pad;
-  ulong status_cache_sz;
+
+  ulong  status_cache_sz;          /* bytes serialized so far */
+  ulong  status_cache_expected_sz; /* size the writer counted up front, written into the TAR header */
+  void * status_cache_writer_arena;
+  ulong  status_cache_writer_arena_sz;
+
+  int   zstd_frame_open;      /* compressor has started a frame that an e_end has not yet closed */
   ulong zstd_data_frame_cnt;
   ulong zstd_padding_sz;
   ulong uncompressed_sz;
@@ -264,10 +270,11 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
   ulong zp_cnt = tile->out_cnt - 1UL; /* last out link is snapmk_out */
 
   ulong l = FD_LAYOUT_INIT;
-  l = FD_LAYOUT_APPEND( l, alignof(fd_snapmk_t), sizeof(fd_snapmk_t)                              );
-  l = FD_LAYOUT_APPEND( l, 32UL,                 ZSTD_estimateCStreamSize( FD_BACKUP_ZSTD_LEVEL ) );
-  l = FD_LAYOUT_APPEND( l, fd_txncache_align(),  fd_txncache_footprint( max_live_slots )          );
-  l = FD_LAYOUT_APPEND( l, alignof(ulong),       zp_cnt*FD_SNAPMK_ZP_DEPTH*sizeof(ulong)          );
+  l = FD_LAYOUT_APPEND( l, alignof(fd_snapmk_t),             sizeof(fd_snapmk_t)                                          );
+  l = FD_LAYOUT_APPEND( l, 32UL,                             ZSTD_estimateCStreamSize( FD_BACKUP_ZSTD_LEVEL )             );
+  l = FD_LAYOUT_APPEND( l, fd_txncache_align(),              fd_txncache_footprint( max_live_slots )                      );
+  l = FD_LAYOUT_APPEND( l, alignof(ulong),                   zp_cnt*FD_SNAPMK_ZP_DEPTH*sizeof(ulong)                      );
+  l = FD_LAYOUT_APPEND( l, fd_txncache_writer_arena_align(), fd_txncache_writer_arena_sz( tile->snapmk.max_txn_per_slot ) );
   return FD_LAYOUT_FINI( l, scratch_align() );
 }
 
@@ -334,11 +341,14 @@ unprivileged_init( fd_topo_t const *      topo,
   ulong zp_cnt = tile->out_cnt - 1UL;
 
   FD_SCRATCH_ALLOC_INIT( l, scratch );
-  fd_snapmk_t * ctx      = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_snapmk_t), sizeof(fd_snapmk_t) );
-  void *        _zstd    = FD_SCRATCH_ALLOC_APPEND( l, 32UL,                 ZSTD_estimateCStreamSize( FD_BACKUP_ZSTD_LEVEL ) );
-  void *        _txnc_lj = FD_SCRATCH_ALLOC_APPEND( l, fd_txncache_align(),  fd_txncache_footprint( max_live_slots ) );
-  ulong *       _rd_shdw = FD_SCRATCH_ALLOC_APPEND( l, alignof(ulong),       zp_cnt*FD_SNAPMK_ZP_DEPTH*sizeof(ulong) );
+  fd_snapmk_t * ctx      = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_snapmk_t),             sizeof(fd_snapmk_t) );
+  void *        _zstd    = FD_SCRATCH_ALLOC_APPEND( l, 32UL,                             ZSTD_estimateCStreamSize( FD_BACKUP_ZSTD_LEVEL ) );
+  void *        _txnc_lj = FD_SCRATCH_ALLOC_APPEND( l, fd_txncache_align(),              fd_txncache_footprint( max_live_slots ) );
+  ulong *       _rd_shdw = FD_SCRATCH_ALLOC_APPEND( l, alignof(ulong),                   zp_cnt*FD_SNAPMK_ZP_DEPTH*sizeof(ulong) );
+  void *        _arena   = FD_SCRATCH_ALLOC_APPEND( l, fd_txncache_writer_arena_align(), fd_txncache_writer_arena_sz( tile->snapmk.max_txn_per_slot ) );
   ulong end = FD_SCRATCH_ALLOC_FINI( l, scratch_align() );
+  ctx->status_cache_writer_arena    = _arena;
+  ctx->status_cache_writer_arena_sz = fd_txncache_writer_arena_sz( tile->snapmk.max_txn_per_slot );
   FD_CHECK_CRIT( end==(ulong)scratch + scratch_footprint( tile ), "bug when calculating tile memory layout" );
 
   for( ulong i=0UL; i<zp_cnt; i++ ) {
@@ -499,8 +509,9 @@ unprivileged_init( fd_topo_t const *      topo,
 
 static void
 zip_reset( fd_snapmk_t * ctx ) {
-  ctx->raw_buf.size = 0UL;
-  ctx->raw_buf.pos  = 0UL;
+  ctx->raw_buf.size    = 0UL;
+  ctx->raw_buf.pos     = 0UL;
+  ctx->zstd_frame_open = 0;
 }
 
 /* zip_append adds bytes into the input buffer (opens a new frame if
@@ -537,6 +548,12 @@ zip_flush( fd_snapmk_t *     ctx,
   if( FD_UNLIKELY( ZSTD_isError( ret ) ) ) {
     FD_LOG_ERR(( "ZSTD_compressStream2 failed: %s", ZSTD_getErrorName( ret ) ));
   }
+  /* A non-zero return after ZSTD_e_end means the frame epilogue is
+     still pending in the compressor (comp_buf too small), which would
+     corrupt the stream once raw frames or the next frame are written
+     after it. */
+  FD_CHECK_ERR( !( directive==ZSTD_e_end && ret ), "ZSTD_e_end left compressed data pending" );
+  ctx->zstd_frame_open = directive!=ZSTD_e_end && ( ctx->zstd_frame_open || ctx->raw_buf.pos>raw_pos );
   ctx->metrics.bytes_compressed += ctx->raw_buf.pos - raw_pos;
   ctx->uncompressed_sz          += ctx->raw_buf.pos - raw_pos;
   ctx->metrics.compress_ticks   += (ulong)( t1-t0 );
@@ -575,6 +592,15 @@ zip_flush( fd_snapmk_t *     ctx,
   ctx->comp_buf.pos  = 0UL;
   ctx->comp_buf.size = COMP_BUF_SZ;
   ctx->zstd_data_frame_cnt += directive==ZSTD_e_end;
+}
+
+/* zip_end_frame ends the current frame, if any is open or any input
+   is buffered.  Skips the call otherwise, which would emit an empty
+   frame. */
+
+static void
+zip_end_frame( fd_snapmk_t * ctx ) {
+  if( ctx->zstd_frame_open || ctx->raw_buf.size ) zip_flush( ctx, ZSTD_e_end );
 }
 
 /* zip_align aligns the Zstandard compressed stream by 512 bytes using
@@ -618,24 +644,41 @@ zip_align( fd_snapmk_t * ctx ) {
   atomic_store_explicit( ctx->file_off_p, aoff, memory_order_release );
 }
 
-/* snapmk_status_cache_prepare writes the file header for the serialized
-   status cache. */
+/* snapmk_status_cache_tar_hdr builds the TAR header of the status cache
+   file for a payload of sz bytes. */
+
+static fd_tar_meta_t *
+snapmk_status_cache_tar_hdr( fd_tar_meta_t * meta,
+                             ulong           sz ) {
+  fd_backup_tar_file_hdr( meta, sz );
+  if( FD_UNLIKELY( !fd_tar_meta_set_size( meta, sz ) ) ) {
+    FD_LOG_ERR(( "status cache (%lu bytes) too large for a TAR size field", sz ));
+  }
+  fd_cstr_ncpy( meta->name, "snapshots/status_cache", sizeof(meta->name) );
+  fd_tar_meta_set_chksum( meta );
+  return meta;
+}
+
+/* snapmk_status_cache_prepare starts status cache serialization and
+   writes its TAR header.  The writer counts the status cache up front,
+   so its size is known before the first byte is streamed. */
 
 static void
 snapmk_status_cache_prepare( fd_snapmk_t * ctx ) {
-  ulong slot = ctx->bank->f.slot;
-  fd_txncache_writer_init( ctx->txncache_writer, ctx->txncache, slot );
-  ulong bin_sz = fd_txncache_writer_serialized_sz( ctx->txncache, slot );
-  ctx->status_cache_sz = bin_sz;
+  fd_bank_t * bank = ctx->bank;
+  ulong         slot_history_sz = 0UL;
+  uchar const * slot_history    =
+      fd_sysvar_cache_data_query( &bank->f.sysvar_cache, fd_sysvar_slot_history_id.uc, &slot_history_sz );
+  if( FD_UNLIKELY( !fd_txncache_writer_init( ctx->txncache_writer, ctx->txncache, bank->txncache_fork_id, bank->f.slot, slot_history, slot_history_sz, ctx->status_cache_writer_arena, ctx->status_cache_writer_arena_sz ) ) ) {
+    FD_LOG_CRIT(( "cannot serialize txncache fork %hu of snapshot bank at slot %lu because the root moved or SlotHistory lacks execution slots", bank->txncache_fork_id.val, bank->f.slot ));
+  }
+  ctx->status_cache_sz          = 0UL;
+  ctx->status_cache_expected_sz = fd_txncache_writer_serialized_sz( ctx->txncache_writer );
 
   zip_reset( ctx );
   fd_tar_meta_t meta;
-  fd_backup_tar_file_hdr( &meta, bin_sz );
-  fd_cstr_ncpy( meta.name, "snapshots/status_cache", sizeof(meta.name) );
-  fd_tar_meta_set_chksum( &meta );
-  ctx->status_cache_pad = fd_ulong_align_up( bin_sz, sizeof(fd_tar_meta_t) ) - bin_sz;
+  snapmk_status_cache_tar_hdr( &meta, ctx->status_cache_expected_sz );
   zip_append( ctx, &meta, sizeof(fd_tar_meta_t) );
-  zip_flush( ctx, ZSTD_e_continue ); /* still need padding in current frame */
 }
 
 /* snapmk_status_cache does a unit of status cache serialization and
@@ -649,23 +692,24 @@ snapmk_status_cache( fd_snapmk_t * ctx ) {
     zip_flush( ctx, ZSTD_e_continue );
     return 1;
   }
-  ulong buf_rem  = RAW_BUF_SZ - ctx->raw_buf.size;
-  ulong chunk_sz = fd_txncache_writer_serialize(
-      ctx->txncache_writer,
-      ctx->raw + ctx->raw_buf.size,
-      buf_rem );
-  ctx->raw_buf.size += chunk_sz;
+  ulong   buf_rem  = RAW_BUF_SZ - ctx->raw_buf.size;
+  uchar * chunk    = ctx->raw + ctx->raw_buf.size;
+  ulong   chunk_sz = fd_txncache_writer_serialize( ctx->txncache_writer, chunk, buf_rem );
   if( FD_UNLIKELY( !chunk_sz ) ) { /* done serializing? */
+    FD_CHECK_CRIT( ctx->status_cache_sz==ctx->status_cache_expected_sz, "status cache size does not match its TAR header" );
     zip_flush( ctx, ZSTD_e_continue );
-    if( ctx->status_cache_pad ) {
-      FD_CHECK_CRIT( ctx->status_cache_pad<sizeof(fd_tar_meta_t), "invalid status_cache_pad" );
+    ulong pad = fd_ulong_align_up( ctx->status_cache_sz, sizeof(fd_tar_meta_t) ) - ctx->status_cache_sz;
+    if( pad ) {
       static uchar const zero[ sizeof(fd_tar_meta_t) ] = {0};
-      zip_append( ctx, zero, ctx->status_cache_pad );
+      zip_append( ctx, zero, pad );
     }
-    zip_flush( ctx, ZSTD_e_end );
+    zip_end_frame( ctx );
     ctx->state = SNAPMK_STATE_EOF_MARKER;
     return 0;
   }
+  ctx->raw_buf.size    += chunk_sz;
+  ctx->status_cache_sz += chunk_sz;
+  zip_flush( ctx, ZSTD_e_continue );
   return 1;
 }
 

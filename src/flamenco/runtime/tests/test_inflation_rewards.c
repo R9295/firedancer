@@ -1,5 +1,5 @@
 #include "fd_svm_mini.h"
-#include "../../rewards/fd_alpen_rewards.h"
+#include "../../alpenglow/fd_alpenglow.h"
 #include "../../rewards/fd_rewards.h"
 #include "../../rewards/fd_rewards_base.h"
 #include "../../rewards/fd_stake_rewards.h"
@@ -163,18 +163,18 @@ clone_stake_account( fd_svm_mini_t *     mini,
   fd_svm_mini_put_account_rooted( mini, &new_acc );
 }
 
-static uchar
+static ushort
 init_stake_rewards( fd_bank_t * bank,
                     fd_hash_t const * blockhash,
                     ulong starting_block_height,
                     uint num_partitions ) {
   fd_stake_rewards_t * stake_rewards = fd_bank_stake_rewards_modify( bank );
-  uchar fork_idx = fd_stake_rewards_init( stake_rewards,
-                                          bank->f.epoch,
-                                          blockhash,
-                                          starting_block_height,
-                                          num_partitions,
-                                          0UL );
+  ushort fork_idx = fd_stake_rewards_init( stake_rewards,
+                                           blockhash,
+                                           starting_block_height,
+                                           num_partitions,
+                                           0U,
+                                           0UL );
   bank->stake_rewards_fork_id = fork_idx;
   return fork_idx;
 }
@@ -200,7 +200,7 @@ init_epoch_rewards_sysvar( fd_bank_t *      bank,
 
 static uint
 find_reward_partition( fd_stake_rewards_t *      stake_rewards,
-                        uchar                     fork_idx,
+                        ushort                    fork_idx,
                         fd_pubkey_t const *       pubkey,
                         uint                      num_partitions ) {
   for( uint p=0U; p<num_partitions; p++ ) {
@@ -450,21 +450,26 @@ test_footer_uses_vote_stakes_rank( fd_svm_mini_t * mini,
     fd_vote_stakes_finalize( vote_stakes, bank->f.epoch );
   }
 
-  fd_reward_cert_t reward_cert = { .slot=reward_slot, .nbits=1U };
-  reward_cert.signer_set[0] = 1UL;
-  fd_footer_certs_t certs = { .skip_reward_cert=&reward_cert };
+  fd_block_footer_t footer[1];
+  fd_memset( footer, 0, sizeof(fd_block_footer_t) );
+  footer->block_producer_time_nanos = 1000000000UL;
+  footer->has_skip_reward_cert      = 1;
+  footer->skip_reward_cert.slot     = reward_slot;
+  fd_bls_set_insert( footer->skip_reward_cert.signer_set, 0UL );
 
   fd_accdb_fork_id_t fork_id = fd_svm_mini_fork_id( mini, bank_idx );
   FD_TEST( vote_last_voted_slot( mini, fork_id, &vote_a )!=reward_slot );
-  FD_TEST( !fd_alpen_rewards_apply( bank, mini->runtime->accdb, NULL, &certs, 1000000000UL ) );
+  FD_TEST( !fd_alpenglow_rewards_apply( bank, mini->runtime->accdb, NULL, footer ) );
   FD_TEST( vote_last_voted_slot( mini, fork_id, &vote_a )==reward_slot );
   FD_TEST( vote_last_voted_slot( mini, fork_id, &vote_b )!=reward_slot );
 
   ulong final_slot = reward_slot+1UL;
-  ag_cert_fast_final_t final_cert = { .slot=final_slot };
-  final_cert.agg_sig.bitmask[0] = 1UL;
-  certs = (fd_footer_certs_t){ .fast_final_cert=&final_cert };
-  FD_TEST( !fd_alpen_rewards_apply( bank, mini->runtime->accdb, NULL, &certs, 1000000000UL ) );
+  fd_memset( footer, 0, sizeof(fd_block_footer_t) );
+  footer->block_producer_time_nanos = 1000000000UL;
+  footer->has_fast_final_cert       = 1;
+  footer->fast_final_cert.slot      = final_slot;
+  fd_bls_set_insert( footer->fast_final_cert.signer_set, 0UL );
+  FD_TEST( !fd_alpenglow_rewards_apply( bank, mini->runtime->accdb, NULL, footer ) );
   FD_TEST( vote_last_voted_slot( mini, fork_id, &vote_a )==final_slot );
   FD_TEST( vote_last_voted_slot( mini, fork_id, &vote_b )!=final_slot );
 }
@@ -589,7 +594,7 @@ test_alpenglow_reward_uses_vote_credits( fd_svm_mini_t * mini ) {
 
   FD_FEATURE_SET_ACTIVE( &epoch_bank->f.features, delay_commission_updates, 0UL );
   fd_stake_rewards_clear( fd_bank_stake_rewards_modify( epoch_bank ) );
-  epoch_bank->stake_rewards_fork_id = UCHAR_MAX;
+  epoch_bank->stake_rewards_fork_id = USHORT_MAX;
   fd_rewards_recalculate_partitioned_rewards( mini->banks,
                                               epoch_bank,
                                               mini->runtime->accdb,
@@ -600,7 +605,7 @@ test_alpenglow_reward_uses_vote_credits( fd_svm_mini_t * mini ) {
 
   epoch_bank->f.features.delay_commission_updates = FD_FEATURE_DISABLED;
   fd_stake_rewards_clear( fd_bank_stake_rewards_modify( epoch_bank ) );
-  epoch_bank->stake_rewards_fork_id = UCHAR_MAX;
+  epoch_bank->stake_rewards_fork_id = USHORT_MAX;
   fd_rewards_recalculate_partitioned_rewards( mini->banks,
                                               epoch_bank,
                                               mini->runtime->accdb,
@@ -738,6 +743,74 @@ test_credits_staker_reward( fd_svm_mini_t * mini ) {
   FD_TEST( s_after.delegation.voter_pubkey.ul[0] == vote_key.ul[0] );
 
   FD_LOG_NOTICE(( "test_credits_staker_reward: PASSED (staker reward = %lu lamports)", reward ));
+}
+
+static void
+test_evicted_reward_window_recalculated( fd_svm_mini_t * mini ) {
+  fd_svm_mini_params_t params[1];
+  fd_svm_mini_params_default( params );
+  params->slots_per_epoch    = TEST_SLOTS_PER_EPOCH;
+  params->root_slot          = TEST_ROOT_SLOT;
+  params->mock_validator_cnt = 1UL;
+  ulong root_idx = fd_svm_mini_reset( mini, params );
+
+  fd_bank_t * root_bank = fd_svm_mini_bank( mini, root_idx );
+  root_bank->f.inflation = (fd_inflation_t){
+    .initial         = 0.08,
+    .terminal        = 0.015,
+    .taper           = 0.15,
+    .foundation      = 0.05,
+    .foundation_term = 7.0,
+  };
+
+  fd_pubkey_t identity_key, vote_key, stake_key;
+  mock_validator_keys( params->hash_seed, &identity_key, &vote_key, &stake_key );
+  patch_vote_account( mini, root_idx, &vote_key, 0, 0UL, 2UL, 0UL );
+
+  fd_accdb_fork_id_t root_fk = fd_svm_mini_fork_id( mini, root_idx );
+  ulong stake_lam_before = read_lamports( mini, root_fk, &stake_key );
+
+  ulong epoch_idx = fd_svm_mini_attach_child(
+      mini, root_idx, TEST_EPOCH_BOUNDARY );
+  fd_bank_t * epoch_bank = fd_svm_mini_bank( mini, epoch_idx );
+  fd_stake_rewards_t * stake_rewards =
+      fd_bank_stake_rewards_modify( epoch_bank );
+  ushort evicted_fork = epoch_bank->stake_rewards_fork_id;
+  ulong total_rewards = fd_stake_rewards_total_rewards(
+      stake_rewards, evicted_fork );
+  FD_TEST( fd_stake_rewards_window_lo(
+      stake_rewards, evicted_fork )!=UINT_MAX );
+
+  ushort dummy_fork[2];
+  for( ushort i=0U; i<2U; i++ ) {
+    fd_hash_t parent_blockhash = { .ul={ i+1UL } };
+    dummy_fork[i] = fd_stake_rewards_init(
+        stake_rewards, &parent_blockhash, 0UL, 1U, 0U, 1UL );
+    fd_pubkey_t pubkey = { .ul={ i+1UL } };
+    fd_stake_rewards_insert(
+        stake_rewards, dummy_fork[i], &pubkey, 1UL, 1UL );
+    fd_stake_rewards_fini( stake_rewards, dummy_fork[i] );
+  }
+  FD_TEST( fd_stake_rewards_window_lo(
+      stake_rewards, evicted_fork )==UINT_MAX );
+  for( ushort i=0U; i<2U; i++ )
+    fd_stake_rewards_release( stake_rewards, dummy_fork[i] );
+
+  fd_svm_mini_freeze( mini, epoch_idx );
+  ulong distrib_idx = fd_svm_mini_attach_child(
+      mini, epoch_idx, TEST_DISTRIB_SLOT );
+  fd_accdb_fork_id_t distrib_fk = fd_svm_mini_fork_id( mini, distrib_idx );
+  fd_bank_t * distrib_bank = fd_svm_mini_bank( mini, distrib_idx );
+
+  ulong stake_lam_after = read_lamports( mini, distrib_fk, &stake_key );
+  FD_TEST( stake_lam_after>stake_lam_before );
+  FD_TEST( distrib_bank->stake_rewards_fork_id==USHORT_MAX );
+  FD_TEST( epoch_bank->stake_rewards_fork_id==evicted_fork );
+  FD_TEST( fd_stake_rewards_refcnt( stake_rewards, evicted_fork )==1UL );
+  FD_TEST( fd_stake_rewards_total_rewards(
+      stake_rewards, evicted_fork )==total_rewards );
+
+  FD_LOG_NOTICE(( "test_evicted_reward_window_recalculated: PASSED" ));
 }
 
 static void
@@ -928,7 +1001,7 @@ test_inert_delegation_not_partitioned( fd_svm_mini_t * mini ) {
 
   /* Snapshot restart recalculation applies the same filter. */
   fd_stake_rewards_clear( stake_rewards );
-  epoch_bank->stake_rewards_fork_id = UCHAR_MAX;
+  epoch_bank->stake_rewards_fork_id = USHORT_MAX;
   fd_rewards_recalculate_partitioned_rewards(
       mini->banks, epoch_bank, mini->runtime->accdb, mini->runtime_stack, NULL );
   partition_cnt = fd_stake_rewards_num_partitions(
@@ -1221,8 +1294,106 @@ test_commission_split_suppresses_reward( fd_svm_mini_t * mini ) {
   FD_LOG_NOTICE(( "test_commission_split_suppresses_reward: PASSED" ));
 }
 
+/* Rewrites the stake account's credits_observed, keeping the stake
+   delegations index in sync with it. */
+
+static void
+patch_stake_credits_observed( fd_svm_mini_t *     mini,
+                              ulong               root_idx,
+                              fd_pubkey_t const * stake_key,
+                              fd_pubkey_t const * vote_key,
+                              ulong               credits_observed ) {
+  fd_accdb_fork_id_t root_fk = fd_svm_mini_fork_id( mini, root_idx );
+  fd_acc_t acc = fd_accdb_read_one( mini->runtime->accdb, root_fk, stake_key->key );
+  FD_TEST( acc.lamports > 0UL );
+  fd_stake_state_t const * ss_orig = fd_stake_state_view( acc.data, acc.data_len );
+  FD_TEST( ss_orig && ss_orig->stake_type==FD_STAKE_STATE_STAKE );
+  fd_stake_state_t ss_new = *ss_orig;
+  ss_new.stake.stake.credits_observed = credits_observed;
+  uchar owner_copy[32]; memcpy( owner_copy, acc.owner, 32 );
+  ulong lamports_copy = acc.lamports;
+  int   exec_copy     = acc.executable;
+  fd_accdb_unread_one( mini->runtime->accdb, &acc );
+
+  uchar new_data[ FD_STAKE_STATE_SZ ] = {0};
+  FD_STORE( fd_stake_state_t, new_data, ss_new );
+  fd_acc_t new_acc = {0};
+  memcpy( new_acc.pubkey, stake_key->key, 32 );
+  memcpy( new_acc.owner, owner_copy, 32 );
+  new_acc.lamports   = lamports_copy;
+  new_acc.executable = exec_copy;
+  new_acc.data_len   = sizeof(new_data);
+  new_acc.data       = new_data;
+  fd_svm_mini_put_account_rooted( mini, &new_acc );
+
+  fd_stake_delegations_t * sd = fd_banks_stake_delegations_root_query( mini->banks );
+  fd_stake_delegations_root_update( sd, stake_key, vote_key,
+      ss_new.stake.stake.delegation.stake,
+      ss_new.stake.stake.delegation.activation_epoch,
+      ss_new.stake.stake.delegation.deactivation_epoch,
+      credits_observed,
+      new_acc.lamports,
+      (uint)new_acc.data_len,
+      FD_STAKE_DELEGATIONS_WARMUP_COOLDOWN_RATE_ENUM_025 );
+}
+
 static void
 test_credit_rewind_force_update( fd_svm_mini_t * mini ) {
+  fd_svm_mini_params_t params[1];
+  fd_svm_mini_params_default( params );
+  params->slots_per_epoch    = TEST_SLOTS_PER_EPOCH;
+  params->root_slot          = TEST_ROOT_SLOT;
+  /* Two validators: the second one earns points, so the global points
+     denominator stays non-zero and the reward calculation is not
+     skipped.  The first one is the rewind case under test. */
+  params->mock_validator_cnt = 2UL;
+  ulong root_idx = fd_svm_mini_reset( mini, params );
+
+  fd_bank_t * root_bank = fd_svm_mini_bank( mini, root_idx );
+  root_bank->f.inflation = (fd_inflation_t){
+    .initial         = 0.08,
+    .terminal        = 0.015,
+    .taper           = 0.15,
+    .foundation      = 0.05,
+    .foundation_term = 7.0,
+  };
+
+  fd_pubkey_t identity_key, vote_key, stake_key;
+  mock_validator_keys_idx( params->hash_seed, 0UL, &identity_key, &vote_key, &stake_key );
+  fd_pubkey_t other_identity_key, other_vote_key, other_stake_key;
+  mock_validator_keys_idx( params->hash_seed, 1UL, &other_identity_key, &other_vote_key, &other_stake_key );
+
+  patch_vote_account( mini, root_idx, &vote_key,       0, 0UL, 5UL, 0UL );
+  patch_vote_account( mini, root_idx, &other_vote_key, 0, 0UL, 5UL, 0UL );
+
+  patch_stake_credits_observed( mini, root_idx, &stake_key, &vote_key, 10UL );
+
+  fd_accdb_fork_id_t root_fk = fd_svm_mini_fork_id( mini, root_idx );
+  ulong stake_lam_before = read_lamports( mini, root_fk, &stake_key );
+
+  ulong distrib_idx = advance_to_distribution( mini, root_idx );
+  fd_accdb_fork_id_t distrib_fk = fd_svm_mini_fork_id( mini, distrib_idx );
+
+  ulong stake_lam_after = read_lamports( mini, distrib_fk, &stake_key );
+  FD_TEST( stake_lam_after == stake_lam_before );
+
+  fd_stake_t s_after = read_stake( mini, distrib_fk, &stake_key );
+  FD_TEST( s_after.credits_observed == 5UL );
+  FD_TEST( s_after.delegation.stake == 1000000000UL );
+
+  FD_LOG_NOTICE(( "test_credit_rewind_force_update: PASSED" ));
+}
+
+/* A Tower epoch whose global points denominator comes out zero is
+   skipped in its entirety: no stake account is touched at the epoch
+   boundary, and recalculating the rewards from the EpochRewards sysvar
+   -- what a bank restored from a snapshot taken during the distribution
+   interval does -- must not touch one either.  Otherwise the restored
+   bank would force credits_observed forward on stake accounts the nodes
+   that stayed up never rewrote, and diverge in the bank hash. */
+
+static void
+test_zero_points_skips_rewards( fd_svm_mini_t * mini ) {
   fd_svm_mini_params_t params[1];
   fd_svm_mini_params_default( params );
   params->slots_per_epoch    = TEST_SLOTS_PER_EPOCH;
@@ -1242,57 +1413,63 @@ test_credit_rewind_force_update( fd_svm_mini_t * mini ) {
   fd_pubkey_t identity_key, vote_key, stake_key;
   mock_validator_keys( params->hash_seed, &identity_key, &vote_key, &stake_key );
 
+  /* The only staker has observed more credits than its vote account
+     holds, so it earns no points and the global denominator is zero. */
   patch_vote_account( mini, root_idx, &vote_key, 0, 0UL, 5UL, 0UL );
+  patch_stake_credits_observed( mini, root_idx, &stake_key, &vote_key, 10UL );
 
-  {
-    fd_accdb_fork_id_t root_fk = fd_svm_mini_fork_id( mini, root_idx );
-    fd_acc_t acc = fd_accdb_read_one( mini->runtime->accdb, root_fk, stake_key.key );
-    FD_TEST( acc.lamports > 0UL );
-    fd_stake_state_t const * ss_orig = fd_stake_state_view( acc.data, acc.data_len );
-    FD_TEST( ss_orig && ss_orig->stake_type==FD_STAKE_STATE_STAKE );
-    fd_stake_state_t ss_new = *ss_orig;
-    ss_new.stake.stake.credits_observed = 10UL;
-    uchar owner_copy[32]; memcpy( owner_copy, acc.owner, 32 );
-    ulong lamports_copy = acc.lamports;
-    int   exec_copy     = acc.executable;
-    fd_accdb_unread_one( mini->runtime->accdb, &acc );
+  fd_accdb_fork_id_t root_fk          = fd_svm_mini_fork_id( mini, root_idx );
+  ulong              stake_lam_before = read_lamports( mini, root_fk, &stake_key );
+  fd_stake_t         stake_before     = read_stake   ( mini, root_fk, &stake_key );
+  FD_TEST( stake_before.credits_observed==10UL );
 
-    uchar new_data[ FD_STAKE_STATE_SZ ] = {0};
-    FD_STORE( fd_stake_state_t, new_data, ss_new );
-    fd_acc_t new_acc = {0};
-    memcpy( new_acc.pubkey, stake_key.key, 32 );
-    memcpy( new_acc.owner, owner_copy, 32 );
-    new_acc.lamports   = lamports_copy;
-    new_acc.executable = exec_copy;
-    new_acc.data_len   = sizeof(new_data);
-    new_acc.data       = new_data;
-    fd_svm_mini_put_account_rooted( mini, &new_acc );
+  ulong              epoch_idx  = fd_svm_mini_attach_child( mini, root_idx, TEST_EPOCH_BOUNDARY );
+  fd_bank_t *        epoch_bank = fd_svm_mini_bank( mini, epoch_idx );
+  fd_accdb_fork_id_t epoch_fk   = fd_svm_mini_fork_id( mini, epoch_idx );
 
-    fd_stake_delegations_t * sd = fd_banks_stake_delegations_root_query( mini->banks );
-    fd_stake_delegations_root_update( sd, &stake_key, &vote_key,
-        ss_new.stake.stake.delegation.stake,
-        ss_new.stake.stake.delegation.activation_epoch,
-        ss_new.stake.stake.delegation.deactivation_epoch,
-        10UL,
-        new_acc.lamports,
-        (uint)new_acc.data_len,
-        FD_STAKE_DELEGATIONS_WARMUP_COOLDOWN_RATE_ENUM_025 );
-  }
+  /* The sysvar is active for the distribution interval, but records a
+     zero rewards budget and a zero points denominator. */
+  fd_sysvar_epoch_rewards_t er[1];
+  FD_TEST( fd_sysvar_epoch_rewards_read( mini->runtime->accdb, epoch_fk, er ) );
+  FD_TEST( er->active );
+  FD_TEST( er->total_rewards   ==0UL );
+  FD_TEST( er->total_points.ud ==0    );
 
-  fd_accdb_fork_id_t root_fk = fd_svm_mini_fork_id( mini, root_idx );
-  ulong stake_lam_before = read_lamports( mini, root_fk, &stake_key );
+  fd_stake_rewards_t * stake_rewards = fd_bank_stake_rewards_modify( epoch_bank );
+  FD_TEST( epoch_bank->stake_rewards_fork_id!=USHORT_MAX );
+  uint partition_cnt = fd_stake_rewards_num_partitions(
+      stake_rewards, epoch_bank->stake_rewards_fork_id );
+  FD_TEST( fd_stake_rewards_total_rewards(
+      stake_rewards, epoch_bank->stake_rewards_fork_id )==0UL );
+  FD_TEST( find_reward_partition(
+      stake_rewards, epoch_bank->stake_rewards_fork_id, &stake_key, partition_cnt )==UINT_MAX );
 
-  ulong distrib_idx = advance_to_distribution( mini, root_idx );
-  fd_accdb_fork_id_t distrib_fk = fd_svm_mini_fork_id( mini, distrib_idx );
+  /* Snapshot restart recalculation skips the same way. */
+  fd_stake_rewards_clear( stake_rewards );
+  epoch_bank->stake_rewards_fork_id = USHORT_MAX;
+  fd_rewards_recalculate_partitioned_rewards(
+      mini->banks, epoch_bank, mini->runtime->accdb, mini->runtime_stack, NULL );
 
-  ulong stake_lam_after = read_lamports( mini, distrib_fk, &stake_key );
-  FD_TEST( stake_lam_after == stake_lam_before );
+  FD_TEST( epoch_bank->stake_rewards_fork_id!=USHORT_MAX );
+  partition_cnt = fd_stake_rewards_num_partitions(
+      stake_rewards, epoch_bank->stake_rewards_fork_id );
+  FD_TEST( fd_stake_rewards_total_rewards(
+      stake_rewards, epoch_bank->stake_rewards_fork_id )==0UL );
+  FD_TEST( find_reward_partition(
+      stake_rewards, epoch_bank->stake_rewards_fork_id, &stake_key, partition_cnt )==UINT_MAX );
 
-  fd_stake_t s_after = read_stake( mini, distrib_fk, &stake_key );
-  FD_TEST( s_after.credits_observed == 5UL );
-  FD_TEST( s_after.delegation.stake == 1000000000UL );
+  /* Distribution over the recalculated partitions leaves the stake
+     account exactly as it was. */
+  fd_svm_mini_freeze( mini, epoch_idx );
+  ulong              distrib_idx = fd_svm_mini_attach_child( mini, epoch_idx, TEST_DISTRIB_SLOT );
+  fd_accdb_fork_id_t distrib_fk  = fd_svm_mini_fork_id( mini, distrib_idx );
 
-  FD_LOG_NOTICE(( "test_credit_rewind_force_update: PASSED" ));
+  FD_TEST( read_lamports( mini, distrib_fk, &stake_key )==stake_lam_before );
+  fd_stake_t stake_after = read_stake( mini, distrib_fk, &stake_key );
+  FD_TEST( stake_after.credits_observed  ==stake_before.credits_observed   );
+  FD_TEST( stake_after.delegation.stake  ==stake_before.delegation.stake   );
+
+  FD_LOG_NOTICE(( "test_zero_points_skips_rewards: PASSED" ));
 }
 
 static void
@@ -1458,26 +1635,28 @@ test_hash_rewards_into_partitions( void ) {
   ulong max_accs  = 16384UL;
   ulong max_forks = 4UL;
 
-  ulong footprint = fd_stake_rewards_footprint( max_accs, max_forks );
+  ulong footprint = fd_stake_rewards_footprint( max_accs, max_forks, 2UL );
   FD_TEST( footprint > 0UL );
   void * mem = aligned_alloc( fd_stake_rewards_align(), footprint );
   FD_TEST( mem );
 
   fd_stake_rewards_t * sr = fd_stake_rewards_join(
-      fd_stake_rewards_new( mem, max_accs, max_forks ) );
+      fd_stake_rewards_new( mem, max_accs, max_forks, 2UL ) );
   FD_TEST( sr );
 
   fd_hash_t blockhash = {{ 0 }};
   memset( blockhash.hash, 0xCD, sizeof(blockhash.hash) );
 
   uint  num_partitions = 5U;
-  uchar fork_idx = fd_stake_rewards_init( sr, 1UL, &blockhash, 100UL, num_partitions, 0UL );
+  ushort fork_idx = fd_stake_rewards_init(
+      sr, &blockhash, 100UL, num_partitions, 0U, 0UL );
 
   for( ulong i=0UL; i<12345UL; i++ ) {
     fd_pubkey_t pubkey = {{ 0 }};
     FD_STORE( ulong, pubkey.key, i );
     fd_stake_rewards_insert( sr, fork_idx, &pubkey, i+1UL, i );
   }
+  fd_stake_rewards_fini( sr, fork_idx );
 
   ulong total_count = 0UL, total_lamports = 0UL;
   for( uint p=0U; p<num_partitions; p++ ) {
@@ -1513,18 +1692,19 @@ test_hash_rewards_windowed( void ) {
   ulong const reward_cnt = 1024UL;
   uint  const num_partitions = 32U;
 
-  ulong footprint = fd_stake_rewards_footprint( capacity, 1UL );
+  ulong footprint = fd_stake_rewards_footprint( capacity, 1UL, 2UL );
   void * mem = aligned_alloc( fd_stake_rewards_align(), footprint );
   FD_TEST( mem );
 
   fd_stake_rewards_t * sr = fd_stake_rewards_join(
-      fd_stake_rewards_new( mem, capacity, 1UL ) );
+      fd_stake_rewards_new( mem, capacity, 1UL, 2UL ) );
   FD_TEST( sr );
 
   fd_hash_t blockhash = {{ 0 }};
   memset( blockhash.hash, 0xAB, sizeof(blockhash.hash) );
 
-  uchar fork_idx = fd_stake_rewards_init( sr, 1UL, &blockhash, 100UL, num_partitions, reward_cnt );
+  ushort fork_idx = fd_stake_rewards_init(
+      sr, &blockhash, 100UL, num_partitions, 0U, reward_cnt );
 
   /* The window must be a strict subset, otherwise the test is vacuous. */
   FD_TEST( fd_stake_rewards_window_lo( sr, fork_idx )==0U );
@@ -1537,7 +1717,11 @@ test_hash_rewards_windowed( void ) {
   ulong remaining_cnt = reward_cnt;
   ulong remaining_sum = reward_cnt*(reward_cnt+1UL)/2UL;
   while( win_lo<num_partitions ) {
-    if( win_lo ) fd_stake_rewards_window_advance( sr, fork_idx, &blockhash, win_lo, remaining_cnt );
+    if( win_lo ) {
+      fd_stake_rewards_release( sr, fork_idx );
+      fork_idx = fd_stake_rewards_init(
+          sr, &blockhash, 100UL, num_partitions, win_lo, remaining_cnt );
+    }
 
     for( ulong i=0UL; i<reward_cnt; i++ ) {
       if( seen[ i ] ) continue;
@@ -1545,6 +1729,7 @@ test_hash_rewards_windowed( void ) {
       FD_STORE( ulong, pubkey.key, i );
       fd_stake_rewards_insert( sr, fork_idx, &pubkey, i+1UL, i );
     }
+    fd_stake_rewards_fini( sr, fork_idx );
 
     /* The total covers everything inserted, not just the window. */
     FD_TEST( fd_stake_rewards_total_rewards( sr, fork_idx )==remaining_sum );
@@ -1593,34 +1778,42 @@ test_hash_rewards_window_sizing( void ) {
   uint  const num_partitions = 256U;
   ulong const reward_cnt     = 2048UL; /* eight per partition */
 
-  ulong footprint = fd_stake_rewards_footprint( capacity, 1UL );
+  ulong footprint = fd_stake_rewards_footprint( capacity, 1UL, 2UL );
   void * mem = aligned_alloc( fd_stake_rewards_align(), footprint );
   FD_TEST( mem );
 
   fd_stake_rewards_t * sr = fd_stake_rewards_join(
-      fd_stake_rewards_new( mem, capacity, 1UL ) );
+      fd_stake_rewards_new( mem, capacity, 1UL, 2UL ) );
   FD_TEST( sr );
 
   fd_hash_t blockhash = {{ 0 }};
   memset( blockhash.hash, 0x5C, sizeof(blockhash.hash) );
 
   /* 1014 of the 1024 entries are usable, so 126 partitions fit. */
-  uchar fork_idx = fd_stake_rewards_init( sr, 1UL, &blockhash, 100UL, num_partitions, reward_cnt );
+  ushort fork_idx = fd_stake_rewards_init(
+      sr, &blockhash, 100UL, num_partitions, 0U, reward_cnt );
   FD_TEST( fd_stake_rewards_window_lo( sr, fork_idx )==0U   );
   FD_TEST( fd_stake_rewards_window_hi( sr, fork_idx )==125U );
+  fd_stake_rewards_fini( sr, fork_idx );
+  fd_stake_rewards_release( sr, fork_idx );
 
   /* Paying [0,125] leaves 130 partitions holding 1040 rewards, which is
      still eight per partition, so the next window is just as wide.
      Dividing 1040 by all 256 partitions instead asks for 249, which
      covers the whole remainder and holds all 1040 of them. */
-  fd_stake_rewards_window_advance( sr, fork_idx, &blockhash, 126U, 1040UL );
+  fork_idx = fd_stake_rewards_init(
+      sr, &blockhash, 100UL, num_partitions, 126U, 1040UL );
   FD_TEST( fd_stake_rewards_window_lo( sr, fork_idx )==126U );
   FD_TEST( fd_stake_rewards_window_hi( sr, fork_idx )==251U );
+  fd_stake_rewards_fini( sr, fork_idx );
+  fd_stake_rewards_release( sr, fork_idx );
 
   /* Once the remainder fits, the window covers all of it. */
-  fd_stake_rewards_window_advance( sr, fork_idx, &blockhash, 252U, 32UL );
+  fork_idx = fd_stake_rewards_init(
+      sr, &blockhash, 100UL, num_partitions, 252U, 32UL );
   FD_TEST( fd_stake_rewards_window_lo( sr, fork_idx )==252U );
   FD_TEST( fd_stake_rewards_window_hi( sr, fork_idx )==255U );
+  fd_stake_rewards_fini( sr, fork_idx );
 
   free( mem );
 
@@ -1629,17 +1822,19 @@ test_hash_rewards_window_sizing( void ) {
 
 static void
 test_hash_rewards_into_partitions_empty( void ) {
-  ulong footprint = fd_stake_rewards_footprint( 1024UL, 4UL );
+  ulong footprint = fd_stake_rewards_footprint( 1024UL, 4UL, 2UL );
   void * mem = aligned_alloc( fd_stake_rewards_align(), footprint );
   FD_TEST( mem );
 
   fd_stake_rewards_t * sr = fd_stake_rewards_join(
-      fd_stake_rewards_new( mem, 1024UL, 4UL ) );
+      fd_stake_rewards_new( mem, 1024UL, 4UL, 2UL ) );
   FD_TEST( sr );
 
   fd_hash_t blockhash = {{ 0 }};
   uint  num_partitions = 5U;
-  uchar fork_idx = fd_stake_rewards_init( sr, 1UL, &blockhash, 100UL, num_partitions, 0UL );
+  ushort fork_idx = fd_stake_rewards_init(
+      sr, &blockhash, 100UL, num_partitions, 0U, 0UL );
+  fd_stake_rewards_fini( sr, fork_idx );
 
   for( uint p=0U; p<num_partitions; p++ ) {
     fd_stake_rewards_iter_init( sr, fork_idx, p );
@@ -1653,25 +1848,174 @@ test_hash_rewards_into_partitions_empty( void ) {
 }
 
 static void
-test_hash_rewards_pubkeys_across_forks( void ) {
-  ulong max_accs  = 4UL;
-  ulong max_forks = 3UL;
-
-  FD_TEST( fd_stake_rewards_footprint( 2150000UL, 32UL ) < (4UL<<30) );
-
-  ulong footprint = fd_stake_rewards_footprint( max_accs, max_forks );
+test_stake_rewards_two_buffer_cache( void ) {
+  ulong footprint = fd_stake_rewards_footprint( 4UL, 3UL, 2UL );
   void * mem = aligned_alloc( fd_stake_rewards_align(), footprint );
   FD_TEST( mem );
 
   fd_stake_rewards_t * sr = fd_stake_rewards_join(
-      fd_stake_rewards_new( mem, max_accs, max_forks ) );
+      fd_stake_rewards_new( mem, 4UL, 3UL, 2UL ) );
   FD_TEST( sr );
 
-  uchar fork_idx[3];
+  fd_hash_t parent_blockhash[ 3 ] = {{{0}}};
+  ushort fork_idx[ 3 ];
+  for( ushort i=0U; i<3U; i++ ) {
+    parent_blockhash[i].ul[0] = i;
+    fork_idx[i] = fd_stake_rewards_init(
+        sr, &parent_blockhash[i], 100UL+i, 1U, 0U, 1UL );
+    fd_pubkey_t pubkey = { .ul={ i } };
+    fd_stake_rewards_insert( sr, fork_idx[i], &pubkey, 10UL+i, 20UL+i );
+
+    /* A construction buffer must coexist with a full resident cache. */
+    if( i==2U ) {
+      for( ushort j=0U; j<2U; j++ ) {
+        FD_TEST( fd_stake_rewards_window_lo( sr, fork_idx[j] )==0U );
+        fd_stake_rewards_iter_init( sr, fork_idx[j], 0U );
+        FD_TEST( !fd_stake_rewards_iter_done( sr ) );
+        fd_pubkey_t observed_pubkey;
+        ulong       observed_lamports;
+        ulong       observed_credits;
+        fd_stake_rewards_iter_ele( sr, fork_idx[j], &observed_pubkey,
+                                   &observed_lamports, &observed_credits );
+        FD_TEST( observed_pubkey.ul[0]==j );
+        FD_TEST( observed_lamports==10UL+j );
+        FD_TEST( observed_credits==20UL+j );
+        fd_stake_rewards_iter_next( sr, fork_idx[j] );
+        FD_TEST( fd_stake_rewards_iter_done( sr ) );
+      }
+    }
+
+    fd_stake_rewards_fini( sr, fork_idx[i] );
+  }
+
+  FD_TEST( fd_stake_rewards_window_lo( sr, fork_idx[0] )==UINT_MAX );
+  FD_TEST( fd_stake_rewards_window_lo( sr, fork_idx[1] )==0U );
+  FD_TEST( fd_stake_rewards_window_lo( sr, fork_idx[2] )==0U );
+  FD_TEST( fd_stake_rewards_starting_block_height( sr, fork_idx[0] )==100UL );
+  FD_TEST( fd_stake_rewards_total_rewards( sr, fork_idx[0] )==10UL );
+
+  for( ushort i=1U; i<3U; i++ ) {
+    fd_stake_rewards_iter_init( sr, fork_idx[i], 0U );
+    FD_TEST( !fd_stake_rewards_iter_done( sr ) );
+    fd_pubkey_t pubkey;
+    ulong lamports;
+    ulong credits_observed;
+    fd_stake_rewards_iter_ele(
+        sr, fork_idx[i], &pubkey, &lamports, &credits_observed );
+    FD_TEST( pubkey.ul[0]==i );
+    FD_TEST( lamports==10UL+i );
+    FD_TEST( credits_observed==20UL+i );
+    fd_stake_rewards_iter_next( sr, fork_idx[i] );
+    FD_TEST( fd_stake_rewards_iter_done( sr ) );
+  }
+
+  ushort evicted_fork = fork_idx[0];
+  fork_idx[0] = fd_stake_rewards_init(
+      sr, &parent_blockhash[0], 100UL, 1U, 0U, 1UL );
+  fd_pubkey_t pubkey = { .ul={ 0UL } };
+  fd_stake_rewards_insert( sr, fork_idx[0], &pubkey, 10UL, 20UL );
+  fd_stake_rewards_fini( sr, fork_idx[0] );
+  fd_stake_rewards_release( sr, evicted_fork );
+
+  FD_TEST( fd_stake_rewards_window_lo( sr, fork_idx[0] )==0U );
+  FD_TEST( fd_stake_rewards_window_lo( sr, fork_idx[1] )==UINT_MAX );
+  FD_TEST( fd_stake_rewards_window_lo( sr, fork_idx[2] )==0U );
+
+  free( mem );
+
+  FD_LOG_NOTICE(( "test_stake_rewards_two_buffer_cache: PASSED" ));
+}
+
+static void
+test_stake_rewards_four_buffer_cache( void ) {
+  ulong footprint = fd_stake_rewards_footprint( 1UL, 5UL, 4UL );
+  void * mem = aligned_alloc( fd_stake_rewards_align(), footprint );
+  FD_TEST( mem );
+
+  fd_stake_rewards_t * sr = fd_stake_rewards_join(
+      fd_stake_rewards_new( mem, 1UL, 5UL, 4UL ) );
+  FD_TEST( sr );
+
+  ushort fork_idx[5];
+  for( ushort i=0U; i<5U; i++ ) {
+    fd_hash_t   parent_blockhash = { .ul={ i } };
+    fd_pubkey_t pubkey           = { .ul={ i } };
+    fork_idx[i] = fd_stake_rewards_init(
+        sr, &parent_blockhash, 100UL+i, 1U, 0U, 1UL );
+    fd_stake_rewards_insert( sr, fork_idx[i], &pubkey, 1UL, 1UL );
+    fd_stake_rewards_fini( sr, fork_idx[i] );
+
+    if( i==3U ) {
+      for( ushort j=0U; j<4U; j++ )
+        FD_TEST( fd_stake_rewards_window_lo( sr, fork_idx[j] )==0U );
+    }
+  }
+
+  FD_TEST( fd_stake_rewards_window_lo( sr, fork_idx[0] )==UINT_MAX );
+  for( ushort i=1U; i<5U; i++ )
+    FD_TEST( fd_stake_rewards_window_lo( sr, fork_idx[i] )==0U );
+
+  free( mem );
+
+  FD_LOG_NOTICE(( "test_stake_rewards_four_buffer_cache: PASSED" ));
+}
+
+static void
+test_stake_rewards_empty_fini_does_not_evict( void ) {
+  ulong footprint = fd_stake_rewards_footprint( 1UL, 3UL, 2UL );
+  void * mem = aligned_alloc( fd_stake_rewards_align(), footprint );
+  FD_TEST( mem );
+
+  fd_stake_rewards_t * sr = fd_stake_rewards_join(
+      fd_stake_rewards_new( mem, 1UL, 3UL, 2UL ) );
+  FD_TEST( sr );
+
+  ushort fork_idx[3];
+  for( ushort i=0U; i<2U; i++ ) {
+    fd_hash_t parent_blockhash = { .ul={ i } };
+    fd_pubkey_t pubkey = { .ul={ i } };
+    fork_idx[i] = fd_stake_rewards_init(
+        sr, &parent_blockhash, 100UL+i, 1U, 0U, 1UL );
+    fd_stake_rewards_insert( sr, fork_idx[i], &pubkey, 1UL, 1UL );
+    fd_stake_rewards_fini( sr, fork_idx[i] );
+  }
+
+  fd_hash_t parent_blockhash = { .ul={ 2UL } };
+  fork_idx[2] = fd_stake_rewards_init(
+      sr, &parent_blockhash, 102UL, 1U, 0U, 0UL );
+  fd_stake_rewards_fini( sr, fork_idx[2] );
+
+  for( ushort i=0U; i<3U; i++ )
+    FD_TEST( fd_stake_rewards_window_lo( sr, fork_idx[i] )==0U );
+  fd_stake_rewards_iter_init( sr, fork_idx[2], 0U );
+  FD_TEST( fd_stake_rewards_iter_done( sr ) );
+
+  free( mem );
+
+  FD_LOG_NOTICE(( "test_stake_rewards_empty_fini_does_not_evict: PASSED" ));
+}
+
+static void
+test_hash_rewards_pubkeys_across_forks( void ) {
+  ulong max_accs  = 4UL;
+  ulong max_forks = 2UL;
+
+  FD_TEST( fd_stake_rewards_footprint( 2150000UL, 32UL, 2UL ) < (4UL<<30) );
+
+  ulong footprint = fd_stake_rewards_footprint( max_accs, max_forks, 2UL );
+  void * mem = aligned_alloc( fd_stake_rewards_align(), footprint );
+  FD_TEST( mem );
+
+  fd_stake_rewards_t * sr = fd_stake_rewards_join(
+      fd_stake_rewards_new( mem, max_accs, max_forks, 2UL ) );
+  FD_TEST( sr );
+
+  ushort fork_idx[2];
   for( ulong fork=0UL; fork<max_forks; fork++ ) {
     fd_hash_t blockhash = {{ 0 }};
     memset( blockhash.hash, (int)(0xA0UL + fork), sizeof(blockhash.hash) );
-    fork_idx[fork] = fd_stake_rewards_init( sr, 1UL, &blockhash, 100UL + fork, 2U, 0UL );
+    fork_idx[fork] = fd_stake_rewards_init(
+        sr, &blockhash, 100UL+fork, 2U, 0U, 0UL );
 
     for( ulong i=0UL; i<max_accs; i++ ) {
       fd_pubkey_t pubkey = {{ 0 }};
@@ -1679,6 +2023,7 @@ test_hash_rewards_pubkeys_across_forks( void ) {
       pubkey.ul[1] = 0xF00DUL;
       fd_stake_rewards_insert( sr, fork_idx[fork], &pubkey, (fork + 1UL)*100UL + i, i );
     }
+    fd_stake_rewards_fini( sr, fork_idx[fork] );
   }
 
   for( ulong fork=0UL; fork<max_forks; fork++ ) {
@@ -1709,15 +2054,18 @@ test_hash_rewards_pubkeys_across_forks( void ) {
     FD_TEST( seen == (1UL<<max_accs)-1UL );
   }
 
-  for( ulong fork=0UL; fork<max_forks; fork++ ) fd_stake_rewards_purge( sr, fork_idx[fork] );
+  for( ulong fork=0UL; fork<max_forks; fork++ )
+    fd_stake_rewards_release( sr, fork_idx[fork] );
 
   fd_hash_t blockhash = {{ 0 }};
-  uchar next_epoch_fork_idx = fd_stake_rewards_init( sr, 2UL, &blockhash, 200UL, 1U, 0UL );
+  ushort next_epoch_fork_idx = fd_stake_rewards_init(
+      sr, &blockhash, 200UL, 1U, 0U, 0UL );
   for( ulong i=0UL; i<max_accs; i++ ) {
     fd_pubkey_t pubkey = {{ 0 }};
     pubkey.ul[0] = max_accs + i;
     fd_stake_rewards_insert( sr, next_epoch_fork_idx, &pubkey, i, i );
   }
+  fd_stake_rewards_fini( sr, next_epoch_fork_idx );
   ulong next_epoch_cnt = 0UL;
   for( fd_stake_rewards_iter_init( sr, next_epoch_fork_idx, 0U );
        !fd_stake_rewards_iter_done( sr );
@@ -1729,12 +2077,14 @@ test_hash_rewards_pubkeys_across_forks( void ) {
   FD_TEST( next_epoch_cnt==max_accs );
 
   blockhash.ul[0] = 1UL;
-  uchar next_epoch_second_fork_idx = fd_stake_rewards_init( sr, 2UL, &blockhash, 201UL, 1U, 0UL );
+  ushort next_epoch_second_fork_idx = fd_stake_rewards_init(
+      sr, &blockhash, 201UL, 1U, 0U, 0UL );
   for( ulong i=0UL; i<max_accs; i++ ) {
     fd_pubkey_t pubkey = {{ 0 }};
     pubkey.ul[0] = 2UL*max_accs + i;
     fd_stake_rewards_insert( sr, next_epoch_second_fork_idx, &pubkey, i, i );
   }
+  fd_stake_rewards_fini( sr, next_epoch_second_fork_idx );
   ulong next_epoch_second_cnt  = 0UL;
   ulong next_epoch_second_seen = 0UL;
   for( fd_stake_rewards_iter_init( sr, next_epoch_second_fork_idx, 0U );
@@ -1759,31 +2109,34 @@ test_hash_rewards_pubkeys_across_forks( void ) {
 }
 
 static void
-test_hash_rewards_purge_first_fork( void ) {
+test_hash_rewards_release_staged_fork( void ) {
   ulong max_accs  = 4UL;
   ulong max_forks = 2UL;
 
-  ulong footprint = fd_stake_rewards_footprint( max_accs, max_forks );
+  ulong footprint = fd_stake_rewards_footprint( max_accs, max_forks, 2UL );
   void * mem = aligned_alloc( fd_stake_rewards_align(), footprint );
   FD_TEST( mem );
 
   fd_stake_rewards_t * sr = fd_stake_rewards_join(
-      fd_stake_rewards_new( mem, max_accs, max_forks ) );
+      fd_stake_rewards_new( mem, max_accs, max_forks, 2UL ) );
   FD_TEST( sr );
 
   fd_hash_t blockhash = {{ 0 }};
   fd_pubkey_t pubkey = {{ 0 }};
 
-  uchar first_fork_idx = fd_stake_rewards_init( sr, 1UL, &blockhash, 100UL, 1U, 0UL );
+  ushort first_fork_idx = fd_stake_rewards_init(
+      sr, &blockhash, 100UL, 1U, 0U, 0UL );
   fd_stake_rewards_insert( sr, first_fork_idx, &pubkey, 1UL, 1UL );
   pubkey.ul[0] = 1UL;
   fd_stake_rewards_insert( sr, first_fork_idx, &pubkey, 2UL, 2UL );
-  fd_stake_rewards_purge( sr, first_fork_idx );
+  fd_stake_rewards_release( sr, first_fork_idx );
 
   blockhash.ul[0] = 1UL;
-  uchar second_fork_idx = fd_stake_rewards_init( sr, 1UL, &blockhash, 101UL, 1U, 0UL );
+  ushort second_fork_idx = fd_stake_rewards_init(
+      sr, &blockhash, 101UL, 1U, 0U, 0UL );
   pubkey.ul[0] = 2UL;
   fd_stake_rewards_insert( sr, second_fork_idx, &pubkey, 3UL, 3UL );
+  fd_stake_rewards_fini( sr, second_fork_idx );
 
   fd_stake_rewards_iter_init( sr, second_fork_idx, 0U );
   FD_TEST( !fd_stake_rewards_iter_done( sr ) );
@@ -1797,7 +2150,7 @@ test_hash_rewards_purge_first_fork( void ) {
 
   free( mem );
 
-  FD_LOG_NOTICE(( "test_hash_rewards_purge_first_fork: PASSED" ));
+  FD_LOG_NOTICE(( "test_hash_rewards_release_staged_fork: PASSED" ));
 }
 
 static void
@@ -1823,9 +2176,10 @@ test_epoch_credit_rewards_and_history_update( fd_svm_mini_t * mini ) {
   fd_accdb_fork_id_t child_fk = fd_svm_mini_fork_id( mini, child_idx );
 
   ulong starting_block_height = child_bank->f.block_height;
-  uchar fork_idx = init_stake_rewards( child_bank, &blockhash, starting_block_height, 1U );
+  ushort fork_idx = init_stake_rewards( child_bank, &blockhash, starting_block_height, 1U );
   fd_stake_rewards_t * stake_rewards = fd_bank_stake_rewards_modify( child_bank );
   fd_stake_rewards_insert( stake_rewards, fork_idx, &stake_key, reward_lamports, credits_observed );
+  fd_stake_rewards_fini( stake_rewards, fork_idx );
   init_epoch_rewards_sysvar( child_bank, mini, starting_block_height, 1U, reward_lamports );
 
   ulong stake_lam_before = read_lamports( mini, child_fk, &stake_key );
@@ -1843,7 +2197,7 @@ test_epoch_credit_rewards_and_history_update( fd_svm_mini_t * mini ) {
   FD_TEST( fd_sysvar_epoch_rewards_read( mini->runtime->accdb, child_fk, er ) );
   FD_TEST( er->distributed_rewards == reward_lamports );
   FD_TEST( er->active == 0 );
-  FD_TEST( child_bank->stake_rewards_fork_id == UCHAR_MAX );
+  FD_TEST( child_bank->stake_rewards_fork_id == USHORT_MAX );
 
   FD_LOG_NOTICE(( "test_epoch_credit_rewards_and_history_update: PASSED" ));
 }
@@ -1880,10 +2234,11 @@ test_update_reward_history_in_partition( fd_svm_mini_t * mini ) {
   fd_accdb_fork_id_t child_fk = fd_svm_mini_fork_id( mini, child_idx );
 
   ulong starting_block_height = child_bank->f.block_height;
-  uchar fork_idx = init_stake_rewards( child_bank, &blockhash, starting_block_height, 1U );
+  ushort fork_idx = init_stake_rewards( child_bank, &blockhash, starting_block_height, 1U );
   fd_stake_rewards_t * stake_rewards = fd_bank_stake_rewards_modify( child_bank );
   fd_stake_rewards_insert( stake_rewards, fork_idx, &stake_key, reward_a, 5UL );
   fd_stake_rewards_insert( stake_rewards, fork_idx, &stake_key_b, reward_b, 6UL );
+  fd_stake_rewards_fini( stake_rewards, fork_idx );
   init_epoch_rewards_sysvar( child_bank, mini, starting_block_height, 1U, total_rewards );
 
   ulong cap_before = child_bank->f.capitalization;
@@ -1920,9 +2275,10 @@ test_build_updated_stake_reward( fd_svm_mini_t * mini ) {
   fd_bank_t * child_bank = fd_svm_mini_bank( mini, child_idx );
 
   ulong starting_block_height = child_bank->f.block_height;
-  uchar fork_idx = init_stake_rewards( child_bank, &blockhash, starting_block_height, 1U );
+  ushort fork_idx = init_stake_rewards( child_bank, &blockhash, starting_block_height, 1U );
   fd_stake_rewards_t * stake_rewards = fd_bank_stake_rewards_modify( child_bank );
   fd_stake_rewards_insert( stake_rewards, fork_idx, &stake_key, reward_lamports, credits_observed );
+  fd_stake_rewards_fini( stake_rewards, fork_idx );
   init_epoch_rewards_sysvar( child_bank, mini, starting_block_height, 1U, reward_lamports );
 
   ulong stake_lam_before = read_lamports( mini, child_fk, &stake_key );
@@ -1957,7 +2313,8 @@ test_update_reward_history_in_partition_empty( fd_svm_mini_t * mini ) {
   fd_accdb_fork_id_t child_fk = fd_svm_mini_fork_id( mini, child_idx );
 
   ulong starting_block_height = child_bank->f.block_height;
-  init_stake_rewards( child_bank, &blockhash, starting_block_height, 1U );
+  ushort fork_idx = init_stake_rewards( child_bank, &blockhash, starting_block_height, 1U );
+  fd_stake_rewards_fini( fd_bank_stake_rewards_modify( child_bank ), fork_idx );
   init_epoch_rewards_sysvar( child_bank, mini, starting_block_height, 1U, 0UL );
 
   ulong cap_before = child_bank->f.capitalization;
@@ -2001,7 +2358,7 @@ test_store_stake_accounts_in_partition( fd_svm_mini_t * mini ) {
   ulong rewards[4];
   ulong credits[4];
   uint attempts = 0U;
-  uchar fork_idx = UCHAR_MAX;
+  ushort fork_idx = USHORT_MAX;
 
   while( attempts++ < 64U ) {
     fd_stake_rewards_clear( stake_rewards );
@@ -2013,6 +2370,7 @@ test_store_stake_accounts_in_partition( fd_svm_mini_t * mini ) {
       credits[i] = 10UL + (ulong)i;
       fd_stake_rewards_insert( stake_rewards, fork_idx, &pubkeys[i], rewards[i], credits[i] );
     }
+    fd_stake_rewards_fini( stake_rewards, fork_idx );
 
     ulong counts[2] = {0UL, 0UL};
     for( uint i=0U; i<4U; i++ ) {
@@ -2022,7 +2380,7 @@ test_store_stake_accounts_in_partition( fd_svm_mini_t * mini ) {
     if( counts[0] && counts[1] ) break;
   }
 
-  FD_TEST( fork_idx!=UCHAR_MAX );
+  FD_TEST( fork_idx!=USHORT_MAX );
 
   for( uint i=0U; i<4U; i++ ) clone_stake_account( mini, root_idx, &stake_key, &pubkeys[i] );
 
@@ -2088,7 +2446,7 @@ test_store_stake_accounts_in_partition_empty( fd_svm_mini_t * mini ) {
   uint num_partitions = 2U;
 
   fd_pubkey_t reward_key = {{ 0 }};
-  uchar fork_idx = UCHAR_MAX;
+  ushort fork_idx = USHORT_MAX;
   uint attempts = 0U;
   ulong child_idx0 = fd_svm_mini_attach_child( mini, root_idx, params->root_slot + 1UL );
   fd_bank_t * bank0 = fd_svm_mini_bank( mini, child_idx0 );
@@ -2101,11 +2459,12 @@ test_store_stake_accounts_in_partition_empty( fd_svm_mini_t * mini ) {
     fork_idx = init_stake_rewards( bank0, &blockhash, starting_block_height, num_partitions );
     for( ulong j=0UL; j<4UL; j++ ) reward_key.ul[j] = (ulong)(attempts * 101U + j);
     fd_stake_rewards_insert( stake_rewards, fork_idx, &reward_key, 333UL, 9UL );
+    fd_stake_rewards_fini( stake_rewards, fork_idx );
     uint part = find_reward_partition( stake_rewards, fork_idx, &reward_key, num_partitions );
     if( part==1U ) break;
   }
 
-  FD_TEST( fork_idx!=UCHAR_MAX );
+  FD_TEST( fork_idx!=USHORT_MAX );
   clone_stake_account( mini, root_idx, &stake_key, &reward_key );
 
   init_epoch_rewards_sysvar( bank0, mini, starting_block_height, num_partitions, 333UL );
@@ -2870,10 +3229,10 @@ test_simd0232_recalc_ignores_commission( fd_svm_mini_t * mini ) {
 
   /* Simulate a restart: drop the partitions and recalculate. */
   fd_stake_rewards_clear( stake_rewards );
-  epoch_bank->stake_rewards_fork_id = UCHAR_MAX;
+  epoch_bank->stake_rewards_fork_id = USHORT_MAX;
   fd_rewards_recalculate_partitioned_rewards( mini->banks, epoch_bank, mini->runtime->accdb, mini->runtime_stack, NULL );
 
-  FD_TEST( epoch_bank->stake_rewards_fork_id!=UCHAR_MAX );
+  FD_TEST( epoch_bank->stake_rewards_fork_id!=USHORT_MAX );
   FD_TEST( fd_stake_rewards_total_rewards( fd_bank_stake_rewards_modify( epoch_bank ), epoch_bank->stake_rewards_fork_id )==staker_total );
 
   /* The collector and the sysvar are untouched by recalculation. */
@@ -2909,6 +3268,7 @@ main( int     argc,
   test_alpenglow_preserves_commission_remainder( mini );
   test_no_credits_no_reward( mini );
   test_credits_staker_reward( mini );
+  test_evicted_reward_window_recalculated( mini );
   test_activation_epoch_skips_reward( mini );
   test_inert_delegation_not_partitioned( mini );
   test_snapshot_refresh_prunes_inactive_stakes( mini );
@@ -2917,6 +3277,7 @@ main( int     argc,
   test_split_commission_reward( mini );
   test_commission_split_suppresses_reward( mini );
   test_credit_rewind_force_update( mini );
+  test_zero_points_skips_rewards( mini );
   test_multi_validator_proportional( mini );
   test_calculate_points_typical_values( mini );
   test_epoch_rewards_sysvar_lifecycle( mini );
@@ -2924,8 +3285,11 @@ main( int     argc,
   test_hash_rewards_windowed();
   test_hash_rewards_window_sizing();
   test_hash_rewards_into_partitions_empty();
+  test_stake_rewards_two_buffer_cache();
+  test_stake_rewards_four_buffer_cache();
+  test_stake_rewards_empty_fini_does_not_evict();
   test_hash_rewards_pubkeys_across_forks();
-  test_hash_rewards_purge_first_fork();
+  test_hash_rewards_release_staged_fork();
   test_distribute_rewards_capitalization( mini );
   test_distribute_empty_rewards( mini );
   test_epoch_credit_rewards_and_history_update( mini );

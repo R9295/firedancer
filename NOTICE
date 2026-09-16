@@ -496,6 +496,7 @@ both released under Apache License 2.0.
 
 https://github.com/anza-xyz/agave/tree/v2.3.7/svm/tests/example-programs/hello-solana
 https://github.com/solana-program/token/tree/program%40v8.0.0/p-token
+https://github.com/solana-program/token/releases/tag/p-token%40v1.0.0
 
                                  Apache License
                            Version 2.0, January 2004
@@ -584,18 +585,6 @@ https://github.com/facebook/zstd
 Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
 
 See src/third_party/zstd/LICENSE for the full license text.
-
-=======================================================================
-
-'src/third_party/lz4' contains a subset of the LZ4 library
-(tag v1.10.0, lib/ only, which is BSD-2-Clause licensed).
-
-https://github.com/lz4/lz4
-
-Copyright (c) 2011-2020, Yann Collet
-All rights reserved.
-
-See src/third_party/lz4/LICENSE for the full license text.
 
 =======================================================================
 

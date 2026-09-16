@@ -1,5 +1,9 @@
 #include "fd_x509_mock.h"
+#include "fd_x509.h"
+#include "fd_der.h"
+#include "../hex/fd_hex.h"
 #include "../../util/fd_util.h"
+#include <string.h>
 
 int
 main( int     argc,
@@ -8,7 +12,35 @@ main( int     argc,
 
   fd_rng_t _rng[1]; fd_rng_t * rng = fd_rng_join( fd_rng_new( _rng, 0U, 0UL ) );
 
-  /* Test v1 */
+  /* Reject an uncompressed point whose y coordinate has been altered while
+     retaining the same parity bit. */
+  {
+    uchar uncompressed[ 65 ];
+    uchar compressed  [ 33 ];
+    fd_hex_decode( uncompressed,
+                   "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296"
+                   "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5",
+                   65UL );
+    FD_TEST( !fd_x509_ec_point_compress( uncompressed, 32UL, compressed ) );
+    uncompressed[ 33 ] ^= 1U;
+    FD_TEST( fd_x509_ec_point_compress( uncompressed, 32UL, compressed )==-1 );
+  }
+
+  {
+    uchar uncompressed[ 97 ];
+    uchar compressed  [ 49 ];
+    fd_hex_decode( uncompressed,
+                   "04aa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385"
+                   "502f25dbf55296c3a545e3872760ab7"
+                   "3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c0"
+                   "0a60b1ce1d7e819d7a431d7c90ea0e5f",
+                   97UL );
+    FD_TEST( !fd_x509_ec_point_compress( uncompressed, 48UL, compressed ) );
+    uncompressed[ 49 ] ^= 1U;
+    FD_TEST( fd_x509_ec_point_compress( uncompressed, 48UL, compressed )==-1 );
+  }
+
+  /* Agave-style Ed25519 certs */
 
   static uchar const cert_v1_1[] = {
     0x30, 0x81, 0xf6, 0x30, 0x81, 0xa9, 0xa0, 0x03, 0x02, 0x01, 0x02, 0x02, 0x08, 0x4c, 0x74, 0xcd,
@@ -28,8 +60,9 @@ main( int     argc,
     0x00, 0xd7, 0xa2, 0x7b, 0x26, 0xfd, 0x73, 0xfc, 0x28, 0x6a, 0xa0, 0x29, 0x43, 0x8c, 0x96, 0x8b,
     0x34, 0x75, 0xd1, 0xdc, 0x94, 0x2a, 0x1a, 0xc1, 0x08
   };
-  uchar const * pubkey = fd_x509_mock_pubkey( cert_v1_1, FD_X509_MOCK_CERT_SZ );
-  FD_TEST( pubkey && pubkey - cert_v1_1 == 122 );
+  uchar const * pubkey; ulong pubkey_len; uchar key_type;
+  FD_TEST( !fd_x509_extract_pubkey( cert_v1_1, sizeof(cert_v1_1), &pubkey, &pubkey_len, &key_type ) );
+  FD_TEST( pubkey - cert_v1_1 == 122 && pubkey_len==32UL && key_type==FD_X509_KEY_ED25519 );
 
   static uchar const cert_v1_2[] = {
     0x30, 0x81, 0xf7, 0x30, 0x81, 0xaa, 0xa0, 0x03, 0x02, 0x01, 0x02, 0x02, 0x09, 0x00, 0xac, 0x9f,
@@ -49,16 +82,15 @@ main( int     argc,
     0xa3, 0x3d, 0x90, 0x62, 0xe7, 0x6d, 0x8b, 0x19, 0x4a, 0xc0, 0x1f, 0xa1, 0x19, 0x7e, 0xf8, 0xaa,
     0x92, 0x0c, 0xef, 0xb4, 0x98, 0x2f, 0xa0, 0x9f, 0xfc, 0x03
   };
-  pubkey = fd_x509_mock_pubkey( cert_v1_2, FD_X509_MOCK_CERT_SZ );
-  FD_TEST( pubkey && pubkey - cert_v1_2 == 123 );
+  FD_TEST( !fd_x509_extract_pubkey( cert_v1_2, sizeof(cert_v1_2), &pubkey, &pubkey_len, &key_type ) );
+  FD_TEST( pubkey - cert_v1_2 == 123 && pubkey_len==32UL && key_type==FD_X509_KEY_ED25519 );
 
-  /* Test out-of-bounds key */
-  for( ulong j=0UL; j<32UL; j++ ) {
-    FD_TEST( !fd_x509_mock_pubkey( cert_v1_2, 123+j ) );
+  /* Truncated certs must fail */
+  for( ulong j=0UL; j<sizeof(cert_v1_2); j++ ) {
+    FD_TEST( fd_x509_extract_pubkey( cert_v1_2, j, &pubkey, &pubkey_len, &key_type ) );
   }
-  FD_TEST( fd_x509_mock_pubkey( cert_v1_2, 123+32 ) );
 
-  /* Test v2 */
+  /* fd_x509_mock_cert output */
 
   for( ulong j=0UL; j<100000UL; j++ ) {
 
@@ -73,26 +105,68 @@ main( int     argc,
 
     /* Ensure pubkey matches */
     FD_TEST( fd_hash( 0UL, public_key, 32UL )==hash );  /* orig same */
-    uchar const * extracted = fd_x509_mock_pubkey( cert, FD_X509_MOCK_CERT_SZ );
-    FD_TEST( 0==memcmp( extracted, public_key, 32UL ) );  /* extract same */
-
-    for( ulong k=0UL; k<64UL; k++ ) {
-
-      /* Corrupt some bytes */
-      uint off = fd_rng_uint_roll( rng, FD_X509_MOCK_CERT_SZ );
-      uint val = fd_rng_uchar( rng );
-      cert[ off ] = (uchar)( cert[ off ] ^ val );
-      extracted = fd_x509_mock_pubkey( cert, FD_X509_MOCK_CERT_SZ );
-
-      /* Extraction must fail if we flipped a bit in the template */
-      FD_TEST( (!extracted) == ( ( (off<0x64) | (off>=0x84) ) & (!!val) ) );
-      cert[ off ] = (uchar)( cert[ off ] ^ val );
-
-    }
+    FD_TEST( !fd_x509_extract_pubkey( cert, FD_X509_MOCK_CERT_SZ, &pubkey, &pubkey_len, &key_type ) );
+    FD_TEST( pubkey_len==32UL && key_type==FD_X509_KEY_ED25519 );
+    FD_TEST( 0==memcmp( pubkey, public_key, 32UL ) );  /* extract same */
 
   }
 
+  /* fd_x509_ec_point_compress */
+  {
+    uchar uncompressed[ 97 ] = { 0x04 };
+    uchar compressed  [ 49 ];
+
+    FD_TEST( fd_x509_ec_point_compress( NULL,         32UL, compressed )==-1 );
+    FD_TEST( fd_x509_ec_point_compress( uncompressed, 32UL, NULL       )==-1 );
+    FD_TEST( fd_x509_ec_point_compress( uncompressed,  0UL, compressed )==-1 );
+    FD_TEST( fd_x509_ec_point_compress( uncompressed, 31UL, compressed )==-1 );
+    FD_TEST( fd_x509_ec_point_compress( uncompressed, 49UL, compressed )==-1 );
+    FD_TEST( fd_x509_ec_point_compress( uncompressed, ULONG_MAX, compressed )==-1 );
+    FD_TEST( fd_x509_ec_point_compress( uncompressed, 32UL, compressed )==-1 );
+    FD_TEST( fd_x509_ec_point_compress( uncompressed, 48UL, compressed )==-1 );
+  }
+
   fd_rng_delete( fd_rng_leave( rng ) );
+
+  /* fd_x509_time_parse */
+  {
+    static struct { uchar tag; char const * s; long expected; } const cases[] = {
+      /* UTCTime, valid */
+      { FD_DER_TAG_UTC_TIME, "700101000000Z",           0L },
+      { FD_DER_TAG_UTC_TIME, "380119031407Z",  2147483647L }, /* 32 bit boundary */
+      { FD_DER_TAG_UTC_TIME, "000229000000Z",   951782400L }, /* 2000 is a leap year */
+      { FD_DER_TAG_UTC_TIME, "490101000000Z",  2493072000L }, /* pivots to 2049 */
+      { FD_DER_TAG_UTC_TIME, "500101000000Z",  -631152000L }, /* pivots to 1950 */
+      /* GeneralizedTime, valid */
+      { FD_DER_TAG_GENERALIZED_TIME, "19700101000000Z",          0L },
+      { FD_DER_TAG_GENERALIZED_TIME, "40960101000000Z", 67090118400L },
+      /* Rejected */
+      { FD_DER_TAG_UTC_TIME, "750101000000",  FD_X509_TIME_INVALID }, /* no Z */
+      { FD_DER_TAG_UTC_TIME, "750101000000+0100", FD_X509_TIME_INVALID },
+      { FD_DER_TAG_UTC_TIME, "7501010000000.5Z", FD_X509_TIME_INVALID },
+      { FD_DER_TAG_UTC_TIME, "9901010000Z",   FD_X509_TIME_INVALID }, /* short */
+      { FD_DER_TAG_UTC_TIME, "7501010000X0Z", FD_X509_TIME_INVALID }, /* non digit */
+      { FD_DER_TAG_UTC_TIME, "750001000000Z", FD_X509_TIME_INVALID }, /* month 00 */
+      { FD_DER_TAG_UTC_TIME, "751301000000Z", FD_X509_TIME_INVALID }, /* month 13 */
+      { FD_DER_TAG_UTC_TIME, "750100000000Z", FD_X509_TIME_INVALID }, /* day 00 */
+      { FD_DER_TAG_UTC_TIME, "750132000000Z", FD_X509_TIME_INVALID }, /* day 32 */
+      { FD_DER_TAG_UTC_TIME, "990229000000Z", FD_X509_TIME_INVALID }, /* 1999 not leap */
+      { FD_DER_TAG_UTC_TIME, "750101240000Z", FD_X509_TIME_INVALID }, /* hour 24 */
+      { FD_DER_TAG_UTC_TIME, "750101006000Z", FD_X509_TIME_INVALID }, /* minute 60 */
+      { FD_DER_TAG_UTC_TIME, "750101000060Z", FD_X509_TIME_INVALID }, /* leap second */
+      { FD_DER_TAG_GENERALIZED_TIME, "700101000000Z", FD_X509_TIME_INVALID }, /* short */
+      { FD_DER_TAG_SEQUENCE, "19700101000000Z", FD_X509_TIME_INVALID },       /* bad tag */
+    };
+
+    for( ulong i=0UL; i<sizeof(cases)/sizeof(cases[0]); i++ ) {
+      long got = fd_x509_time_parse( cases[i].tag, (uchar const *)cases[i].s, strlen( cases[i].s ) );
+      if( FD_UNLIKELY( got!=cases[i].expected ) ) {
+        FD_LOG_ERR(( "fd_x509_time_parse(%s): got %ld, expected %ld", cases[i].s, got, cases[i].expected ));
+      }
+    }
+
+    FD_LOG_INFO(( "OK: fd_x509_time_parse" ));
+  }
 
   FD_LOG_NOTICE(( "pass" ));
   fd_halt();

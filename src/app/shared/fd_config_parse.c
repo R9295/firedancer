@@ -102,8 +102,7 @@ fd_config_extract_podf( uchar *        pod,
   CFG_POP      ( ulong,  runtime.max_live_slots                              );
   CFG_POP      ( ulong,  runtime.max_fork_width                              );
 
-  CFG_POP      ( ulong,  runtime.program_cache.heap_size_mib                 );
-  CFG_POP      ( ulong,  runtime.program_cache.mean_cache_entry_size         );
+  CFG_POP      ( ulong,  runtime.program_cache_size_mib                      );
 
   CFG_POP      ( cstr,   consensus.wait_for_supermajority_with_bank_hash     );
 
@@ -334,18 +333,18 @@ fd_config_extract_pod( uchar *       pod,
   CFG_POP      ( uint,   development.bench.benchg_tile_count              );
   CFG_POP      ( uint,   development.bench.benchs_tile_count              );
   CFG_POP      ( cstr,   development.bench.affinity                       );
-  CFG_POP      ( bool,   development.bench.larger_max_cost_per_block      );
-  CFG_POP      ( bool,   development.bench.larger_shred_limits_per_block  );
+  CFG_POP      ( cstr,   development.bench.transaction_mode               );
+  CFG_POP      ( ulong,  development.bench.max_cost_per_block             );
+  CFG_POP      ( ulong,  development.bench.max_shreds_per_block           );
   CFG_POP      ( ulong,  development.bench.disable_blockstore_from_slot   );
   CFG_POP      ( bool,   development.bench.disable_status_cache           );
 
   CFG_POP      ( cstr,   development.bundle.ssl_key_log_file              );
   CFG_POP      ( uint,   development.bundle.buffer_size_kib               );
-  CFG_POP      ( uint,   development.bundle.ssl_heap_size_mib             );
 
   CFG_POP      ( bool,   development.event.report_shreds                  );
   CFG_POP      ( bool,   development.event.report_transactions            );
-  CFG_POP      ( bool,   development.event.report_transaction_diffs       );
+  CFG_POP      ( bool,   development.event.report_runtime_diffs           );
 
   CFG_POP      ( cstr,   development.pktgen.affinity                      );
   CFG_POP      ( cstr,   development.pktgen.fake_dst_ip                   );
@@ -399,6 +398,20 @@ fd_config_extract_pod( uchar *       pod,
   CFG_RENAMED( tiles.repair.repair_intake_listen_port,   tiles.repair.repair_client_listen_port );
 
 # undef CFG_RENAMED
+
+# define CFG_DEPRECATED( path )                                        \
+  do {                                                                 \
+    char const * key = #path;                                          \
+    if( FD_UNLIKELY( !fd_pod_query( pod, key, NULL ) ) ) {             \
+      FD_LOG_WARNING(( "ignoring deprecated config option `%s`", key ));\
+      if( FD_UNLIKELY( fd_pod_remove( pod, key ) ) )                   \
+        FD_LOG_ERR(( "failed to remove deprecated key `%s`", key ));   \
+    }                                                                  \
+  } while(0)
+
+  CFG_DEPRECATED( development.bundle.ssl_heap_size_mib );
+
+# undef CFG_DEPRECATED
 
   if( FD_UNLIKELY( !fdctl_pod_find_leftover( pod ) ) ) return NULL;
   return config;

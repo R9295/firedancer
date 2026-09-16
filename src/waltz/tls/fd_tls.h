@@ -2,6 +2,8 @@
 #define HEADER_fd_src_waltz_tls_fd_tls_h
 
 #include "fd_tls_estate.h"
+#include "../../ballet/chacha/fd_chacha_rng.h"
+#include "../../ballet/x509/fd_x509_ca_store.h"
 
 /* fd_tls implements a subset of the TLS v1.3 (RFC 8446) handshake
    protocol.
@@ -119,43 +121,6 @@ typedef void
                               uchar const * quic_tp,
                               ulong         quic_tp_sz );
 
-/* fd_tls_rand_vt_t is an abstraction for retrieving secure pseudorandom
-   values.  When fd_tls needs random values, it calls fd_tls_rand_fn_t.
-
-   ctx is an arbitrary pointer that is provided as a callback argument.
-   buf points to a buffer of bufsz bytes that is to be filled with
-   cryptographically secure randomness.  bufsz is usually 32 bytes.
-   Assume buf is unaligned.  Returns buf on success and NULL on failure.
-
-   Function must not block, but may synchronously pre-calculate a
-   reasonable amount of data ahead of time.  NULL return value implies
-   inability to keep up with demand for random values.  In this case,
-   function should return NULL.  Function should minimize side effects
-   (notably, should not log).
-
-   TODO API considerations:
-   - read() style error codes?
-   - Buffering to reduce amount of virtual function calls? */
-
-typedef void *
-(* fd_tls_rand_fn_t)( void * ctx,
-                      void * buf,
-                      ulong  bufsz );
-
-struct fd_tls_rand_vt {
-  void *           ctx;
-  fd_tls_rand_fn_t rand_fn;
-};
-
-typedef struct fd_tls_rand_vt fd_tls_rand_t;
-
-static inline void *
-fd_tls_rand( fd_tls_rand_t const * rand,
-             void *                buf,
-             ulong                 bufsz ) {
-  return rand->rand_fn( rand->ctx, buf, bufsz );
-}
-
 /* fd_tls_sign_fn_t is called by by fd_tls to request signing of a
    TLS 1.3 certificate verify payload.
 
@@ -165,7 +130,15 @@ fd_tls_rand( fd_tls_rand_t const * rand,
    buffer containing the TLS 1.3 CertificateVerify payload.
 
    This function must not fail.  Lifetime of the payload buffer ends at
-   return. */
+   return.
+
+   May be NULL for clients that never present a client certificate.  If
+   such a client (or one without a cert_x509) receives a CertificateRequest,
+   fd_tls does not abort: it sends a Certificate message with an empty
+   certificate_list and no CertificateVerify, and continues the
+   handshake (RFC 8446 Section 4.4.2).  The server then decides whether
+   to proceed or to abort with an alert.  Servers must always install a
+   signer. */
 
 typedef void
 (* fd_tls_sign_fn_t)( void *        ctx,
@@ -187,6 +160,7 @@ fd_tls_sign( fd_tls_sign_t const * sign,
 }
 
 extern char const fd_tls13_cli_sign_prefix[ 98 ];
+extern char const fd_tls13_srv_sign_prefix[ 98 ];
 
 /* Public API *********************************************************/
 
@@ -228,7 +202,8 @@ extern char const fd_tls13_cli_sign_prefix[ 98 ];
    across multiple TLS handshakes. */
 
 struct fd_tls {
-  fd_tls_rand_t       rand;
+  /* CSPRNG, caller-provided.  caller is responsible for reseeding. */
+  fd_chacha_rng_t *   rng;
   fd_tls_secrets_fn_t secrets_fn;
   fd_tls_sendmsg_fn_t sendmsg_fn;
 
@@ -236,6 +211,13 @@ struct fd_tls {
      TODO: Will optional function pointers stall the pipeline? */
   fd_tls_quic_tp_self_fn_t quic_tp_self_fn;
   fd_tls_quic_tp_peer_fn_t quic_tp_peer_fn;
+
+  /* Trust store for the server certificate chain (client mode).  If
+     non-NULL, the chain is verified against it and against server_name
+     (RFC 5280 path validation, RFC 6125 hostname matching) and the
+     handshake is aborted on failure.  If NULL, no chain validation is
+     done (QUIC peer-to-peer mode, or verification disabled). */
+  fd_x509_ca_store_t const * ca_store;
 
   /* key_{private,public}_key is an X25519 key pair.  During the TLS
      handshake, it is used to establish symmetric encryption keys.
@@ -276,6 +258,12 @@ struct fd_tls {
   uchar alpn[ 32 ];
   ulong alpn_sz;
 
+  /* Server Name Indication (SNI) for client mode (RFC 6066).
+     Set before starting a TLS client handshake.  Omitted when
+     server_name_len==0 (e.g. QUIC mode).  NUL terminated. */
+  char   server_name[ 254 ];
+  ushort server_name_len;
+
   /* Flags */
   ulong quic            :  1;
   ulong _flags_reserved : 63;
@@ -294,12 +282,12 @@ typedef struct fd_tls fd_tls_t;
 #define FD_TLS_REASON_ILLEGAL_STATE   ( 1)  /* illegal hs state */
 #define FD_TLS_REASON_SENDMSG_FAIL    ( 2)  /* sendmsg callback failed */
 #define FD_TLS_REASON_WRONG_ENC_LVL   ( 3)  /* wrong encryption level */
-#define FD_TLS_REASON_RAND_FAIL       ( 4)  /* rand fn failed */
 
 #define FD_TLS_REASON_X25519_FAIL     ( 9)  /* fd_x25519_exchange failed */
 #define FD_TLS_REASON_NO_X509         (10)  /* no X.509 cert installed */
 #define FD_TLS_REASON_WRONG_PUBKEY    (11)  /* peer cert has different pubkey than expected */
 #define FD_TLS_REASON_ED25519_FAIL    (12)  /* Ed25519 signature validation failed */
+#define FD_TLS_REASON_SECP256R1_FAIL  (14)  /* ECDSA P-256 signature validation failed */
 
 #define FD_TLS_REASON_CH_EXPECTED    (101)  /* wanted ClientHello, got another msg type */
 #define FD_TLS_REASON_CH_PARSE       (103)  /* failed to parse ClientHello */
@@ -314,6 +302,8 @@ typedef struct fd_tls fd_tls_t;
 #define FD_TLS_REASON_SH_EXPECTED    (201)  /* wanted ServerHello, got another msg type */
 #define FD_TLS_REASON_SH_PARSE       (203)  /* failed to parse ServerHello */
 #define FD_TLS_REASON_SH_ENCODE      (204)  /* failed to encode ServerHello */
+#define FD_TLS_REASON_SH_NEG_CIPHER  (205)  /* ServerHello selected unoffered cipher suite */
+#define FD_TLS_REASON_SH_SESSION_ID  (206)  /* ServerHello session_id echo mismatch */
 
 #define FD_TLS_REASON_EE_NO_QUIC     (301)  /* Missing QUIC transport params in EncryptedExtensions */
 #define FD_TLS_REASON_EE_EXPECTED    (302)  /* wanted EncryptedExtensions, got another msg type */
@@ -322,17 +312,19 @@ typedef struct fd_tls fd_tls_t;
 #define FD_TLS_REASON_QUIC_TP_OVERSZ (306)  /* Buffer overflow in QUIC transport params callback */
 
 #define FD_TLS_REASON_CV_EXPECTED    (401)  /* wanted CertificateVerify, got another msg type */
-#define FD_TLS_REASON_CV_SIGALG      (402)  /* CertificateVerify sig is not Ed25519 */
+#define FD_TLS_REASON_CV_SIGALG      (402)  /* CertificateVerify sig alg doesn't match cert key type */
 #define FD_TLS_REASON_CV_PARSE       (404)  /* failed to parse CertificateVerify */
 #define FD_TLS_REASON_CV_ENCODE      (405)  /* failed to encode CertificateVerify */
 
 #define FD_TLS_REASON_CERT_CR_EXPECTED (501)  /* wanted Certificate or CertificateRequest, got another msg type */
 #define FD_TLS_REASON_CERT_CR_PARSE    (503)  /* failed to parse Certificate or CertificateRequest */
 
+#define FD_TLS_REASON_CERT_KEY_TYPE  (601)  /* unsupported certificate key type */
 #define FD_TLS_REASON_CERT_EXPECTED  (602)  /* wanted Certificate, got another msg type */
 #define FD_TLS_REASON_CERT_PARSE     (604)  /* failed to parse Certificate */
 #define FD_TLS_REASON_X509_PARSE     (605)  /* X.509 DER parse failed */
 #define FD_TLS_REASON_CERT_ENCODE    (606)  /* failed to encode Certificate */
+#define FD_TLS_REASON_CERT_VERIFY    (607)  /* certificate chain failed verification against ca_store */
 
 #define FD_TLS_REASON_CERT_CHAIN_EMPTY    (701)  /* cert chain contains no certs */
 #define FD_TLS_REASON_CERT_CHAIN_PARSE    (702)  /* failed to parse cert chain */
@@ -344,6 +336,19 @@ typedef struct fd_tls fd_tls_t;
 #define FD_TLS_REASON_ALPN_PARSE     (1001)  /* failed to parse ALPN */
 #define FD_TLS_REASON_ALPN_NEG       (1002)  /* ALPN negotiation failed */
 #define FD_TLS_REASON_NO_ALPN        (1003)  /* no ALPN extension */
+
+#define FD_TLS_REASON_POST_HS_MSG      (1101)  /* unexpected post-handshake msg type */
+#define FD_TLS_REASON_KEY_UPDATE_PARSE (1102)  /* failed to parse KeyUpdate */
+#define FD_TLS_REASON_CCS              (1103)  /* unexpected ChangeCipherSpec record */
+#define FD_TLS_REASON_ALERT_PARSE      (1104)  /* malformed alert record */
+#define FD_TLS_REASON_PEER_ALERT       (1105)  /* peer sent a fatal alert */
+#define FD_TLS_REASON_HS_INTERLEAVED   (1106)  /* record interleaved with a fragmented handshake message */
+#define FD_TLS_REASON_REC_TYPE         (1108)  /* unexpected record layer content type */
+#define FD_TLS_REASON_REC_OVERFLOW     (1109)  /* record larger than the protocol allows */
+#define FD_TLS_REASON_HS_KEY_CHANGE    (1110)  /* handshake data follows a key change in the same record */
+#define FD_TLS_REASON_HS_MSG_SIZE      (1111)  /* handshake message length invalid */
+#define FD_TLS_REASON_REC_MAC          (1112)  /* record failed authentication */
+#define FD_TLS_REASON_REC_PADDING      (1113)  /* record has no content type byte */
 
 FD_PROTOTYPES_BEGIN
 

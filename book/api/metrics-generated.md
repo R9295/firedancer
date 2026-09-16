@@ -94,7 +94,6 @@
 | <span class="metrics-name">snapct_&#8203;incremental_&#8203;size_&#8203;bytes</span> | gauge | Total size of the incremental snapshot file. Might change if snapshot load is aborted and restarted |
 | <span class="metrics-name">snapct_&#8203;incremental_&#8203;retry</span> | gauge | Retries of the incremental snapshot download so far because the peer was too slow |
 | <span class="metrics-name">snapct_&#8203;predicted_&#8203;slot</span> | gauge | Predicted slot from which replay starts after snapshot loading finishes. Might change if snapshot load is aborted and restarted |
-| <span class="metrics-name">snapct_&#8203;ssl_&#8203;alloc_&#8203;failed</span> | counter | SSL allocation errors encountered |
 
 </div>
 
@@ -105,7 +104,6 @@
 | Metric | Type | Description |
 |--------|------|-------------|
 | <span class="metrics-name">snapld_&#8203;state</span> | gauge | 0=idle, 1=processing, 2=finishing, 3=error, 4=shutdown |
-| <span class="metrics-name">snapld_&#8203;ssl_&#8203;alloc_&#8203;failed</span> | counter | SSL allocation errors encountered |
 
 </div>
 
@@ -370,7 +368,6 @@
 | <span class="metrics-name">bundle_&#8203;conn_&#8203;error</span><br/>{bundle_&#8203;error="<span class="metrics-enum">transport</span>"} | counter | gRPC errors encountered (Transport error) |
 | <span class="metrics-name">bundle_&#8203;conn_&#8203;error</span><br/>{bundle_&#8203;error="<span class="metrics-enum">timeout</span>"} | counter | gRPC errors encountered (I/O timeout) |
 | <span class="metrics-name">bundle_&#8203;conn_&#8203;error</span><br/>{bundle_&#8203;error="<span class="metrics-enum">no_&#8203;fee_&#8203;info</span>"} | counter | gRPC errors encountered (Bundle dropped due to missing fee info) |
-| <span class="metrics-name">bundle_&#8203;conn_&#8203;error</span><br/>{bundle_&#8203;error="<span class="metrics-enum">ssl_&#8203;alloc</span>"} | counter | gRPC errors encountered (OpenSSL alloc fail) |
 | <span class="metrics-name">bundle_&#8203;heap_&#8203;size_&#8203;bytes</span> | gauge | Workspace heap size |
 | <span class="metrics-name">bundle_&#8203;heap_&#8203;free_&#8203;bytes</span> | gauge | Approximate free space in workspace |
 | <span class="metrics-name">bundle_&#8203;shredstream_&#8203;heartbeat_&#8203;sent</span> | counter | ShredStream heartbeats successfully sent |
@@ -582,6 +579,11 @@
 | <span class="metrics-name">execle_&#8203;txn_&#8203;landed</span><br/>{transaction_&#8203;landed="<span class="metrics-enum">landed_&#8203;fees_&#8203;only</span>"} | counter | Whether a transaction landed in the block or not (Transaction landed, but was fees only and did not execute) |
 | <span class="metrics-name">execle_&#8203;txn_&#8203;landed</span><br/>{transaction_&#8203;landed="<span class="metrics-enum">landed_&#8203;failed</span>"} | counter | Whether a transaction landed in the block or not (Transaction landed, but failed to execute) |
 | <span class="metrics-name">execle_&#8203;txn_&#8203;landed</span><br/>{transaction_&#8203;landed="<span class="metrics-enum">unlanded</span>"} | counter | Whether a transaction landed in the block or not (Transaction did not land) |
+| <span class="metrics-name">execle_&#8203;txn_&#8203;version</span><br/>{txn_&#8203;version="<span class="metrics-enum">legacy</span>"} | counter | Number of transactions executed, broken down by transaction version (Legacy transaction format) |
+| <span class="metrics-name">execle_&#8203;txn_&#8203;version</span><br/>{txn_&#8203;version="<span class="metrics-enum">v0</span>"} | counter | Number of transactions executed, broken down by transaction version (Version 0 transaction format) |
+| <span class="metrics-name">execle_&#8203;txn_&#8203;version</span><br/>{txn_&#8203;version="<span class="metrics-enum">v1</span>"} | counter | Number of transactions executed, broken down by transaction version (Version 1 transaction format) |
+| <span class="metrics-name">execle_&#8203;instruction_&#8203;executed</span> | counter | Number of top-level instructions executed |
+| <span class="metrics-name">execle_&#8203;cpi_&#8203;executed</span> | counter | Number of cross-program invocations executed |
 | <span class="metrics-name">execle_&#8203;cu_&#8203;executed</span> | counter | Estimated compute units executed since tile start |
 | <span class="metrics-name">execle_&#8203;txn_&#8203;regime_&#8203;duration_&#8203;nanos</span><br/>{txn_&#8203;regime="<span class="metrics-enum">setup</span>"} | counter | Mutually exclusive and exhaustive duration spent in transaction execution regimes, in nanoseconds (Transaction setup) |
 | <span class="metrics-name">execle_&#8203;txn_&#8203;regime_&#8203;duration_&#8203;nanos</span><br/>{txn_&#8203;regime="<span class="metrics-enum">exec</span>"} | counter | Mutually exclusive and exhaustive duration spent in transaction execution regimes, in nanoseconds (Transaction execution (includes VM setup/execution)) |
@@ -594,16 +596,41 @@
 | <span class="metrics-name">execle_&#8203;progcache_&#8203;lookup</span> | counter | Program cache lookups |
 | <span class="metrics-name">execle_&#8203;progcache_&#8203;hit</span> | counter | Program cache hits |
 | <span class="metrics-name">execle_&#8203;progcache_&#8203;miss</span> | counter | Program cache misses |
-| <span class="metrics-name">execle_&#8203;progcache_&#8203;oom_&#8203;heap</span> | counter | Program cache out-of-memory events (heap) |
-| <span class="metrics-name">execle_&#8203;progcache_&#8203;oom_&#8203;desc</span> | counter | Program cache out-of-memory events (descriptor table) |
+| <span class="metrics-name">execle_&#8203;progcache_&#8203;hit_&#8203;loading</span> | counter | Program cache lookups that waited on another tile's in-flight load of the same program |
+| <span class="metrics-name">execle_&#8203;progcache_&#8203;class_&#8203;full</span> | counter | Program cache insertions that found their size class full |
 | <span class="metrics-name">execle_&#8203;progcache_&#8203;fill</span> | counter | Program cache insertions |
 | <span class="metrics-name">execle_&#8203;progcache_&#8203;fill_&#8203;bytes</span> | counter | Bytes inserted into program cache |
 | <span class="metrics-name">execle_&#8203;progcache_&#8203;spill</span> | counter | Program cache spills (OOM fallback mechanism) |
 | <span class="metrics-name">execle_&#8203;progcache_&#8203;spill_&#8203;bytes</span> | counter | Bytes spilled from program cache (OOM fallback mechanism) |
-| <span class="metrics-name">execle_&#8203;progcache_&#8203;eviction</span> | counter | Program cache evictions |
+| <span class="metrics-name">execle_&#8203;progcache_&#8203;eviction</span> | counter | Program cache slots reclaimed by a fill's eviction sweep (housekeeping evictions are not counted) |
 | <span class="metrics-name">execle_&#8203;progcache_&#8203;eviction_&#8203;bytes</span> | counter | Bytes evicted from program cache |
 | <span class="metrics-name">execle_&#8203;progcache_&#8203;duration_&#8203;seconds</span> | counter | Time spent on program cache operations, in seconds |
+| <span class="metrics-name">execle_&#8203;progcache_&#8203;load</span> | counter | Program ELF load and verification attempts for insertion into the program cache (counts failed verifications and spill-backed loads) |
 | <span class="metrics-name">execle_&#8203;progcache_&#8203;load_&#8203;duration_&#8203;seconds</span> | counter | Time spent loading programs, in seconds |
+| <span class="metrics-name">execle_&#8203;progcache_&#8203;class_&#8203;hit</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class0</span>"} | counter | Program cache hits, broken down by size class (<=128 KiB) |
+| <span class="metrics-name">execle_&#8203;progcache_&#8203;class_&#8203;hit</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class1</span>"} | counter | Program cache hits, broken down by size class (128-512 KiB) |
+| <span class="metrics-name">execle_&#8203;progcache_&#8203;class_&#8203;hit</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class2</span>"} | counter | Program cache hits, broken down by size class (512 KiB-1 MiB) |
+| <span class="metrics-name">execle_&#8203;progcache_&#8203;class_&#8203;hit</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class3</span>"} | counter | Program cache hits, broken down by size class (1-2 MiB) |
+| <span class="metrics-name">execle_&#8203;progcache_&#8203;class_&#8203;hit</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class4</span>"} | counter | Program cache hits, broken down by size class (2-4 MiB) |
+| <span class="metrics-name">execle_&#8203;progcache_&#8203;class_&#8203;hit</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class5</span>"} | counter | Program cache hits, broken down by size class (4-11 MiB) |
+| <span class="metrics-name">execle_&#8203;progcache_&#8203;class_&#8203;fill</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class0</span>"} | counter | Program cache insertions, broken down by size class (<=128 KiB) |
+| <span class="metrics-name">execle_&#8203;progcache_&#8203;class_&#8203;fill</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class1</span>"} | counter | Program cache insertions, broken down by size class (128-512 KiB) |
+| <span class="metrics-name">execle_&#8203;progcache_&#8203;class_&#8203;fill</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class2</span>"} | counter | Program cache insertions, broken down by size class (512 KiB-1 MiB) |
+| <span class="metrics-name">execle_&#8203;progcache_&#8203;class_&#8203;fill</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class3</span>"} | counter | Program cache insertions, broken down by size class (1-2 MiB) |
+| <span class="metrics-name">execle_&#8203;progcache_&#8203;class_&#8203;fill</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class4</span>"} | counter | Program cache insertions, broken down by size class (2-4 MiB) |
+| <span class="metrics-name">execle_&#8203;progcache_&#8203;class_&#8203;fill</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class5</span>"} | counter | Program cache insertions, broken down by size class (4-11 MiB) |
+| <span class="metrics-name">execle_&#8203;progcache_&#8203;class_&#8203;eviction</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class0</span>"} | counter | Program cache evictions, broken down by size class (<=128 KiB) |
+| <span class="metrics-name">execle_&#8203;progcache_&#8203;class_&#8203;eviction</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class1</span>"} | counter | Program cache evictions, broken down by size class (128-512 KiB) |
+| <span class="metrics-name">execle_&#8203;progcache_&#8203;class_&#8203;eviction</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class2</span>"} | counter | Program cache evictions, broken down by size class (512 KiB-1 MiB) |
+| <span class="metrics-name">execle_&#8203;progcache_&#8203;class_&#8203;eviction</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class3</span>"} | counter | Program cache evictions, broken down by size class (1-2 MiB) |
+| <span class="metrics-name">execle_&#8203;progcache_&#8203;class_&#8203;eviction</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class4</span>"} | counter | Program cache evictions, broken down by size class (2-4 MiB) |
+| <span class="metrics-name">execle_&#8203;progcache_&#8203;class_&#8203;eviction</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class5</span>"} | counter | Program cache evictions, broken down by size class (4-11 MiB) |
+| <span class="metrics-name">execle_&#8203;progcache_&#8203;class_&#8203;spill</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class0</span>"} | counter | Program cache spills, broken down by size class (<=128 KiB) |
+| <span class="metrics-name">execle_&#8203;progcache_&#8203;class_&#8203;spill</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class1</span>"} | counter | Program cache spills, broken down by size class (128-512 KiB) |
+| <span class="metrics-name">execle_&#8203;progcache_&#8203;class_&#8203;spill</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class2</span>"} | counter | Program cache spills, broken down by size class (512 KiB-1 MiB) |
+| <span class="metrics-name">execle_&#8203;progcache_&#8203;class_&#8203;spill</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class3</span>"} | counter | Program cache spills, broken down by size class (1-2 MiB) |
+| <span class="metrics-name">execle_&#8203;progcache_&#8203;class_&#8203;spill</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class4</span>"} | counter | Program cache spills, broken down by size class (2-4 MiB) |
+| <span class="metrics-name">execle_&#8203;progcache_&#8203;class_&#8203;spill</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class5</span>"} | counter | Program cache spills, broken down by size class (4-11 MiB) |
 | <span class="metrics-name">execle_&#8203;accdb_&#8203;account_&#8203;acquired</span><br/>{accdb_&#8203;cache_&#8203;class="<span class="metrics-enum">class0</span>"} | counter | Number of accounts acquired from the account database, attributed to the cache size class of the account's current data size (0-128 B) |
 | <span class="metrics-name">execle_&#8203;accdb_&#8203;account_&#8203;acquired</span><br/>{accdb_&#8203;cache_&#8203;class="<span class="metrics-enum">class1</span>"} | counter | Number of accounts acquired from the account database, attributed to the cache size class of the account's current data size (129-512 B) |
 | <span class="metrics-name">execle_&#8203;accdb_&#8203;account_&#8203;acquired</span><br/>{accdb_&#8203;cache_&#8203;class="<span class="metrics-enum">class2</span>"} | counter | Number of accounts acquired from the account database, attributed to the cache size class of the account's current data size (513 B-2 KiB) |
@@ -695,7 +722,7 @@
 | <span class="metrics-name">shred_&#8203;microblock_&#8203;per_&#8203;batch</span> | histogram | Microblocks in each microblock batch that is shredded |
 | <span class="metrics-name">shred_&#8203;shredding_&#8203;duration_&#8203;seconds</span> | histogram | Duration of producing one FEC set from the shredder |
 | <span class="metrics-name">shred_&#8203;add_&#8203;shred_&#8203;duration_&#8203;seconds</span> | histogram | Duration of verifying and processing one shred received from the network |
-| <span class="metrics-name">shred_&#8203;disk_&#8203;write_&#8203;seconds</span> | histogram | Duration of persisting one accepted data shred |
+| <span class="metrics-name">shred_&#8203;fec_&#8203;fallback_&#8203;write_&#8203;seconds</span> | histogram | Duration of spilling one FEC payload from the shred tile |
 | <span class="metrics-name">shred_&#8203;shred_&#8203;processed</span><br/>{shred_&#8203;processing_&#8203;result="<span class="metrics-enum">bad_&#8203;slot</span>"} | counter | Result of processing a shred from the network (Shred was for a slot for which we don't know the leader) |
 | <span class="metrics-name">shred_&#8203;shred_&#8203;processed</span><br/>{shred_&#8203;processing_&#8203;result="<span class="metrics-enum">parse_&#8203;failed</span>"} | counter | Result of processing a shred from the network (Shred parsing failed) |
 | <span class="metrics-name">shred_&#8203;shred_&#8203;processed</span><br/>{shred_&#8203;processing_&#8203;result="<span class="metrics-enum">equivocated</span>"} | counter | Result of processing a shred from the network (Shred was equivocated with another shred) |
@@ -713,9 +740,8 @@
 | <span class="metrics-name">shred_&#8203;shred_&#8203;repair_&#8203;rx_&#8203;bytes</span> | counter | Bytes received from network packets with repair shreds, including network headers |
 | <span class="metrics-name">shred_&#8203;shred_&#8203;turbine_&#8203;rx</span> | counter | Turbine shreds received |
 | <span class="metrics-name">shred_&#8203;shred_&#8203;turbine_&#8203;rx_&#8203;bytes</span> | counter | Bytes received from network packets with turbine shreds, including network headers |
-| <span class="metrics-name">shred_&#8203;disk_&#8203;shred_&#8203;inserted</span> | counter | Data shreds persisted to the repair store |
-| <span class="metrics-name">shred_&#8203;disk_&#8203;write_&#8203;failed</span> | counter | Data shreds rejected by the repair store API |
-| <span class="metrics-name">shred_&#8203;disk_&#8203;write_&#8203;bytes</span> | counter | Bytes written by data shreds successfully indexed in the repair store |
+| <span class="metrics-name">shred_&#8203;fec_&#8203;fallback_&#8203;write</span> | counter | FEC payloads synchronously spilled by the shred tile |
+| <span class="metrics-name">shred_&#8203;fec_&#8203;fallback_&#8203;write_&#8203;bytes</span> | counter | FEC payload bytes synchronously spilled by the shred tile |
 
 </div>
 
@@ -1010,7 +1036,18 @@
 | <span class="metrics-name">rserve_&#8203;shreds_&#8203;current</span> | gauge | The number of shreds currently in the shreds database |
 | <span class="metrics-name">rserve_&#8203;shreds_&#8203;max</span> | gauge | Total capacity of shreds that can be stored in the shreds database |
 | <span class="metrics-name">rserve_&#8203;disk_&#8203;current_&#8203;bytes</span> | gauge | Logical bytes occupied by live wire shreds and spilled FEC payloads |
-| <span class="metrics-name">rserve_&#8203;disk_&#8203;allocated_&#8203;bytes</span> | gauge | Physical bytes reserved for the wire ring and allocated spill pages |
+| <span class="metrics-name">rserve_&#8203;disk_&#8203;allocated_&#8203;bytes</span> | gauge | Logical wire-ring high-water plus allocated spill pages |
+| <span class="metrics-name">rserve_&#8203;disk_&#8203;write_&#8203;seconds</span> | histogram | Duration of persisting one accepted data shred |
+| <span class="metrics-name">rserve_&#8203;disk_&#8203;shred_&#8203;inserted</span> | counter | Data shreds persisted to the repair store |
+| <span class="metrics-name">rserve_&#8203;disk_&#8203;write_&#8203;failed</span> | counter | Data shreds rejected by the repair store API |
+| <span class="metrics-name">rserve_&#8203;disk_&#8203;write_&#8203;bytes</span> | counter | Bytes written by persisted data shreds |
+| <span class="metrics-name">rserve_&#8203;fec_&#8203;preevict_&#8203;write_&#8203;seconds</span> | histogram | Duration of pre-evicting one FEC payload |
+| <span class="metrics-name">rserve_&#8203;fec_&#8203;preevict_&#8203;write</span> | counter | FEC payloads pre-evicted by rserve |
+| <span class="metrics-name">rserve_&#8203;fec_&#8203;preevict_&#8203;write_&#8203;bytes</span> | counter | FEC payload bytes pre-evicted by rserve |
+| <span class="metrics-name">rserve_&#8203;fec_&#8203;cache_&#8203;free</span> | gauge | Immediately available FEC payload cache entries |
+| <span class="metrics-name">rserve_&#8203;fec_&#8203;cache_&#8203;max</span> | gauge | Total FEC payload cache entries |
+| <span class="metrics-name">rserve_&#8203;fec_&#8203;cache_&#8203;target</span> | gauge | Background preeviction target in free entries |
+| <span class="metrics-name">rserve_&#8203;fec_&#8203;cache_&#8203;low_&#8203;water</span> | gauge | Free entries that trigger background preeviction |
 | <span class="metrics-name">rserve_&#8203;ping_&#8203;cache_&#8203;entries</span> | counter | How many active entries do we have in the ping cache |
 | <span class="metrics-name">rserve_&#8203;ping_&#8203;cache_&#8203;evictions</span> | counter | How many entries we've evicted from the ping cache |
 
@@ -1107,14 +1144,18 @@
 | <span class="metrics-name">replay_&#8203;fec_&#8203;bank_&#8203;full</span> | counter | Times banks are full and a FEC set can't be processed |
 | <span class="metrics-name">replay_&#8203;storage_&#8203;root_&#8203;behind</span> | counter | Times the storage root is behind the consensus root and can't be advanced |
 | <span class="metrics-name">replay_&#8203;progcache_&#8203;rooted</span> | counter | Program cache entries rooted |
-| <span class="metrics-name">replay_&#8203;progcache_&#8203;gc_&#8203;root</span> | counter | Number of program cache entries garbage collected while rooting |
-| <span class="metrics-name">replay_&#8203;progcache_&#8203;free_&#8203;partition</span> | gauge | Free program cache heap partitions (indicates fragmentation) |
-| <span class="metrics-name">replay_&#8203;progcache_&#8203;free_&#8203;bytes</span> | gauge | Free bytes in the program cache heap |
-| <span class="metrics-name">replay_&#8203;progcache_&#8203;size_&#8203;bytes</span> | gauge | Total size of the program cache heap |
-| <span class="metrics-name">replay_&#8203;progcache_&#8203;free_&#8203;partition_&#8203;max_&#8203;bytes</span> | gauge | Largest free heap partition in program cache |
-| <span class="metrics-name">replay_&#8203;progcache_&#8203;used_&#8203;partition_&#8203;median_&#8203;bytes</span> | gauge | Median used heap partition size in program cache |
-| <span class="metrics-name">replay_&#8203;progcache_&#8203;used_&#8203;partition_&#8203;mean_&#8203;bytes</span> | gauge | Mean used heap partition size in program cache |
-| <span class="metrics-name">replay_&#8203;progcache_&#8203;duration_&#8203;seconds</span> | counter | Time spent doing program cache tasks, in seconds |
+| <span class="metrics-name">replay_&#8203;progcache_&#8203;class_&#8203;used</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class0</span>"} | gauge | Occupied program cache value slots, broken down by size class (<=128 KiB) |
+| <span class="metrics-name">replay_&#8203;progcache_&#8203;class_&#8203;used</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class1</span>"} | gauge | Occupied program cache value slots, broken down by size class (128-512 KiB) |
+| <span class="metrics-name">replay_&#8203;progcache_&#8203;class_&#8203;used</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class2</span>"} | gauge | Occupied program cache value slots, broken down by size class (512 KiB-1 MiB) |
+| <span class="metrics-name">replay_&#8203;progcache_&#8203;class_&#8203;used</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class3</span>"} | gauge | Occupied program cache value slots, broken down by size class (1-2 MiB) |
+| <span class="metrics-name">replay_&#8203;progcache_&#8203;class_&#8203;used</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class4</span>"} | gauge | Occupied program cache value slots, broken down by size class (2-4 MiB) |
+| <span class="metrics-name">replay_&#8203;progcache_&#8203;class_&#8203;used</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class5</span>"} | gauge | Occupied program cache value slots, broken down by size class (4-11 MiB) |
+| <span class="metrics-name">replay_&#8203;progcache_&#8203;class_&#8203;max</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class0</span>"} | gauge | Total program cache value slot capacity, broken down by size class (<=128 KiB) |
+| <span class="metrics-name">replay_&#8203;progcache_&#8203;class_&#8203;max</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class1</span>"} | gauge | Total program cache value slot capacity, broken down by size class (128-512 KiB) |
+| <span class="metrics-name">replay_&#8203;progcache_&#8203;class_&#8203;max</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class2</span>"} | gauge | Total program cache value slot capacity, broken down by size class (512 KiB-1 MiB) |
+| <span class="metrics-name">replay_&#8203;progcache_&#8203;class_&#8203;max</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class3</span>"} | gauge | Total program cache value slot capacity, broken down by size class (1-2 MiB) |
+| <span class="metrics-name">replay_&#8203;progcache_&#8203;class_&#8203;max</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class4</span>"} | gauge | Total program cache value slot capacity, broken down by size class (2-4 MiB) |
+| <span class="metrics-name">replay_&#8203;progcache_&#8203;class_&#8203;max</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class5</span>"} | gauge | Total program cache value slot capacity, broken down by size class (4-11 MiB) |
 | <span class="metrics-name">replay_&#8203;accdb_&#8203;account_&#8203;acquired</span><br/>{accdb_&#8203;cache_&#8203;class="<span class="metrics-enum">class0</span>"} | counter | Number of accounts acquired from the account database, attributed to the cache size class of the account's current data size (0-128 B) |
 | <span class="metrics-name">replay_&#8203;accdb_&#8203;account_&#8203;acquired</span><br/>{accdb_&#8203;cache_&#8203;class="<span class="metrics-enum">class1</span>"} | counter | Number of accounts acquired from the account database, attributed to the cache size class of the account's current data size (129-512 B) |
 | <span class="metrics-name">replay_&#8203;accdb_&#8203;account_&#8203;acquired</span><br/>{accdb_&#8203;cache_&#8203;class="<span class="metrics-enum">class2</span>"} | counter | Number of accounts acquired from the account database, attributed to the cache size class of the account's current data size (513 B-2 KiB) |
@@ -1213,8 +1254,13 @@
 | <span class="metrics-name">execrp_&#8203;txn_&#8203;result</span><br/>{transaction_&#8203;result="<span class="metrics-enum">insufficient_&#8203;funds_&#8203;for_&#8203;rent</span>"} | counter | Result of loading and executing a transaction (The transaction would leave an account with a lower balance than the rent-exempt minimum) |
 | <span class="metrics-name">execrp_&#8203;txn_&#8203;result</span><br/>{transaction_&#8203;result="<span class="metrics-enum">unbalanced_&#8203;transaction</span>"} | counter | Result of loading and executing a transaction (The total referenced account lamports before and after the transaction was unbalanced) |
 | <span class="metrics-name">execrp_&#8203;txn_&#8203;result</span><br/>{transaction_&#8203;result="<span class="metrics-enum">bundle_&#8203;peer</span>"} | counter | Result of loading and executing a transaction (The transaction was part of a bundle and an earlier transaction in the bundle failed) |
+| <span class="metrics-name">execrp_&#8203;txn_&#8203;version</span><br/>{txn_&#8203;version="<span class="metrics-enum">legacy</span>"} | counter | Number of transactions executed, broken down by transaction version (Legacy transaction format) |
+| <span class="metrics-name">execrp_&#8203;txn_&#8203;version</span><br/>{txn_&#8203;version="<span class="metrics-enum">v0</span>"} | counter | Number of transactions executed, broken down by transaction version (Version 0 transaction format) |
+| <span class="metrics-name">execrp_&#8203;txn_&#8203;version</span><br/>{txn_&#8203;version="<span class="metrics-enum">v1</span>"} | counter | Number of transactions executed, broken down by transaction version (Version 1 transaction format) |
 | <span class="metrics-name">execrp_&#8203;signature_&#8203;verified</span> | counter | Ed25519 signature verification jobs executed |
 | <span class="metrics-name">execrp_&#8203;poh_&#8203;hashed</span> | counter | PoH SHA-256 calls executed |
+| <span class="metrics-name">execrp_&#8203;instruction_&#8203;executed</span> | counter | Number of top-level instructions executed |
+| <span class="metrics-name">execrp_&#8203;cpi_&#8203;executed</span> | counter | Number of cross-program invocations executed |
 | <span class="metrics-name">execrp_&#8203;txn_&#8203;regime_&#8203;duration_&#8203;nanos</span><br/>{txn_&#8203;regime="<span class="metrics-enum">setup</span>"} | counter | Mutually exclusive and exhaustive duration spent in transaction execution regimes, in nanoseconds (Transaction setup) |
 | <span class="metrics-name">execrp_&#8203;txn_&#8203;regime_&#8203;duration_&#8203;nanos</span><br/>{txn_&#8203;regime="<span class="metrics-enum">exec</span>"} | counter | Mutually exclusive and exhaustive duration spent in transaction execution regimes, in nanoseconds (Transaction execution (includes VM setup/execution)) |
 | <span class="metrics-name">execrp_&#8203;txn_&#8203;regime_&#8203;duration_&#8203;nanos</span><br/>{txn_&#8203;regime="<span class="metrics-enum">commit</span>"} | counter | Mutually exclusive and exhaustive duration spent in transaction execution regimes, in nanoseconds (Transaction result commit) |
@@ -1227,16 +1273,41 @@
 | <span class="metrics-name">execrp_&#8203;progcache_&#8203;lookup</span> | counter | Program cache lookups |
 | <span class="metrics-name">execrp_&#8203;progcache_&#8203;hit</span> | counter | Program cache hits |
 | <span class="metrics-name">execrp_&#8203;progcache_&#8203;miss</span> | counter | Program cache misses |
-| <span class="metrics-name">execrp_&#8203;progcache_&#8203;oom_&#8203;heap</span> | counter | Program cache out-of-memory events (heap) |
-| <span class="metrics-name">execrp_&#8203;progcache_&#8203;oom_&#8203;desc</span> | counter | Program cache out-of-memory events (descriptor table) |
+| <span class="metrics-name">execrp_&#8203;progcache_&#8203;hit_&#8203;loading</span> | counter | Program cache lookups that waited on another tile's in-flight load of the same program |
+| <span class="metrics-name">execrp_&#8203;progcache_&#8203;class_&#8203;full</span> | counter | Program cache insertions that found their size class full |
 | <span class="metrics-name">execrp_&#8203;progcache_&#8203;fill</span> | counter | Program cache insertions |
 | <span class="metrics-name">execrp_&#8203;progcache_&#8203;fill_&#8203;bytes</span> | counter | Bytes inserted into program cache |
 | <span class="metrics-name">execrp_&#8203;progcache_&#8203;spill</span> | counter | Program cache spills (OOM fallback mechanism) |
 | <span class="metrics-name">execrp_&#8203;progcache_&#8203;spill_&#8203;bytes</span> | counter | Bytes spilled from program cache (OOM fallback mechanism) |
-| <span class="metrics-name">execrp_&#8203;progcache_&#8203;eviction</span> | counter | Program cache evictions |
+| <span class="metrics-name">execrp_&#8203;progcache_&#8203;eviction</span> | counter | Program cache slots reclaimed by a fill's eviction sweep (housekeeping evictions are not counted) |
 | <span class="metrics-name">execrp_&#8203;progcache_&#8203;eviction_&#8203;bytes</span> | counter | Bytes evicted from program cache |
 | <span class="metrics-name">execrp_&#8203;progcache_&#8203;duration_&#8203;seconds</span> | counter | Time spent on program cache operations, in seconds |
+| <span class="metrics-name">execrp_&#8203;progcache_&#8203;load</span> | counter | Program ELF load and verification attempts for insertion into the program cache (counts failed verifications and spill-backed loads) |
 | <span class="metrics-name">execrp_&#8203;progcache_&#8203;load_&#8203;duration_&#8203;seconds</span> | counter | Time spent loading programs, in seconds |
+| <span class="metrics-name">execrp_&#8203;progcache_&#8203;class_&#8203;hit</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class0</span>"} | counter | Program cache hits, broken down by size class (<=128 KiB) |
+| <span class="metrics-name">execrp_&#8203;progcache_&#8203;class_&#8203;hit</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class1</span>"} | counter | Program cache hits, broken down by size class (128-512 KiB) |
+| <span class="metrics-name">execrp_&#8203;progcache_&#8203;class_&#8203;hit</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class2</span>"} | counter | Program cache hits, broken down by size class (512 KiB-1 MiB) |
+| <span class="metrics-name">execrp_&#8203;progcache_&#8203;class_&#8203;hit</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class3</span>"} | counter | Program cache hits, broken down by size class (1-2 MiB) |
+| <span class="metrics-name">execrp_&#8203;progcache_&#8203;class_&#8203;hit</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class4</span>"} | counter | Program cache hits, broken down by size class (2-4 MiB) |
+| <span class="metrics-name">execrp_&#8203;progcache_&#8203;class_&#8203;hit</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class5</span>"} | counter | Program cache hits, broken down by size class (4-11 MiB) |
+| <span class="metrics-name">execrp_&#8203;progcache_&#8203;class_&#8203;fill</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class0</span>"} | counter | Program cache insertions, broken down by size class (<=128 KiB) |
+| <span class="metrics-name">execrp_&#8203;progcache_&#8203;class_&#8203;fill</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class1</span>"} | counter | Program cache insertions, broken down by size class (128-512 KiB) |
+| <span class="metrics-name">execrp_&#8203;progcache_&#8203;class_&#8203;fill</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class2</span>"} | counter | Program cache insertions, broken down by size class (512 KiB-1 MiB) |
+| <span class="metrics-name">execrp_&#8203;progcache_&#8203;class_&#8203;fill</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class3</span>"} | counter | Program cache insertions, broken down by size class (1-2 MiB) |
+| <span class="metrics-name">execrp_&#8203;progcache_&#8203;class_&#8203;fill</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class4</span>"} | counter | Program cache insertions, broken down by size class (2-4 MiB) |
+| <span class="metrics-name">execrp_&#8203;progcache_&#8203;class_&#8203;fill</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class5</span>"} | counter | Program cache insertions, broken down by size class (4-11 MiB) |
+| <span class="metrics-name">execrp_&#8203;progcache_&#8203;class_&#8203;eviction</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class0</span>"} | counter | Program cache evictions, broken down by size class (<=128 KiB) |
+| <span class="metrics-name">execrp_&#8203;progcache_&#8203;class_&#8203;eviction</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class1</span>"} | counter | Program cache evictions, broken down by size class (128-512 KiB) |
+| <span class="metrics-name">execrp_&#8203;progcache_&#8203;class_&#8203;eviction</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class2</span>"} | counter | Program cache evictions, broken down by size class (512 KiB-1 MiB) |
+| <span class="metrics-name">execrp_&#8203;progcache_&#8203;class_&#8203;eviction</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class3</span>"} | counter | Program cache evictions, broken down by size class (1-2 MiB) |
+| <span class="metrics-name">execrp_&#8203;progcache_&#8203;class_&#8203;eviction</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class4</span>"} | counter | Program cache evictions, broken down by size class (2-4 MiB) |
+| <span class="metrics-name">execrp_&#8203;progcache_&#8203;class_&#8203;eviction</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class5</span>"} | counter | Program cache evictions, broken down by size class (4-11 MiB) |
+| <span class="metrics-name">execrp_&#8203;progcache_&#8203;class_&#8203;spill</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class0</span>"} | counter | Program cache spills, broken down by size class (<=128 KiB) |
+| <span class="metrics-name">execrp_&#8203;progcache_&#8203;class_&#8203;spill</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class1</span>"} | counter | Program cache spills, broken down by size class (128-512 KiB) |
+| <span class="metrics-name">execrp_&#8203;progcache_&#8203;class_&#8203;spill</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class2</span>"} | counter | Program cache spills, broken down by size class (512 KiB-1 MiB) |
+| <span class="metrics-name">execrp_&#8203;progcache_&#8203;class_&#8203;spill</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class3</span>"} | counter | Program cache spills, broken down by size class (1-2 MiB) |
+| <span class="metrics-name">execrp_&#8203;progcache_&#8203;class_&#8203;spill</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class4</span>"} | counter | Program cache spills, broken down by size class (2-4 MiB) |
+| <span class="metrics-name">execrp_&#8203;progcache_&#8203;class_&#8203;spill</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class5</span>"} | counter | Program cache spills, broken down by size class (4-11 MiB) |
 | <span class="metrics-name">execrp_&#8203;accdb_&#8203;account_&#8203;acquired</span><br/>{accdb_&#8203;cache_&#8203;class="<span class="metrics-enum">class0</span>"} | counter | Number of accounts acquired from the account database, attributed to the cache size class of the account's current data size (0-128 B) |
 | <span class="metrics-name">execrp_&#8203;accdb_&#8203;account_&#8203;acquired</span><br/>{accdb_&#8203;cache_&#8203;class="<span class="metrics-enum">class1</span>"} | counter | Number of accounts acquired from the account database, attributed to the cache size class of the account's current data size (129-512 B) |
 | <span class="metrics-name">execrp_&#8203;accdb_&#8203;account_&#8203;acquired</span><br/>{accdb_&#8203;cache_&#8203;class="<span class="metrics-enum">class2</span>"} | counter | Number of accounts acquired from the account database, attributed to the cache size class of the account's current data size (513 B-2 KiB) |
@@ -1365,6 +1436,14 @@
 | <span class="metrics-name">accdb_&#8203;cache_&#8203;class_&#8203;low_&#8203;water_&#8203;used</span><br/>{accdb_&#8203;cache_&#8203;class="<span class="metrics-enum">class5</span>"} | gauge | Used-slot count at which the background preevict pass kicks in (max - cache_free_low_water). When used exceeds this, preevicts start. (32-128 KiB) |
 | <span class="metrics-name">accdb_&#8203;cache_&#8203;class_&#8203;low_&#8203;water_&#8203;used</span><br/>{accdb_&#8203;cache_&#8203;class="<span class="metrics-enum">class6</span>"} | gauge | Used-slot count at which the background preevict pass kicks in (max - cache_free_low_water). When used exceeds this, preevicts start. (128 KiB-1 MiB) |
 | <span class="metrics-name">accdb_&#8203;cache_&#8203;class_&#8203;low_&#8203;water_&#8203;used</span><br/>{accdb_&#8203;cache_&#8203;class="<span class="metrics-enum">class7</span>"} | gauge | Used-slot count at which the background preevict pass kicks in (max - cache_free_low_water). When used exceeds this, preevicts start. (1-10 MiB) |
+| <span class="metrics-name">accdb_&#8203;progcache_&#8203;eviction</span> | counter | Program cache slots reclaimed by the background preevict pass |
+| <span class="metrics-name">accdb_&#8203;progcache_&#8203;eviction_&#8203;bytes</span> | counter | Bytes evicted from program cache by the background preevict pass |
+| <span class="metrics-name">accdb_&#8203;progcache_&#8203;class_&#8203;eviction</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class0</span>"} | counter | Program cache slots reclaimed by the background preevict pass, broken down by size class (<=128 KiB) |
+| <span class="metrics-name">accdb_&#8203;progcache_&#8203;class_&#8203;eviction</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class1</span>"} | counter | Program cache slots reclaimed by the background preevict pass, broken down by size class (128-512 KiB) |
+| <span class="metrics-name">accdb_&#8203;progcache_&#8203;class_&#8203;eviction</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class2</span>"} | counter | Program cache slots reclaimed by the background preevict pass, broken down by size class (512 KiB-1 MiB) |
+| <span class="metrics-name">accdb_&#8203;progcache_&#8203;class_&#8203;eviction</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class3</span>"} | counter | Program cache slots reclaimed by the background preevict pass, broken down by size class (1-2 MiB) |
+| <span class="metrics-name">accdb_&#8203;progcache_&#8203;class_&#8203;eviction</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class4</span>"} | counter | Program cache slots reclaimed by the background preevict pass, broken down by size class (2-4 MiB) |
+| <span class="metrics-name">accdb_&#8203;progcache_&#8203;class_&#8203;eviction</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class5</span>"} | counter | Program cache slots reclaimed by the background preevict pass, broken down by size class (4-11 MiB) |
 
 </div>
 
@@ -2128,6 +2207,7 @@
 | Metric | Type | Description |
 |--------|------|-------------|
 | <span class="metrics-name">benchs_&#8203;txn_&#8203;tx</span> | counter | Benchmark transactions sent |
+| <span class="metrics-name">benchs_&#8203;txn_&#8203;dropped</span> | counter | Benchmark transactions dropped because the QUIC connection had no stream available |
 
 </div>
 
@@ -2175,5 +2255,41 @@
 | <span class="metrics-name">rotor_&#8203;fec_&#8203;root_&#8203;failed</span> | counter | Times we failed to verify a FEC root response |
 | <span class="metrics-name">rotor_&#8203;parent_&#8203;fec_&#8203;count_&#8203;failed</span> | counter | Times we failed to verify a parent FEC count response |
 | <span class="metrics-name">rotor_&#8203;response_&#8203;latency_&#8203;nanos</span> | histogram | Time it took to receive a repair request response, in nanoseconds |
+
+</div>
+
+## Votor Tile
+
+<div class="metrics">
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| <span class="metrics-name">votor_&#8203;datagram_&#8203;rx</span><br/>{datagram_&#8203;rx_&#8203;result="<span class="metrics-enum">vote</span>"} | counter | Result of dispatching an inbound datagram (per datagram) (Datagram carried a vote and was handed to vote rx) |
+| <span class="metrics-name">votor_&#8203;datagram_&#8203;rx</span><br/>{datagram_&#8203;rx_&#8203;result="<span class="metrics-enum">cert</span>"} | counter | Result of dispatching an inbound datagram (per datagram) (Datagram carried a cert and was handed to cert rx) |
+| <span class="metrics-name">votor_&#8203;datagram_&#8203;rx</span><br/>{datagram_&#8203;rx_&#8203;result="<span class="metrics-enum">not_&#8203;ready</span>"} | counter | Result of dispatching an inbound datagram (per datagram) (Datagram arrived before the votor tile was initialized) |
+| <span class="metrics-name">votor_&#8203;datagram_&#8203;rx</span><br/>{datagram_&#8203;rx_&#8203;result="<span class="metrics-enum">too_&#8203;small</span>"} | counter | Result of dispatching an inbound datagram (per datagram) (Datagram was too small to hold a version and a tag) |
+| <span class="metrics-name">votor_&#8203;datagram_&#8203;rx</span><br/>{datagram_&#8203;rx_&#8203;result="<span class="metrics-enum">unknown_&#8203;tag</span>"} | counter | Result of dispatching an inbound datagram (per datagram) (Datagram tag was neither a vote nor a cert) |
+| <span class="metrics-name">votor_&#8203;vote_&#8203;rx</span><br/>{vote_&#8203;rx_&#8203;result="<span class="metrics-enum">success</span>"} | counter | Result of processing an inbound vote (per vote) (Vote was handed to the pool and accepted) |
+| <span class="metrics-name">votor_&#8203;vote_&#8203;rx</span><br/>{vote_&#8203;rx_&#8203;result="<span class="metrics-enum">bad_&#8203;size</span>"} | counter | Result of processing an inbound vote (per vote) (Vote was truncated or had trailing bytes) |
+| <span class="metrics-name">votor_&#8203;vote_&#8203;rx</span><br/>{vote_&#8203;rx_&#8203;result="<span class="metrics-enum">bad_&#8203;encoding</span>"} | counter | Result of processing an inbound vote (per vote) (Vote had an invalid version, tag, or signature encoding) |
+| <span class="metrics-name">votor_&#8203;vote_&#8203;rx</span><br/>{vote_&#8203;rx_&#8203;result="<span class="metrics-enum">shred_&#8203;version</span>"} | counter | Result of processing an inbound vote (per vote) (Vote was for a different shred version) |
+| <span class="metrics-name">votor_&#8203;vote_&#8203;rx</span><br/>{vote_&#8203;rx_&#8203;result="<span class="metrics-enum">unknown_&#8203;signer</span>"} | counter | Result of processing an inbound vote (per vote) (Sending connection had no authenticated identity) |
+| <span class="metrics-name">votor_&#8203;vote_&#8203;rx</span><br/>{vote_&#8203;rx_&#8203;result="<span class="metrics-enum">not_&#8203;a_&#8203;peer</span>"} | counter | Result of processing an inbound vote (per vote) (Sender was not in the peer set) |
+| <span class="metrics-name">votor_&#8203;vote_&#8203;rx</span><br/>{vote_&#8203;rx_&#8203;result="<span class="metrics-enum">not_&#8203;ranked</span>"} | counter | Result of processing an inbound vote (per vote) (Sender was not a ranked validator in the vote slot's epoch) |
+| <span class="metrics-name">votor_&#8203;vote_&#8203;rx</span><br/>{vote_&#8203;rx_&#8203;result="<span class="metrics-enum">slot_&#8203;out_&#8203;of_&#8203;bounds</span>"} | counter | Result of processing an inbound vote (per vote) (Vote slot was either too old or too far in the future) |
+| <span class="metrics-name">votor_&#8203;vote_&#8203;rx</span><br/>{vote_&#8203;rx_&#8203;result="<span class="metrics-enum">duplicate</span>"} | counter | Result of processing an inbound vote (per vote) (Voter had already cast this vote) |
+| <span class="metrics-name">votor_&#8203;vote_&#8203;rx</span><br/>{vote_&#8203;rx_&#8203;result="<span class="metrics-enum">slashable</span>"} | counter | Result of processing an inbound vote (per vote) (Vote constitutes a slashable offence) |
+| <span class="metrics-name">votor_&#8203;vote_&#8203;rx</span><br/>{vote_&#8203;rx_&#8203;result="<span class="metrics-enum">banned</span>"} | counter | Result of processing an inbound vote (per vote) (Sender is banned for a failed signature verification) |
+| <span class="metrics-name">votor_&#8203;cert_&#8203;rx</span><br/>{cert_&#8203;rx_&#8203;result="<span class="metrics-enum">success</span>"} | counter | Result of processing an inbound cert (per cert) (Cert was handed to the pool and accepted) |
+| <span class="metrics-name">votor_&#8203;cert_&#8203;rx</span><br/>{cert_&#8203;rx_&#8203;result="<span class="metrics-enum">bad_&#8203;size</span>"} | counter | Result of processing an inbound cert (per cert) (Cert was truncated or had trailing bytes) |
+| <span class="metrics-name">votor_&#8203;cert_&#8203;rx</span><br/>{cert_&#8203;rx_&#8203;result="<span class="metrics-enum">bad_&#8203;encoding</span>"} | counter | Result of processing an inbound cert (per cert) (Cert had an invalid version, tag, bitmap, or signature encoding) |
+| <span class="metrics-name">votor_&#8203;cert_&#8203;rx</span><br/>{cert_&#8203;rx_&#8203;result="<span class="metrics-enum">shred_&#8203;version</span>"} | counter | Result of processing an inbound cert (per cert) (Cert was for a different shred version) |
+| <span class="metrics-name">votor_&#8203;cert_&#8203;rx</span><br/>{cert_&#8203;rx_&#8203;result="<span class="metrics-enum">unknown_&#8203;signer</span>"} | counter | Result of processing an inbound cert (per cert) (Sending connection had no authenticated identity) |
+| <span class="metrics-name">votor_&#8203;cert_&#8203;rx</span><br/>{cert_&#8203;rx_&#8203;result="<span class="metrics-enum">not_&#8203;a_&#8203;peer</span>"} | counter | Result of processing an inbound cert (per cert) (Sender was not in the peer set) |
+| <span class="metrics-name">votor_&#8203;cert_&#8203;rx</span><br/>{cert_&#8203;rx_&#8203;result="<span class="metrics-enum">not_&#8203;ranked</span>"} | counter | Result of processing an inbound cert (per cert) (Sender was not a ranked validator in the cert slot's epoch) |
+| <span class="metrics-name">votor_&#8203;cert_&#8203;rx</span><br/>{cert_&#8203;rx_&#8203;result="<span class="metrics-enum">slot_&#8203;out_&#8203;of_&#8203;bounds</span>"} | counter | Result of processing an inbound cert (per cert) (Cert slot was either too old or too far in the future) |
+| <span class="metrics-name">votor_&#8203;cert_&#8203;rx</span><br/>{cert_&#8203;rx_&#8203;result="<span class="metrics-enum">duplicate</span>"} | counter | Result of processing an inbound cert (per cert) (Cert was already in the pool) |
+| <span class="metrics-name">votor_&#8203;cert_&#8203;rx</span><br/>{cert_&#8203;rx_&#8203;result="<span class="metrics-enum">failed_&#8203;verify</span>"} | counter | Result of processing an inbound cert (per cert) (Cert failed the stake threshold or the aggregate signature check) |
+| <span class="metrics-name">votor_&#8203;cert_&#8203;rx</span><br/>{cert_&#8203;rx_&#8203;result="<span class="metrics-enum">banned</span>"} | counter | Result of processing an inbound cert (per cert) (Sender is banned for a failed signature verification) |
 
 </div>

@@ -5,6 +5,7 @@
 #include "../fd_quic_proto.h"
 #include "../fd_quic_proto.c"
 #include "../fd_quic_private.h"
+#include "../fd_quic_retry.h"
 #include "../templ/fd_quic_parse_util.h"
 #include "../../tls/fd_tls_proto.h"
 #include "../../../disco/metrics/generated/fd_metrics_enums.h"
@@ -1024,6 +1025,283 @@ FD_UNIT_TEST( quic_datagram_express_tx ) {
   conn->tx_max_datagram_frame_sz = 1UL+1UL+sizeof(msg)-1UL;
   FD_TEST( !fd_quic_conn_tx_dgram( conn, pkt, sizeof(pkt), msg, sizeof(msg) ) );
   FD_TEST( conn->pkt_number[2]==pkt_num+1UL );
+}
+
+/* fd_quic_rng_ulong periodically rekeys the CSPRNG.  Verify that it only
+   does so at/after the deadline, and that the deadline advances. */
+
+FD_UNIT_TEST( quic_rng_reseed ) {
+  fd_quic_sandbox_init( sandbox, FD_QUIC_ROLE_SERVER );
+  fd_quic_state_t * state = fd_quic_get_state( sandbox->quic );
+
+  long const t0 = 1000000000L;
+  state->now           = t0;
+  state->rng_reseed_at = t0 + FD_QUIC_RNG_RESEED_INTERVAL;
+
+  uchar key0[ FD_CHACHA_KEY_SZ ];
+  memcpy( key0, state->_rng->key, sizeof(key0) );
+
+  /* No reseed strictly before the deadline */
+
+  for( ulong i=0UL; i<1024UL; i++ ) fd_quic_rng_ulong( state );
+  FD_TEST( state->rng_reseed_at==t0+FD_QUIC_RNG_RESEED_INTERVAL );
+  FD_TEST( !memcmp( state->_rng->key, key0, sizeof(key0) ) );
+
+  state->now = state->rng_reseed_at - 1L;
+  fd_quic_rng_ulong( state );
+  FD_TEST( state->rng_reseed_at==t0+FD_QUIC_RNG_RESEED_INTERVAL );
+  FD_TEST( !memcmp( state->_rng->key, key0, sizeof(key0) ) );
+
+  /* Reseed exactly at the deadline */
+
+  state->now = state->rng_reseed_at;
+  long const t1 = state->now;
+  fd_quic_rng_ulong( state );
+  FD_TEST( state->rng_reseed_at==t1+FD_QUIC_RNG_RESEED_INTERVAL );
+  FD_TEST( memcmp( state->_rng->key, key0, sizeof(key0) )!=0 );
+
+  /* ... and not again until the new deadline */
+
+  memcpy( key0, state->_rng->key, sizeof(key0) );
+  state->now = state->rng_reseed_at - 1L;
+  for( ulong i=0UL; i<1024UL; i++ ) fd_quic_rng_ulong( state );
+  FD_TEST( state->rng_reseed_at==t1+FD_QUIC_RNG_RESEED_INTERVAL );
+  FD_TEST( !memcmp( state->_rng->key, key0, sizeof(key0) ) );
+
+  /* A clock jump well past the deadline reseeds once */
+
+  state->now = state->rng_reseed_at + 3L*FD_QUIC_RNG_RESEED_INTERVAL;
+  long const t2 = state->now;
+  fd_quic_rng_ulong( state );
+  FD_TEST( state->rng_reseed_at==t2+FD_QUIC_RNG_RESEED_INTERVAL );
+  FD_TEST( memcmp( state->_rng->key, key0, sizeof(key0) )!=0 );
+}
+
+/* RFC 9000 Section 17.2.5.2. Retry Packet
+
+   > A client MUST accept and process at most one Retry packet for each
+   > connection attempt.  After the client has received and processed
+   > an Initial or Retry packet from the server, it MUST discard any
+   > subsequent Retry packets that it receives.
+
+   > A client MUST discard a Retry packet that contains a SCID field
+   > that is identical to the DCID field of its Initial packet.
+
+   An on-path attacker that observed the client's Initial can forge a
+   Retry with a valid integrity tag at any time.  Verify that such a
+   Retry is ignored once the connection has progressed. */
+
+static ulong
+test_quic_client_retry_build( uchar                    retry[ FD_QUIC_RETRY_LOCAL_SZ ],
+                              fd_quic_pkt_t *          pkt,
+                              fd_quic_conn_t const *   conn,
+                              ulong                    retry_scid ) {
+  memset( pkt, 0, sizeof(fd_quic_pkt_t) );
+  pkt->ip4->saddr     = FD_QUIC_SANDBOX_PEER_IP4;
+  pkt->ip4->daddr     = FD_QUIC_SANDBOX_SELF_IP4;
+  pkt->udp->net_sport = FD_QUIC_SANDBOX_PEER_PORT;
+  pkt->udp->net_dport = FD_QUIC_SANDBOX_SELF_PORT;
+
+  /* The Retry's DCID is the client's SCID, the ODCID is the DCID the
+     client used in its Initial (conn->peer_cids[0]).  The retry token
+     is opaque to the client, so any secret/IV works here. */
+  fd_quic_conn_id_t client_scid = fd_quic_conn_id_new( &conn->our_conn_id, FD_QUIC_CONN_ID_SZ );
+  uchar secret[ FD_QUIC_RETRY_SECRET_SZ ] = {0};
+  uchar iv    [ FD_QUIC_RETRY_IV_SZ     ] = {0};
+  return fd_quic_retry_create( retry, pkt, 1UL, 2UL, secret, iv,
+                               &conn->peer_cids[0], &client_scid,
+                               retry_scid, LONG_MAX/2 );
+}
+
+FD_UNIT_TEST( quic_client_retry_after_initial ) {
+  fd_quic_sandbox_init( sandbox, FD_QUIC_ROLE_CLIENT );
+  fd_quic_conn_t * conn = fd_quic_sandbox_new_conn_established( sandbox, rng );
+  FD_TEST( !conn->server );
+  FD_TEST( conn->established );
+  FD_TEST( conn->retry_src_conn_id.sz==0 );
+
+  fd_quic_conn_id_t const orig_peer_cid = conn->peer_cids[0];
+  ulong             const forged_scid   = 0x4141414141414141UL;
+  fd_quic_pkt_t     pkt[1];
+  uchar             retry[ FD_QUIC_RETRY_LOCAL_SZ ];
+  ulong             retry_sz = test_quic_client_retry_build( retry, pkt, conn, forged_scid );
+  FD_TEST( retry_sz>0UL && retry_sz<=FD_QUIC_RETRY_LOCAL_SZ );
+  FD_TEST( fd_quic_h0_long_packet_type( retry[0] )==FD_QUIC_PKT_TYPE_RETRY );
+
+  /* Connection already processed a server Initial: the Retry must be
+     discarded without touching connection state. */
+  ulong before_fail = sandbox->quic->metrics.conn_err_retry_fail_cnt;
+  FD_TEST( fd_quic_process_quic_packet_v1( sandbox->quic, pkt, retry, retry_sz )==FD_QUIC_PARSE_FAIL );
+  FD_TEST( sandbox->quic->metrics.conn_err_retry_fail_cnt==before_fail+1UL );
+  FD_TEST( conn->state==FD_QUIC_CONN_STATE_ACTIVE );
+  FD_TEST( conn->retry_src_conn_id.sz==0 );
+  FD_TEST( conn->token_len==0UL );
+  FD_TEST( conn->peer_cids[0].sz==orig_peer_cid.sz );
+  FD_TEST( 0==memcmp( conn->peer_cids[0].conn_id, orig_peer_cid.conn_id, orig_peer_cid.sz ) );
+  FD_TEST( conn->keys_avail==(1U<<fd_quic_enc_level_appdata_id) );
+
+  /* Positive control: the same Retry is accepted by a connection that
+     has not yet heard from the server.  This proves the forged packet
+     is well-formed and that the gate above is what rejected it. */
+  conn->established = 0;
+  FD_TEST( fd_quic_process_quic_packet_v1( sandbox->quic, pkt, retry, retry_sz )==retry_sz );
+  FD_TEST( sandbox->quic->metrics.conn_err_retry_fail_cnt==before_fail+1UL );
+  FD_TEST( conn->retry_src_conn_id.sz==FD_QUIC_CONN_ID_SZ );
+  FD_TEST( FD_LOAD( ulong, conn->retry_src_conn_id.conn_id )==forged_scid );
+  FD_TEST( conn->peer_cids[0].sz==FD_QUIC_CONN_ID_SZ );
+  FD_TEST( FD_LOAD( ulong, conn->peer_cids[0].conn_id )==forged_scid );
+  FD_TEST( conn->token_len==sizeof(fd_quic_retry_token_t) );
+
+  /* At most one Retry per connection attempt: a second Retry (even
+     one that is valid for the updated DCID) must be discarded. */
+  fd_quic_conn_id_t const retry_peer_cid = conn->peer_cids[0];
+  ulong             const second_scid    = 0x4242424242424242UL;
+  retry_sz = test_quic_client_retry_build( retry, pkt, conn, second_scid );
+  FD_TEST( fd_quic_process_quic_packet_v1( sandbox->quic, pkt, retry, retry_sz )==FD_QUIC_PARSE_FAIL );
+  FD_TEST( sandbox->quic->metrics.conn_err_retry_fail_cnt==before_fail+2UL );
+  FD_TEST( FD_LOAD( ulong, conn->retry_src_conn_id.conn_id )==forged_scid );
+  FD_TEST( conn->peer_cids[0].sz==retry_peer_cid.sz );
+  FD_TEST( 0==memcmp( conn->peer_cids[0].conn_id, retry_peer_cid.conn_id, retry_peer_cid.sz ) );
+}
+
+FD_UNIT_TEST( quic_client_retry_scid_eq_dcid ) {
+  fd_quic_sandbox_init( sandbox, FD_QUIC_ROLE_CLIENT );
+  fd_quic_conn_t * conn = fd_quic_sandbox_new_conn_established( sandbox, rng );
+  conn->established = 0; /* pretend no server Initial seen yet */
+  FD_TEST( conn->peer_cids[0].sz==FD_QUIC_CONN_ID_SZ );
+
+  /* Retry SCID identical to the DCID of the client's Initial */
+  fd_quic_conn_id_t const orig_peer_cid = conn->peer_cids[0];
+  ulong             const same_scid     = FD_LOAD( ulong, orig_peer_cid.conn_id );
+  fd_quic_pkt_t     pkt[1];
+  uchar             retry[ FD_QUIC_RETRY_LOCAL_SZ ];
+  ulong             retry_sz = test_quic_client_retry_build( retry, pkt, conn, same_scid );
+
+  ulong before_fail = sandbox->quic->metrics.conn_err_retry_fail_cnt;
+  FD_TEST( fd_quic_process_quic_packet_v1( sandbox->quic, pkt, retry, retry_sz )==FD_QUIC_PARSE_FAIL );
+  FD_TEST( sandbox->quic->metrics.conn_err_retry_fail_cnt==before_fail+1UL );
+  FD_TEST( conn->retry_src_conn_id.sz==0 );
+  FD_TEST( conn->token_len==0UL );
+  FD_TEST( 0==memcmp( conn->peer_cids[0].conn_id, orig_peer_cid.conn_id, orig_peer_cid.sz ) );
+
+  /* A subsequent Retry with a distinct SCID is still accepted */
+  retry_sz = test_quic_client_retry_build( retry, pkt, conn, same_scid ^ 1UL );
+  FD_TEST( fd_quic_process_quic_packet_v1( sandbox->quic, pkt, retry, retry_sz )==retry_sz );
+  FD_TEST( conn->retry_src_conn_id.sz==FD_QUIC_CONN_ID_SZ );
+  FD_TEST( FD_LOAD( ulong, conn->peer_cids[0].conn_id )==(same_scid ^ 1UL) );
+}
+
+/* RFC 9000 Section 7.2: discard subsequent Initials with a different SCID. */
+
+static void
+test_quic_initial_scid( int role ) {
+  uchar const scid_sizes[] = { 0, FD_QUIC_CONN_ID_SZ, FD_QUIC_MAX_CONN_ID_SZ };
+  for( ulong i=0UL; i<sizeof(scid_sizes); i++ ) {
+    FD_TEST( fd_quic_sandbox_init( sandbox, role ) );
+    fd_quic_t *       quic  = sandbox->quic;
+    fd_quic_state_t * state = fd_quic_get_state( quic );
+    int server = role==FD_QUIC_ROLE_SERVER;
+
+    ulong our_conn_id = fd_rng_ulong( rng );
+    uchar scid_bytes[ FD_QUIC_MAX_CONN_ID_SZ ];
+    memset( scid_bytes, 0x42, sizeof(scid_bytes) );
+    fd_quic_conn_id_t scid = fd_quic_conn_id_new( scid_bytes, scid_sizes[i] );
+    fd_quic_conn_id_t dcid = fd_quic_conn_id_new( &our_conn_id, FD_QUIC_CONN_ID_SZ );
+    fd_quic_conn_t * conn = fd_quic_conn_create(
+        quic, our_conn_id, server ? &scid : &dcid,
+        FD_QUIC_SANDBOX_PEER_IP4, FD_QUIC_SANDBOX_PEER_PORT,
+        FD_QUIC_SANDBOX_SELF_IP4, FD_QUIC_SANDBOX_SELF_PORT, server );
+    FD_TEST( conn );
+    fd_quic_gen_initial_secrets( &conn->secrets, dcid.conn_id, dcid.sz, server );
+    fd_quic_crypto_keys_t * keys = &conn->keys[ fd_quic_enc_level_initial_id ][0];
+    fd_quic_gen_keys( keys, conn->secrets.secret[ fd_quic_enc_level_initial_id ][0] );
+
+    for( ulong pktnum=0UL; pktnum<6UL; pktnum++ ) {
+      if( pktnum==3UL && !scid.sz ) continue;
+      uchar payload[ FD_QUIC_INITIAL_PAYLOAD_SZ_MIN ] = { 0x01 }; /* PING + padding */
+      fd_quic_initial_t initial = {
+        .h0              = fd_quic_initial_h0( 3 ),
+        .version         = 1,
+        .dst_conn_id_len = dcid.sz,
+        .src_conn_id_len = scid.sz,
+        .len             = 4UL + sizeof(payload) + FD_QUIC_CRYPTO_TAG_SZ,
+        .pkt_num         = pktnum
+      };
+      memcpy( initial.dst_conn_id, dcid.conn_id, dcid.sz );
+      memcpy( initial.src_conn_id, scid.conn_id, scid.sz );
+      if( pktnum==3UL ) initial.src_conn_id[ scid.sz-1U ] ^= 1U;
+      if( pktnum==4UL ) initial.src_conn_id_len = (uchar)( scid.sz==FD_QUIC_MAX_CONN_ID_SZ ? scid.sz-1 : scid.sz+1 );
+
+      uchar buf[1500];
+      ulong hdr_sz = fd_quic_encode_initial( buf, sizeof(buf), &initial );
+      FD_TEST( hdr_sz!=FD_QUIC_ENCODE_FAIL );
+      ulong pkt_sz = sizeof(buf);
+      FD_TEST( fd_quic_crypto_encrypt( buf, &pkt_sz, buf, hdr_sz, payload, sizeof(payload),
+                                      keys, keys, pktnum )==FD_QUIC_SUCCESS );
+      if( pktnum==0UL ) buf[ pkt_sz-1UL ] ^= 1U; /* invalid authentication tag */
+
+      fd_quic_pkt_t pkt = {
+        .ip4 = {{ .saddr = FD_QUIC_SANDBOX_PEER_IP4, .daddr = FD_QUIC_SANDBOX_SELF_IP4 }},
+        .udp = {{ .net_sport = FD_QUIC_SANDBOX_PEER_PORT, .net_dport = FD_QUIC_SANDBOX_SELF_PORT }},
+        .datagram_sz = (uint)pkt_sz
+      };
+      ulong before_pktnum = conn->exp_pkt_number[0];
+      long  before_active = conn->last_activity;
+      ulong before_ping   = quic->metrics.frame_rx_cnt[ FD_METRICS_ENUM_QUIC_FRAME_TYPE_V_PING_IDX ];
+      state->now++;
+      int accept = pktnum==1UL || pktnum==2UL || pktnum==5UL;
+      ulong rc = fd_quic_process_quic_packet_v1( quic, &pkt, buf, pkt_sz );
+      FD_TEST( rc==(accept ? pkt_sz : FD_QUIC_PARSE_FAIL) );
+      FD_TEST( conn->state==FD_QUIC_CONN_STATE_HANDSHAKE );
+      FD_TEST( conn->exp_pkt_number[0]==(accept ? pktnum+1UL : before_pktnum) );
+      FD_TEST( conn->last_activity==(accept ? state->now : before_active) );
+      FD_TEST( quic->metrics.frame_rx_cnt[ FD_METRICS_ENUM_QUIC_FRAME_TYPE_V_PING_IDX ]==before_ping+(ulong)accept );
+      fd_quic_conn_id_t const * expected_scid = !server && pktnum==0UL ? &dcid : &scid;
+      FD_TEST( conn->peer_cids[0].sz==expected_scid->sz );
+      FD_TEST( !memcmp( conn->peer_cids[0].conn_id, expected_scid->conn_id, expected_scid->sz ) );
+      FD_TEST( conn->established==(uint)( !server && pktnum>0UL ) );
+    }
+    fd_quic_fini( quic );
+  }
+}
+
+FD_UNIT_TEST( quic_initial_scid_client ) {
+  test_quic_initial_scid( FD_QUIC_ROLE_CLIENT );
+}
+
+FD_UNIT_TEST( quic_initial_scid_server ) {
+  test_quic_initial_scid( FD_QUIC_ROLE_SERVER );
+}
+
+FD_UNIT_TEST( quic_initial_datagram_size ) {
+  uint const token_lengths[] = { 0U, 46U };
+  for( ulong i=0UL; i<sizeof(token_lengths)/sizeof(token_lengths[0]); i++ ) {
+    FD_TEST( fd_quic_sandbox_init( sandbox, FD_QUIC_ROLE_CLIENT ) );
+    fd_quic_conn_t * conn = fd_quic_connect(
+        sandbox->quic,
+        FD_QUIC_SANDBOX_PEER_IP4, FD_QUIC_SANDBOX_PEER_PORT,
+        FD_QUIC_SANDBOX_SELF_IP4, FD_QUIC_SANDBOX_SELF_PORT,
+        sandbox->wallclock );
+    FD_TEST( conn );
+    uint token_len = token_lengths[i];
+    FD_TEST( token_len<=sizeof(conn->token) );
+    fd_memset( conn->token, 0x41, token_len );
+    conn->token_len = token_len;
+
+    fd_quic_service( sandbox->quic, sandbox->wallclock );
+    fd_frag_meta_t const * frag = fd_quic_sandbox_next_packet( sandbox );
+    FD_TEST( frag );
+    FD_TEST( frag->sz>=sizeof(fd_ip4_hdr_t)+sizeof(fd_udp_hdr_t) );
+    uchar const * packet = fd_quic_sandbox_packet_data( sandbox, frag );
+    fd_ip4_hdr_t const * ip4 = (fd_ip4_hdr_t const *)packet;
+    ulong ip4_sz = FD_IP4_GET_LEN( *ip4 );
+    FD_TEST( frag->sz>=ip4_sz+sizeof(fd_udp_hdr_t) );
+    ulong udp_payload_sz = frag->sz-ip4_sz-sizeof(fd_udp_hdr_t);
+    FD_TEST( udp_payload_sz<=conn->tx_max_datagram_sz );
+    FD_TEST( udp_payload_sz==FD_QUIC_INITIAL_PAYLOAD_SZ_MIN );
+    FD_TEST( !fd_quic_sandbox_next_packet( sandbox ) );
+    fd_quic_fini( sandbox->quic );
+  }
 }
 
 int

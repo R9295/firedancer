@@ -4,6 +4,9 @@
 #include "../fd_waltz_base.h"
 #include "../../ballet/sha256/fd_sha256.h"
 
+#define FD_TLS_KEY_ED25519    ((uchar)0)
+#define FD_TLS_KEY_ECDSA_P256 ((uchar)1)
+
 /* Base ***************************************************************/
 
 /* fd_tls_estate_base_t is the shared header of the
@@ -11,7 +14,7 @@
 
 struct fd_tls_estate_base {
   uchar  state;
-  uchar  server : 1;  /* 1 if server, 0 if client */
+  uchar  server   : 1;  /* 1 if server, 0 if client */
   ushort reason;      /* FD_TLS_REASON_{...} */
 
   /* Sadly required for SSLKEYLOGFILE */
@@ -20,7 +23,8 @@ struct fd_tls_estate_base {
 
 typedef struct fd_tls_estate_base fd_tls_estate_base_t;
 
-/* The transcript is a running hash over all handshake messages.  The
+/* Transcript-Hash (RFC 8446 Section 4.4.1)
+   The transcript is a running hash over all handshake messages.  The
    hash state depends on the current handshake progression.  The hash
    order is as follows:
 
@@ -84,9 +88,10 @@ FD_PROTOTYPES_END
    is in the order of ~3 seconds (conn timeout).  This requires some
    care to avoid memory exhaustion attacks.
 
-   For example, a default OpenSSL app uses a handshake state size of
-   about 10 KB (via multiple allocations on global heap).  Assuming 3
-   second conn timeout, and flood rate of 1 million ClientHello msg/s,
+   For example, an off-the-shelf TLS implementation uses a handshake
+   state size of about 10 KB (via multiple allocations on global heap).
+   Assuming 3 second conn timeout, and flood rate of 1 million
+   ClientHello msg/s,
    an attacker could indefinitely occupy ~30 GB of raw heap allocations!
    More concerning -- Global heap pressure will cause latent allocation
    failures in unrelated code, which might escalate to OOM kills.
@@ -157,10 +162,9 @@ FD_PROTOTYPES_BEGIN
 fd_tls_estate_srv_t *
 fd_tls_estate_srv_new( void * mem );
 
-/* fd_tls_estate_srv_delete is currently a no-op. */
-
 static inline void *
 fd_tls_estate_srv_delete( fd_tls_estate_srv_t * estate ) {
+  if( FD_LIKELY( estate ) ) fd_memzero_explicit( estate, sizeof(fd_tls_estate_srv_t) );
   return (void *)estate;
 }
 
@@ -190,13 +194,22 @@ struct fd_tls_estate_cli {
    Type of handshake object depends on is_server. */
   fd_tls_estate_base_t base;
 
-  uchar server_pubkey   [ 32 ];
+  uchar server_pubkey   [ 65 ];  /* {32,65} for {Ed25519,P256} uncompressed */
+  ulong server_pubkey_len;
+  uchar server_key_type;         /* FD_TLS_KEY_{...} */
   uchar server_hs_secret[ 32 ];
   uchar client_hs_secret[ 32 ];
   uchar master_secret   [ 32 ];
 
   uchar client_cert       : 1;  /* 0=anon  1=client auth */
+  uchar client_cert_empty : 1;  /* no compatible CertificateVerify scheme */
   uchar server_pubkey_pin : 1;  /* if 1, require cert to match server_pubkey */
+  uchar alpn_negotiated   : 1;  /* if 1, server selected the offered ALPN */
+  uchar cert_verify_err;         /* FD_X509_VERIFY_{...} if ca_store is set, else 0 */
+
+  /* TCP middlebox compat (RFC 8446 Section 4.1.2) */
+  uchar session_id[ 32 ];
+  uchar session_id_sz;
 
   fd_sha256_t transcript;
 };
@@ -208,8 +221,14 @@ FD_PROTOTYPES_BEGIN
 fd_tls_estate_cli_t *
 fd_tls_estate_cli_new( void * mem );
 
+/* fd_tls_estate_cli_delete destroys the handshake state.  Securely
+   erases the object, which holds the handshake secrets, the master
+   secret, and the transcript hash state.  See
+   fd_tls_estate_srv_delete. */
+
 static inline void *
 fd_tls_estate_cli_delete( fd_tls_estate_cli_t * estate ) {
+  if( FD_LIKELY( estate ) ) fd_memzero_explicit( estate, sizeof(fd_tls_estate_cli_t) );
   return (void *)estate;
 }
 

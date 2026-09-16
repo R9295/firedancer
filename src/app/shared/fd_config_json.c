@@ -11,7 +11,7 @@
    or knowingly skipped) before the constant is bumped.  String keys of
    the user's own file are separately forced through the classification
    lists below. */
-FD_STATIC_ASSERT( sizeof(fd_config_t)==22970296UL, update_fd_config_to_json_for_the_layout_change );
+FD_STATIC_ASSERT( sizeof(fd_config_t)==22987008UL, update_fd_config_to_json_for_the_layout_change );
 
 #define REDACTED "[redacted]"
 
@@ -169,6 +169,7 @@ static char const * const jw_reported_keys[] = {
   "tiles.replay.enable_features",
   "development.core_dump",
   "development.bench.affinity",
+  "development.bench.transaction_mode",
   "development.pktgen.affinity",
   "development.pktgen.fake_dst_ip",
   "development.udpecho.affinity",
@@ -372,10 +373,7 @@ fd_config_to_json( fd_config_t const * config,
   jw_obj_open( &w, "runtime" );
     jw_ulong( &w, "max_live_slots", f->runtime.max_live_slots );
     jw_ulong( &w, "max_fork_width", f->runtime.max_fork_width );
-    jw_obj_open( &w, "program_cache" );
-      jw_ulong( &w, "heap_size_mib",         f->runtime.program_cache.heap_size_mib );
-      jw_ulong( &w, "mean_cache_entry_size", f->runtime.program_cache.mean_cache_entry_size );
-    jw_obj_close( &w );
+    jw_ulong( &w, "program_cache_size_mib", f->runtime.program_cache_size_mib );
   jw_obj_close( &w );
 
   jw_obj_open( &w, "snapshots" );
@@ -488,20 +486,20 @@ fd_config_to_json( fd_config_t const * config,
       jw_ulong( &w, "benchg_tile_count",            config->development.bench.benchg_tile_count );
       jw_ulong( &w, "benchs_tile_count",            config->development.bench.benchs_tile_count );
       jw_str  ( &w, "affinity",                     config->development.bench.affinity );
-      jw_bool ( &w, "larger_max_cost_per_block",    config->development.bench.larger_max_cost_per_block );
-      jw_bool ( &w, "larger_shred_limits_per_block",config->development.bench.larger_shred_limits_per_block );
+      jw_str  ( &w, "transaction_mode",             config->development.bench.transaction_mode );
+      jw_ulong( &w, "max_cost_per_block",           config->development.bench.max_cost_per_block );
+      jw_ulong( &w, "max_shreds_per_block",         config->development.bench.max_shreds_per_block );
       jw_ulong( &w, "disable_blockstore_from_slot", config->development.bench.disable_blockstore_from_slot );
       jw_bool ( &w, "disable_status_cache",         config->development.bench.disable_status_cache );
     jw_obj_close( &w );
     jw_obj_open( &w, "bundle" );
       jw_path ( &w, "ssl_key_log_file",  config->development.bundle.ssl_key_log_file );
       jw_ulong( &w, "buffer_size_kib",   config->development.bundle.buffer_size_kib );
-      jw_ulong( &w, "ssl_heap_size_mib", config->development.bundle.ssl_heap_size_mib );
     jw_obj_close( &w );
     jw_obj_open( &w, "event" );
       jw_bool( &w, "report_shreds",            config->development.event.report_shreds );
       jw_bool( &w, "report_transactions",      config->development.event.report_transactions );
-      jw_bool( &w, "report_transaction_diffs", config->development.event.report_transaction_diffs );
+      jw_bool( &w, "report_runtime_diffs",      config->development.event.report_runtime_diffs );
     jw_obj_close( &w );
     jw_obj_open( &w, "pktgen" );
       jw_str( &w, "affinity",    config->development.pktgen.affinity );
