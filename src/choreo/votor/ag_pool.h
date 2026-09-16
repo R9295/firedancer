@@ -74,8 +74,30 @@ ag_slot_state_t const *
 ag_pool_slot_state( ag_pool_t const * self,
                     ulong             slot );
 
+/* ag_pool_standstill is called when no new finalization has been
+   observed for AG_DELTA_STANDSTILL_NS, and again every
+   AG_DELTA_STANDSTILL_NS for as long as that lasts.  Schedules every
+   slot above the finalized slot that currently holds a cert or one of
+   our own votes for ag_pool_refresh, and emits an
+   AG_EVENT_POOL_STANDSTILL naming the finalized slot so Votor extends
+   its skip timeouts.  Mirrors Agave's Standstill event and its refresh
+   of votes and certs into the StandstillRefreshQueue. */
+
 void
-ag_pool_recover_from_standstill( ag_pool_t * self );
+ag_pool_standstill( ag_pool_t * self );
+
+/* ag_pool_refresh is called every AG_REFRESH_INTERVAL_NS.  If any slot
+   scheduled by ag_pool_standstill is still above the finalized slot,
+   emits an AG_EVENT_POOL_REFRESH with at most AG_REFRESH_MSG_MAX
+   messages to rebroadcast: the certs that finalized the finalized slot,
+   then whole slots of certs and own votes, resuming after the slot the
+   previous refresh ended on and wrapping around once.  Does nothing
+   while the previous refresh event has not been polled, as the event
+   points into pool scratch.  Mirrors Agave's
+   VotingService::maybe_handle_standstill_queue. */
+
+void
+ag_pool_refresh( ag_pool_t * self );
 
 FD_FN_PURE ulong
 ag_pool_finalized_slot( ag_pool_t const * self );

@@ -86,6 +86,12 @@ struct __attribute__((aligned(128UL))) ag_pool {
   ag_event_repair_t * repair_events;
 
   struct {
+    ulong hi;      /* highest slot scheduled, nothing is scheduled while hi<=finalized slot */
+    ulong cursor;  /* slot the previous refresh ended on */
+    int   pending; /* the previous refresh event has not been polled yet */
+  } refresh;
+
+  struct {
     ag_cert_t *         certs;
     ulong               cert_cnt;
     ag_vote_t *         votes;
@@ -142,8 +148,8 @@ ag_pool_footprint( ulong slot_max ) {
       s2n_waiting_parent_cert_map_align(),  s2n_waiting_parent_cert_map_footprint ( s2n_chain_cnt ) ),
       pool_events_align(),                  pool_events_footprint( slot_max )                       ),
       repair_events_align(),                repair_events_footprint( slot_max )                     ),
-      alignof(ag_cert_t),                   sizeof(ag_cert_t)         * slot_max                    ),
-      alignof(ag_vote_t),                   sizeof(ag_vote_t)         * slot_max                    ),
+      alignof(ag_cert_t),                   sizeof(ag_cert_t)         * AG_REFRESH_MSG_MAX          ),
+      alignof(ag_vote_t),                   sizeof(ag_vote_t)         * AG_REFRESH_MSG_MAX          ),
       alignof(ag_parent_ready_t),           sizeof(ag_parent_ready_t) * slot_max                    ),
       alignof(ag_event_pool_t),             sizeof(ag_event_pool_t)   * slot_max                    ),
       alignof(ag_block_id_t),               sizeof(ag_block_id_t)     * slot_max                    ),
@@ -187,8 +193,8 @@ ag_pool_new( void * mem,
   void *      s2n_waiting_parent_cert_map  = FD_SCRATCH_ALLOC_APPEND( l, s2n_waiting_parent_cert_map_align(),  s2n_waiting_parent_cert_map_footprint ( s2n_chain_cnt ) );
   void *      pool_events                  = FD_SCRATCH_ALLOC_APPEND( l, pool_events_align(),                  pool_events_footprint( slot_max )                       );
   void *      repair_events                = FD_SCRATCH_ALLOC_APPEND( l, repair_events_align(),                repair_events_footprint( slot_max )                     );
-  void *      cert_scratch                 = FD_SCRATCH_ALLOC_APPEND( l, alignof(ag_cert_t),                   sizeof(ag_cert_t)         * slot_max                    );
-  void *      vote_scratch                 = FD_SCRATCH_ALLOC_APPEND( l, alignof(ag_vote_t),                   sizeof(ag_vote_t)         * slot_max                    );
+  void *      cert_scratch                 = FD_SCRATCH_ALLOC_APPEND( l, alignof(ag_cert_t),                   sizeof(ag_cert_t)         * AG_REFRESH_MSG_MAX          );
+  void *      vote_scratch                 = FD_SCRATCH_ALLOC_APPEND( l, alignof(ag_vote_t),                   sizeof(ag_vote_t)         * AG_REFRESH_MSG_MAX          );
   void *      parent_ready_scratch         = FD_SCRATCH_ALLOC_APPEND( l, alignof(ag_parent_ready_t),           sizeof(ag_parent_ready_t) * slot_max                    );
   void *      pool_event_scratch           = FD_SCRATCH_ALLOC_APPEND( l, alignof(ag_event_pool_t),             sizeof(ag_event_pool_t)   * slot_max                    );
   void *      implicitly_finalized_scratch = FD_SCRATCH_ALLOC_APPEND( l, alignof(ag_block_id_t),               sizeof(ag_block_id_t)     * slot_max                    );
@@ -223,6 +229,10 @@ ag_pool_new( void * mem,
   pool->slot_max = slot_max;
 
   pool->seq = 0UL;
+
+  pool->refresh.hi      = 0UL;
+  pool->refresh.cursor  = 0UL;
+  pool->refresh.pending = 0;
 
   pool->scratch.certs                = (ag_cert_t *)cert_scratch;
   pool->scratch.cert_cnt             = 0UL;
@@ -280,6 +290,8 @@ ag_pool_init( ag_pool_t * self,
               ulong       slot ) {
   ag_finality_tracker_init( self->finality_tracker, slot );
   self->parent_ready_tracker->root = slot;
+  self->refresh.hi                 = slot;
+  self->refresh.cursor             = slot;
 }
 
 void
@@ -577,30 +589,73 @@ ag_pool_add_block( ag_pool_t *           self,
   return AG_POOL_SUCCESS;
 }
 
-void
-ag_pool_recover_from_standstill( ag_pool_t * self ) {
+/* A slot holds at most 4+AG_NOTAR_FALLBACK_CERT_MAX certs and at most
+   4+AG_NOTAR_FALLBACK_VOTE_MAX votes of our own, so a refresh batch
+   always fits the (at most two) certs that finalized the finalized slot
+   plus one whole slot. */
+
+#define REFRESH_SLOT_MSG_MAX ( 4UL+AG_NOTAR_FALLBACK_CERT_MAX + 4UL+AG_NOTAR_FALLBACK_VOTE_MAX )
+FD_STATIC_ASSERT( 2UL+REFRESH_SLOT_MSG_MAX<=AG_REFRESH_MSG_MAX, refresh_msg_max );
+
+/* refresh_cnt returns the number of certs and own votes held by ele. */
+
+FD_FN_PURE static ulong
+refresh_cnt( slot_state_ele_t const * ele ) {
+  ag_slot_certs_t const * sc  = &ele->slot_state.certs;
+  ulong                   cnt = (ulong)( sc->finalize.slot     !=ULONG_MAX ) +
+                                (ulong)( sc->fast_finalize.slot!=ULONG_MAX ) +
+                                (ulong)( sc->notar.slot        !=ULONG_MAX ) +
+                                sc->notar_fallback_cnt                       +
+                                (ulong)( sc->skip.slot         !=ULONG_MAX );
+
+  ag_slot_votes_t const * sv   = &ele->slot_state.votes;
+  ulong                   rank = ele->slot_state.own_rank;
+  if( FD_UNLIKELY( rank==USHORT_MAX ) ) return cnt; /* unstaked */
+  return cnt + (ulong)( sv->notar        [rank].slot!=ULONG_MAX ) +
+               (ulong)( sv->finalize     [rank].slot!=ULONG_MAX ) +
+               (ulong)( sv->skip         [rank].slot!=ULONG_MAX ) +
+               sv->notar_fallback_cnt[rank]                       +
+               (ulong)( sv->skip_fallback[rank].slot!=ULONG_MAX );
+}
+
+/* refresh_collect appends the certs and own votes held by ele to the
+   refresh batch in scratch. */
+
+static void
+refresh_collect( ag_pool_t *              self,
+                 slot_state_ele_t const * ele ) {
   ag_cert_t * certs     = self->scratch.certs;
-  ulong       certs_cnt = 0UL;
+  ulong       certs_cnt = self->scratch.cert_cnt;
   ag_vote_t * votes     = self->scratch.votes;
-  ulong       votes_cnt = 0UL;
+  ulong       votes_cnt = self->scratch.vote_cnt;
+  FD_TEST( certs_cnt+votes_cnt+refresh_cnt( ele )<=AG_REFRESH_MSG_MAX );
 
-  /* 1. collect our finalized slot's cert */
-
-  ulong finalized_slot = ag_pool_finalized_slot( self );
-  slot_state_ele_t const * fast_final_or_final_ = slot_state_map_ele_query_const( self->slot_states->map, &finalized_slot, NULL, self->slot_states->pool );
-  if( FD_LIKELY( fast_final_or_final_ ) ) { /* possible no cert if snapshot slot */
-    ag_slot_certs_t const * fast_final_or_final = &fast_final_or_final_->slot_state.certs;
-    if( FD_LIKELY( fast_final_or_final->fast_finalize.slot!=ULONG_MAX ) ) {
-      certs[certs_cnt++] = (ag_cert_t){ .kind = AG_CERT_KIND_FAST_FINAL, .fast_final = fast_final_or_final->fast_finalize };
-    } else {
-      FD_TEST( fast_final_or_final->finalize.slot!=ULONG_MAX );
-      FD_TEST( fast_final_or_final->notar.slot   !=ULONG_MAX );
-      certs[certs_cnt++] = (ag_cert_t){ .kind = AG_CERT_KIND_FINAL, .final = fast_final_or_final->finalize };
-      certs[certs_cnt++] = (ag_cert_t){ .kind = AG_CERT_KIND_NOTAR, .notar = fast_final_or_final->notar    };
-    }
+  ag_slot_certs_t const * sc = &ele->slot_state.certs;
+  if( FD_UNLIKELY( sc->finalize.slot     !=ULONG_MAX ) ) certs[ certs_cnt++ ] = (ag_cert_t){ .kind = AG_CERT_KIND_FINAL,      .final      = sc->finalize      };
+  if( FD_UNLIKELY( sc->fast_finalize.slot!=ULONG_MAX ) ) certs[ certs_cnt++ ] = (ag_cert_t){ .kind = AG_CERT_KIND_FAST_FINAL, .fast_final = sc->fast_finalize };
+  if( FD_LIKELY  ( sc->notar.slot        !=ULONG_MAX ) ) certs[ certs_cnt++ ] = (ag_cert_t){ .kind = AG_CERT_KIND_NOTAR,      .notar      = sc->notar         };
+  for( ulong i=0UL; i<sc->notar_fallback_cnt; i++ ) {
+    certs[ certs_cnt++ ] = (ag_cert_t){ .kind = AG_CERT_KIND_NOTAR_FALLBACK, .notar_fallback = sc->notar_fallback[i] };
   }
+  if( FD_UNLIKELY( sc->skip.slot         !=ULONG_MAX ) ) certs[ certs_cnt++ ] = (ag_cert_t){ .kind = AG_CERT_KIND_SKIP,       .skip       = sc->skip          };
+  self->scratch.cert_cnt = certs_cnt;
 
-  /* 2. collect every cert and own vote for slots > finalized slot */
+  ag_slot_votes_t const * sv   = &ele->slot_state.votes;
+  ulong                   rank = ele->slot_state.own_rank;
+  if( FD_UNLIKELY( rank==USHORT_MAX ) ) return; /* unstaked */
+  if( FD_LIKELY  ( sv->notar   [rank].slot!=ULONG_MAX ) ) votes[ votes_cnt++ ] = (ag_vote_t){ .kind = AG_VOTE_KIND_NOTAR, .notar = sv->notar   [rank] };
+  if( FD_LIKELY  ( sv->finalize[rank].slot!=ULONG_MAX ) ) votes[ votes_cnt++ ] = (ag_vote_t){ .kind = AG_VOTE_KIND_FINAL, .final = sv->finalize[rank] };
+  if( FD_UNLIKELY( sv->skip    [rank].slot!=ULONG_MAX ) ) votes[ votes_cnt++ ] = (ag_vote_t){ .kind = AG_VOTE_KIND_SKIP,  .skip  = sv->skip    [rank] };
+  for( ulong i=0UL; i<sv->notar_fallback_cnt[rank]; i++ ) {
+    votes[ votes_cnt++ ] = (ag_vote_t){ .kind = AG_VOTE_KIND_NOTAR_FALLBACK, .notar_fallback = sv->notar_fallback[rank][i] };
+  }
+  if( FD_UNLIKELY( sv->skip_fallback[rank].slot!=ULONG_MAX ) ) votes[ votes_cnt++ ] = (ag_vote_t){ .kind = AG_VOTE_KIND_SKIP_FALLBACK, .skip_fallback = sv->skip_fallback[rank] };
+  self->scratch.vote_cnt = votes_cnt;
+}
+
+void
+ag_pool_standstill( ag_pool_t * self ) {
+  ulong finalized_slot = ag_pool_finalized_slot( self );
 
   slot_state_map_t * map  = self->slot_states->map;
   slot_state_ele_t * pool = self->slot_states->pool;
@@ -608,34 +663,74 @@ ag_pool_recover_from_standstill( ag_pool_t * self ) {
                                    !slot_state_map_iter_done( iter, map, pool );
                              iter = slot_state_map_iter_next( iter, map, pool ) ) {
     slot_state_ele_t const * ele = slot_state_map_iter_ele_const( iter, map, pool );
-    if( FD_UNLIKELY( ele->slot<=finalized_slot ) ) continue;
-
-    ag_slot_certs_t const * sc = &ele->slot_state.certs;
-    if( FD_UNLIKELY( sc->finalize.slot     !=ULONG_MAX && certs_cnt<self->slot_max ) ) certs[ certs_cnt++ ] = (ag_cert_t){ .kind = AG_CERT_KIND_FINAL,      .final      = sc->finalize      };
-    if( FD_UNLIKELY( sc->fast_finalize.slot!=ULONG_MAX && certs_cnt<self->slot_max ) ) certs[ certs_cnt++ ] = (ag_cert_t){ .kind = AG_CERT_KIND_FAST_FINAL, .fast_final = sc->fast_finalize };
-    if( FD_LIKELY  ( sc->notar.slot        !=ULONG_MAX && certs_cnt<self->slot_max ) ) certs[ certs_cnt++ ] = (ag_cert_t){ .kind = AG_CERT_KIND_NOTAR,      .notar      = sc->notar         };
-    for( ulong i=0UL; i<sc->notar_fallback_cnt && certs_cnt<self->slot_max; i++ ) {
-      certs[ certs_cnt++ ] = (ag_cert_t){ .kind = AG_CERT_KIND_NOTAR_FALLBACK, .notar_fallback = sc->notar_fallback[i] };
-    }
-    if( FD_UNLIKELY( sc->skip.slot         !=ULONG_MAX && certs_cnt<self->slot_max ) ) certs[ certs_cnt++ ] = (ag_cert_t){ .kind = AG_CERT_KIND_SKIP,       .skip       = sc->skip          };
-
-    ag_slot_votes_t const * sv   = &ele->slot_state.votes;
-    ulong                   rank = ele->slot_state.own_rank;
-    if( FD_UNLIKELY( rank==USHORT_MAX ) ) continue; /* unstaked */
-    if( FD_LIKELY  ( sv->notar   [rank].slot!=ULONG_MAX && votes_cnt<self->slot_max ) ) votes[ votes_cnt++ ] = (ag_vote_t){ .kind = AG_VOTE_KIND_NOTAR, .notar = sv->notar   [rank] };
-    if( FD_LIKELY  ( sv->finalize[rank].slot!=ULONG_MAX && votes_cnt<self->slot_max ) ) votes[ votes_cnt++ ] = (ag_vote_t){ .kind = AG_VOTE_KIND_FINAL, .final = sv->finalize[rank] };
-    if( FD_UNLIKELY( sv->skip    [rank].slot!=ULONG_MAX && votes_cnt<self->slot_max ) ) votes[ votes_cnt++ ] = (ag_vote_t){ .kind = AG_VOTE_KIND_SKIP,  .skip  = sv->skip    [rank] };
-    for( ulong i=0UL; i<sv->notar_fallback_cnt[rank] && votes_cnt<self->slot_max; i++ ) {
-      votes[ votes_cnt++ ] = (ag_vote_t){ .kind = AG_VOTE_KIND_NOTAR_FALLBACK, .notar_fallback = sv->notar_fallback[rank][i] };
-    }
-    if( FD_UNLIKELY( sv->skip_fallback[rank].slot!=ULONG_MAX && votes_cnt<self->slot_max ) ) votes[ votes_cnt++ ] = (ag_vote_t){ .kind = AG_VOTE_KIND_SKIP_FALLBACK, .skip_fallback = sv->skip_fallback[rank] };
+    if( FD_LIKELY( ele->slot<=finalized_slot || ele->slot<=self->refresh.hi || !refresh_cnt( ele ) ) ) continue;
+    self->refresh.hi = ele->slot;
   }
 
-  /* 3. push out a standstill pool event containing the above */
+  pool_events_push( self->pool_events, (ag_event_pool_t){ .seq = self->seq++, .kind = AG_EVENT_POOL_STANDSTILL, .standstill = finalized_slot } );
+}
 
-  self->scratch.cert_cnt = certs_cnt;
-  self->scratch.vote_cnt = votes_cnt;
-  pool_events_push( self->pool_events, (ag_event_pool_t){ .seq = self->seq++, .kind = AG_EVENT_POOL_STANDSTILL, .standstill = { .slot = finalized_slot + 1UL, .certs = certs, .cert_cnt = certs_cnt, .votes = votes, .vote_cnt = votes_cnt } } );
+void
+ag_pool_refresh( ag_pool_t * self ) {
+  ulong finalized_slot = ag_pool_finalized_slot( self );
+  if( FD_LIKELY( self->refresh.hi<=finalized_slot || self->refresh.pending ) ) return;
+
+  self->scratch.cert_cnt = 0UL;
+  self->scratch.vote_cnt = 0UL;
+
+  /* 1. the certs that finalized the finalized slot.  There are none for
+        the slot we booted from. */
+
+  slot_state_map_t *       map  = self->slot_states->map;
+  slot_state_ele_t *       pool = self->slot_states->pool;
+  slot_state_ele_t const * ele  = slot_state_map_ele_query_const( map, &finalized_slot, NULL, pool );
+  if( FD_LIKELY( ele ) ) {
+    ag_slot_certs_t const * sc    = &ele->slot_state.certs;
+    ag_cert_t *             certs = self->scratch.certs;
+    if( FD_LIKELY( sc->fast_finalize.slot!=ULONG_MAX ) ) {
+      certs[ self->scratch.cert_cnt++ ] = (ag_cert_t){ .kind = AG_CERT_KIND_FAST_FINAL, .fast_final = sc->fast_finalize };
+    } else if( FD_LIKELY( sc->finalize.slot!=ULONG_MAX && sc->notar.slot!=ULONG_MAX ) ) {
+      certs[ self->scratch.cert_cnt++ ] = (ag_cert_t){ .kind = AG_CERT_KIND_FINAL, .final = sc->finalize };
+      certs[ self->scratch.cert_cnt++ ] = (ag_cert_t){ .kind = AG_CERT_KIND_NOTAR, .notar = sc->notar    };
+    }
+  }
+
+  /* 2. whole slots above the one the previous refresh ended on, then
+        wrap around to the lowest slot above finalized.  A slot is only
+        included if all its messages fit the batch. */
+
+  ulong budget = AG_REFRESH_MSG_MAX - self->scratch.cert_cnt;
+  ulong start  = fd_ulong_max( self->refresh.cursor, finalized_slot );
+  ulong cnt    = 0UL;
+  int   full   = 0;
+  self->refresh.cursor = start;
+  for( ulong slot=start+1UL; slot<=self->refresh.hi; slot++ ) {
+    ele = slot_state_map_ele_query_const( map, &slot, NULL, pool );
+    ulong slot_cnt = ele ? refresh_cnt( ele ) : 0UL;
+    if( FD_UNLIKELY( !slot_cnt ) ) continue;
+    if( FD_UNLIKELY( cnt+slot_cnt>budget ) ) { full = 1; break; }
+    refresh_collect( self, ele );
+    cnt                 += slot_cnt;
+    self->refresh.cursor = slot;
+  }
+  if( FD_LIKELY( !full && start>finalized_slot ) ) {
+    self->refresh.cursor = finalized_slot;
+    for( ulong slot=finalized_slot+1UL; slot<=start; slot++ ) {
+      ele = slot_state_map_ele_query_const( map, &slot, NULL, pool );
+      ulong slot_cnt = ele ? refresh_cnt( ele ) : 0UL;
+      if( FD_UNLIKELY( !slot_cnt ) ) continue;
+      if( FD_UNLIKELY( cnt+slot_cnt>budget ) ) break;
+      refresh_collect( self, ele );
+      cnt                 += slot_cnt;
+      self->refresh.cursor = slot;
+    }
+  }
+
+  /* 3. push out a refresh pool event containing the above */
+
+  ag_refresh_t refresh = { .slot = finalized_slot, .certs = self->scratch.certs, .cert_cnt = self->scratch.cert_cnt, .votes = self->scratch.votes, .vote_cnt = self->scratch.vote_cnt };
+  pool_events_push( self->pool_events, (ag_event_pool_t){ .seq = self->seq++, .kind = AG_EVENT_POOL_REFRESH, .refresh = refresh } );
+  self->refresh.pending = 1;
 }
 
 FD_FN_PURE ulong
@@ -669,6 +764,7 @@ ag_pool_poll_pool_event( ag_pool_t *       self,
                          ag_event_pool_t * event ) {
   if( FD_LIKELY( pool_events_empty( self->pool_events ) ) ) return 0;
   *event = pool_events_pop( self->pool_events );
+  if( FD_UNLIKELY( event->kind==AG_EVENT_POOL_REFRESH ) ) self->refresh.pending = 0;
   return 1;
 }
 

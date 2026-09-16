@@ -15,6 +15,16 @@
 #define AG_DELTA_FIRST_SLICE_NS (10000000L)        /* TODO */
 #define AG_DELTA_TIMEOUT_NS     (3L * AG_DELTA_NS) /* skip timeout  */
 #define AG_DELTA_STANDSTILL_NS  (10000000000L)     /* 10s since last finalize */
+#define AG_TIMEOUT_MAX_NS       (3600000000000L)   /* 1h cap on a standstill-extended skip timeout */
+
+/* During a standstill, certs and our own votes above the finalized slot
+   are refreshed in batches of at most AG_REFRESH_MSG_MAX messages every
+   AG_REFRESH_INTERVAL_NS, so as to stay within the per-peer rate limit
+   Agave applies to Votor traffic (Agave STANDSTILL_REFRESH_BATCH_SIZE
+   and STANDSTILL_REFRESH_INTERVAL). */
+
+#define AG_REFRESH_INTERVAL_NS  (1000000000L)      /* 1s between refresh batches */
+#define AG_REFRESH_MSG_MAX      (20UL)             /* messages per refresh batch */
 
 #define AG_WEAKEST_QUORUM_THRESHOLD_NUMER (1UL) /* 20%, safe-to-notar + 40% skip */
 #define AG_WEAK_QUORUM_THRESHOLD_NUMER    (2UL) /* 40%, safe-to-notar / safe-to-skip */
@@ -42,14 +52,14 @@ typedef struct ag_block_info ag_block_info_t;
 typedef struct ag_vote ag_vote_t; /* forward decl */
 typedef struct ag_cert ag_cert_t; /* forward decl */
 
-struct ag_standstill {
-  ulong       slot;
+struct ag_refresh {
+  ulong       slot; /* highest finalized slot as of the refresh */
   ag_cert_t * certs;
   ulong       cert_cnt;
   ag_vote_t * votes;
   ulong       vote_cnt;
 };
-typedef struct ag_standstill ag_standstill_t;
+typedef struct ag_refresh ag_refresh_t;
 
 FD_PROTOTYPES_BEGIN
 

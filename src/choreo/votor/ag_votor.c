@@ -82,6 +82,7 @@ struct __attribute__((aligned(128UL))) ag_votor {
 
   slot_states_t * slot_states;
   ulong           highest_final_cert_slot;
+  ulong           standstill_slot; /* highest finalized slot when standstill was detected, ULONG_MAX if not in standstill */
 
   ulong        prev_epoch_rank;
   ulong        prev_epoch_slot;
@@ -122,12 +123,29 @@ state_mut( ag_votor_t * self,
   return ele;
 }
 
+/* delta_timeout returns the skip timeout for the window starting at
+   slot.  During a standstill it is extended by 5% for every leader
+   window since the slot standstill was detected at, up to
+   AG_TIMEOUT_MAX_NS (Agave calculate_timeout_multiplier).  Only the
+   network-derived part of the timeout is extended, not the block
+   pacing. */
+
+FD_FN_PURE static long
+delta_timeout( ag_votor_t const * self,
+               ulong              slot ) {
+  if( FD_LIKELY( self->standstill_slot==ULONG_MAX ) ) return AG_DELTA_TIMEOUT_NS;
+  ulong windows = fd_ulong_sat_sub( slot, self->standstill_slot ) / AG_SLOTS_PER_WINDOW;
+  long  timeout = AG_DELTA_TIMEOUT_NS;
+  for( ulong i=0UL; i<windows && timeout<AG_TIMEOUT_MAX_NS; i++ ) timeout = timeout*21L/20L;
+  return fd_long_min( timeout, AG_TIMEOUT_MAX_NS );
+}
+
 static void
 set_timeouts( ag_votor_t * self,
               ulong        slot ) {
   FD_TEST( ag_is_start_of_window( slot ) );
 
-  long deadline = self->now + AG_DELTA_TIMEOUT_NS + AG_DELTA_FIRST_SLICE_NS;
+  long deadline = self->now + delta_timeout( self, slot ) + AG_DELTA_FIRST_SLICE_NS;
 
   slot_state_ele_t * start      = state_mut( self, slot );
   int                start_idle = timer_idle( start );
@@ -219,6 +237,7 @@ ag_votor_new( void * mem,
   votor->slot_states->pool       = slot_state_pool_join( slot_state_pool_new( slot_state_pool, slot_max                  ) );
   votor->slot_states->map        = slot_state_map_join ( slot_state_map_new ( slot_state_map,  slot_state_chain_cnt, seed ) );
   votor->highest_final_cert_slot = ULONG_MAX;
+  votor->standstill_slot         = ULONG_MAX;
   votor->prev_epoch_rank         = 0UL;
   votor->prev_epoch_slot         = ULONG_MAX;
   votor->curr_epoch_rank         = 0UL;
@@ -284,6 +303,7 @@ ag_votor_init( ag_votor_t *   self,
   self->bls_sign_fn             = sign_fn;
   self->bls_sign_ctx            = sign_ctx;
   self->highest_final_cert_slot = slot;
+  self->standstill_slot         = ULONG_MAX;
 
   slot_state_ele_t * state       = state_mut( self, slot );
   state->voted                   = 1;
@@ -300,6 +320,7 @@ void
 ag_votor_fini( ag_votor_t * self ) {
   self->root                    = ULONG_MAX;
   self->highest_final_cert_slot = ULONG_MAX;
+  self->standstill_slot         = ULONG_MAX;
 }
 
 static ushort
@@ -341,7 +362,8 @@ pool_event_slot( ag_event_pool_t const * event ) {
   case AG_EVENT_POOL_SAFE_TO_NOTAR: return event->safe_to_notar.slot;
   case AG_EVENT_POOL_SAFE_TO_SKIP:  return event->safe_to_skip;
   case AG_EVENT_POOL_CERT_CREATED:  return ag_cert_slot( &event->cert_created );
-  case AG_EVENT_POOL_STANDSTILL:    return event->standstill.slot;
+  case AG_EVENT_POOL_STANDSTILL:    return event->standstill;
+  case AG_EVENT_POOL_REFRESH:       return event->refresh.slot;
   default:                          FD_LOG_CRIT(( "unreachable" ));
   }
 }
@@ -351,7 +373,8 @@ should_ignore_pool_event( ag_votor_t const *      self,
                           ag_event_pool_t const * event ) {
   ulong slot = pool_event_slot( event );
   switch( event->kind ) {
-  case AG_EVENT_POOL_STANDSTILL:    return 0;
+  case AG_EVENT_POOL_STANDSTILL:
+  case AG_EVENT_POOL_REFRESH:       return 0;
   case AG_EVENT_POOL_CERT_CREATED:  return slot<first_unpruned_slot( self );
   case AG_EVENT_POOL_PARENT_READY:
   case AG_EVENT_POOL_SAFE_TO_NOTAR:
@@ -483,6 +506,10 @@ handle_cert_created( ag_votor_t *      self,
 
   case AG_CERT_KIND_FINAL:
   case AG_CERT_KIND_FAST_FINAL:
+    if( FD_UNLIKELY( self->standstill_slot!=ULONG_MAX && slot>self->standstill_slot ) ) {
+      FD_LOG_NOTICE(( "standstill detected at slot %lu ended at slot %lu, ending skip timeout extension", self->standstill_slot, slot ));
+      self->standstill_slot = ULONG_MAX;
+    }
     set_timeouts( self, ag_first_slot_in_window( slot ) );
 
     self->highest_final_cert_slot = fd_ulong_max( self->highest_final_cert_slot, slot );
@@ -590,12 +617,19 @@ ag_votor_handle_pool_event( ag_votor_t *            self,
     handle_cert_created( self, &event->cert_created );
     break;
 
-  case AG_EVENT_POOL_STANDSTILL: {
-    ag_standstill_t const * standstill = &event->standstill;
-    FD_TEST( cert_events_avail( self->cert_events )>=standstill->cert_cnt );
-    for( ulong i=0UL; i<standstill->cert_cnt; i++ ) cert_events_push( self->cert_events, (ag_event_cert_t){ .seq = self->seq++, .ts = self->now, .cert = standstill->certs[i] } );
-    FD_TEST( vote_events_avail( self->vote_events )>=standstill->vote_cnt );
-    for( ulong i=0UL; i<standstill->vote_cnt; i++ ) vote_events_push( self->vote_events, (ag_event_vote_t){ .seq = self->seq++, .ts = self->now, .vote = standstill->votes[i] } );
+  case AG_EVENT_POOL_STANDSTILL:
+    if( FD_UNLIKELY( self->standstill_slot==ULONG_MAX ) ) {
+      FD_LOG_NOTICE(( "standstill detected at finalized slot %lu, extending skip timeouts", event->standstill ));
+      self->standstill_slot = event->standstill;
+    }
+    break;
+
+  case AG_EVENT_POOL_REFRESH: {
+    ag_refresh_t const * refresh = &event->refresh;
+    FD_TEST( cert_events_avail( self->cert_events )>=refresh->cert_cnt );
+    for( ulong i=0UL; i<refresh->cert_cnt; i++ ) cert_events_push( self->cert_events, (ag_event_cert_t){ .seq = self->seq++, .ts = self->now, .cert = refresh->certs[i] } );
+    FD_TEST( vote_events_avail( self->vote_events )>=refresh->vote_cnt );
+    for( ulong i=0UL; i<refresh->vote_cnt; i++ ) vote_events_push( self->vote_events, (ag_event_vote_t){ .seq = self->seq++, .ts = self->now, .vote = refresh->votes[i] } );
     break;
   }
 

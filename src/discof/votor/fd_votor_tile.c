@@ -180,6 +180,12 @@ struct fd_votor_tile {
   ag_block_id_t *            rooted;
   publish_t *                publishes;
 
+  struct {
+    ulong finalized_slot; /* finalized slot as of the previous check */
+    long  ts;             /* when finalized_slot last advanced, or standstill was last signalled */
+    long  refresh_ts;     /* when the pool may next refresh */
+  } standstill;
+
   /* Networking */
 
   fd_pubkey_t        client_peer_id_keys[ QUIC_CONN_MAX ];
@@ -929,6 +935,25 @@ after_credit( fd_votor_tile_t *   ctx,
 
   if( FD_UNLIKELY( !ctx->init ) ) return;
 
+  /* Standstill: no new finalization in AG_DELTA_STANDSTILL_NS.  Signal
+     it again every AG_DELTA_STANDSTILL_NS for as long as it lasts, and
+     let the pool refresh messages above the finalized slot every
+     AG_REFRESH_INTERVAL_NS. */
+
+  ulong pool_finalized_slot = ag_pool_finalized_slot( ctx->pool );
+  if( FD_UNLIKELY( pool_finalized_slot!=ctx->standstill.finalized_slot ) ) {
+    ctx->standstill.finalized_slot = pool_finalized_slot;
+    ctx->standstill.ts             = now;
+  } else if( FD_UNLIKELY( now-ctx->standstill.ts>AG_DELTA_STANDSTILL_NS ) ) {
+    ag_pool_standstill( ctx->pool );
+    ctx->standstill.ts = now;
+    *charge_busy       = 1;
+  }
+  if( FD_UNLIKELY( now>=ctx->standstill.refresh_ts ) ) {
+    ag_pool_refresh( ctx->pool );
+    ctx->standstill.refresh_ts = now+AG_REFRESH_INTERVAL_NS;
+  }
+
   if( FD_UNLIKELY( ag_pool_poll_pool_event( ctx->pool, &ctx->scratch.pool_event ) ) ) {
     ag_votor_handle_pool_event( ctx->votor, &ctx->scratch.pool_event, now );
     ag_cert_t const * cert = &ctx->scratch.pool_event.cert_created;
@@ -1027,7 +1052,7 @@ after_credit( fd_votor_tile_t *   ctx,
     }
   }
 
-  if( FD_UNLIKELY( ag_votor_poll_cert_event( ctx->votor, &ctx->scratch.cert_event ) ) ) { /* a cert the pool accepted, or a standstill re-broadcast */
+  if( FD_UNLIKELY( ag_votor_poll_cert_event( ctx->votor, &ctx->scratch.cert_event ) ) ) { /* a cert the pool accepted, or a standstill refresh */
     ag_pool_add_cert( ctx->pool, &ctx->scratch.cert_event.cert, ctx->scratch.bad );
     if( FD_UNLIKELY( !fd_bls_set_is_null( ctx->scratch.bad ) ) ) ban_bad_ranks( ctx, ctx->scratch.bad, ag_cert_slot( &ctx->scratch.cert_event.cert ) );
 
@@ -1283,6 +1308,10 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->init             = 0;
   ctx->next_leader_slot = ULONG_MAX;
   for( ulong i=0UL; i<CERT_SLOT_MAX; i++ ) ctx->final_notar_join[ i ].slot = ULONG_MAX;
+
+  ctx->standstill.finalized_slot = ULONG_MAX;
+  ctx->standstill.ts             = 0L;
+  ctx->standstill.refresh_ts     = 0L;
 
   FD_TEST( tile->in_cnt<=sizeof(ctx->in_kind)/sizeof(ctx->in_kind[0]) );
   for( ulong i=0UL; i<tile->in_cnt; i++ ) {

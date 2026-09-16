@@ -78,15 +78,14 @@ is_parent_ready( ag_pool_t *           pool,
 static int
 votor_event_pop( ag_pool_t *       pool,
                  ag_event_pool_t * out ) {
-  if( FD_UNLIKELY( pool_events_empty( pool->pool_events ) ) ) return 0;
-  *out = pool_events_pop( pool->pool_events );
-  return 1;
+  return ag_pool_poll_pool_event( pool, out );
 }
 
 static void
 drain_events( ag_pool_t * pool ) {
   pool_events_remove_all  ( pool->pool_events   );
   repair_events_remove_all( pool->repair_events );
+  pool->refresh.pending = 0;
 }
 
 #define SLOTS_PER_WINDOW AG_SLOTS_PER_WINDOW
@@ -149,6 +148,37 @@ take_events( ag_pool_t * pool ) {
 static ag_event_pool_t const *
 event( ulong i ) {
   return &g_event[ i ];
+}
+
+/* take_standstill drains the pool's events and returns the slot of the
+   single standstill event among them. */
+
+static ulong
+take_standstill( ag_pool_t * pool ) {
+  ulong slot = ULONG_MAX;
+  ulong cnt  = take_events( pool );
+  for( ulong i=0UL; i<cnt; i++ ) {
+    if( event( i )->kind!=AG_EVENT_POOL_STANDSTILL ) continue;
+    FD_TEST( slot==ULONG_MAX );
+    slot = event( i )->standstill;
+  }
+  FD_TEST( slot!=ULONG_MAX );
+  return slot;
+}
+
+/* take_refresh drains the pool's events and returns the single refresh
+   event among them, or NULL.  Valid until the next take_events. */
+
+static ag_refresh_t const *
+take_refresh( ag_pool_t * pool ) {
+  ag_refresh_t const * refresh = NULL;
+  ulong                cnt     = take_events( pool );
+  for( ulong i=0UL; i<cnt; i++ ) {
+    if( event( i )->kind!=AG_EVENT_POOL_REFRESH ) continue;
+    FD_TEST( !refresh );
+    refresh = &event( i )->refresh;
+  }
+  return refresh;
 }
 
 /* At most three epoch infos are live at once: a, b and c in
@@ -968,20 +998,18 @@ test_standstill_recovery( void ) {
   ag_block_hash_t hash3; random_hash( hash3 );
   add_notar_votes( pool, slot3, hash3, 0UL, 1UL );
 
-  ag_pool_recover_from_standstill( pool );
+  ag_pool_standstill( pool );
+  FD_TEST( take_standstill( pool )==slot1 );
 
-  ag_standstill_t const * ss = NULL;
-  ulong event_cnt = take_events( pool );
-  for( ulong i=0UL; i<event_cnt; i++ ) {
-    if( event( i )->kind==AG_EVENT_POOL_STANDSTILL ) ss = &event( i )->standstill;
-  }
-  FD_TEST( ss );
-  FD_TEST( ss->slot==slot2 );
+  ag_pool_refresh( pool );
+  ag_refresh_t const * rs = take_refresh( pool );
+  FD_TEST( rs );
+  FD_TEST( rs->slot==slot1 );
 
-  ag_cert_t const * certs     = ss->certs;
-  ulong             certs_cnt = ss->cert_cnt;
-  ag_vote_t const * votes     = ss->votes;
-  ulong             votes_cnt = ss->vote_cnt;
+  ag_cert_t const * certs     = rs->certs;
+  ulong             certs_cnt = rs->cert_cnt;
+  ag_vote_t const * votes     = rs->votes;
+  ulong             votes_cnt = rs->vote_cnt;
 
   FD_TEST( certs_cnt==2UL );
   for( ulong i=0UL; i<certs_cnt; i++ ) {
@@ -1021,6 +1049,126 @@ test_standstill_recovery( void ) {
     FD_TEST( ag_cert_de( &bad, buf, sz-1UL )==AG_CERT_DE_ERR_SZ ); /* too few  */
     FD_TEST( ag_cert_de( &bad, buf, sz+1UL )==AG_CERT_DE_ERR_SZ ); /* trailing */
   }
+
+  teardown_pool( pool );
+}
+
+/* Checks a refresh batch built from slots that each hold exactly a
+   notar cert, the notar-fallback cert it implies and our own notar
+   vote, after fin_cnt certs that finalized the finalized slot. */
+
+static void
+check_refresh( ag_refresh_t const * rs,
+               ulong                fin_cnt,
+               ulong const *        slots,
+               ulong                slot_cnt ) {
+  FD_TEST( rs );
+  FD_TEST( rs->cert_cnt+rs->vote_cnt<=AG_REFRESH_MSG_MAX );
+  FD_TEST( rs->cert_cnt==fin_cnt+2UL*slot_cnt );
+  FD_TEST( rs->vote_cnt==slot_cnt );
+  for( ulong i=0UL; i<slot_cnt; i++ ) {
+    ag_cert_t const * notar          = &rs->certs[ fin_cnt+2UL*i     ];
+    ag_cert_t const * notar_fallback = &rs->certs[ fin_cnt+2UL*i+1UL ];
+    ag_vote_t const * vote           = &rs->votes[ i ];
+    FD_TEST( notar->kind==AG_CERT_KIND_NOTAR );
+    FD_TEST( ag_cert_slot( notar )==slots[ i ] );
+    FD_TEST( notar_fallback->kind==AG_CERT_KIND_NOTAR_FALLBACK );
+    FD_TEST( ag_cert_slot( notar_fallback )==slots[ i ] );
+    FD_TEST( vote->kind==AG_VOTE_KIND_NOTAR );
+    FD_TEST( ag_vote_slot( vote )==slots[ i ] );
+    FD_TEST( ag_vote_rank( vote )==0UL );
+  }
+}
+
+/* Firedancer-only test.
+
+   Agave VotingService refreshes standstill messages in batches of at
+   most STANDSTILL_REFRESH_BATCH_SIZE a second, cycling through whole
+   slots and pruning those finalization passes.  test_standstill_refresh_*
+   in voting_service.rs. */
+
+static void
+test_standstill_refresh_paced( void ) {
+  ag_pool_t * pool = setup_pool();
+
+  /* slots 1..8 each hold 3 messages, so a batch of 20 fits 6 slots */
+
+  ulong           slot_cnt = 8UL;
+  ag_block_hash_t hash[ 10 ];
+  for( ulong slot=1UL; slot<=slot_cnt; slot++ ) {
+    random_hash( hash[ slot ] );
+    add_notar_votes( pool, slot, hash[ slot ], 0UL, 7UL );
+    FD_TEST( has_notar_cert( pool, slot ) );
+  }
+  FD_TEST( ag_pool_finalized_slot( pool )==0UL );
+
+  /* nothing is refreshed before a standstill */
+
+  ag_pool_refresh( pool );
+  FD_TEST( !take_events( pool ) );
+
+  ag_pool_standstill( pool );
+  FD_TEST( take_standstill( pool )==0UL );
+
+  ag_pool_refresh( pool );
+  FD_TEST( pool_events_cnt( pool->pool_events )==1UL );
+
+  /* no new batch until the previous one is polled */
+
+  ag_pool_refresh( pool );
+  FD_TEST( pool_events_cnt( pool->pool_events )==1UL );
+  ulong const b1[] = { 1UL, 2UL, 3UL, 4UL, 5UL, 6UL };
+  check_refresh( take_refresh( pool ), 0UL, b1, 6UL );
+
+  /* the rest, then wrap around */
+
+  ag_pool_refresh( pool );
+  ulong const b2[] = { 7UL, 8UL, 1UL, 2UL, 3UL, 4UL };
+  check_refresh( take_refresh( pool ), 0UL, b2, 6UL );
+
+  ag_pool_refresh( pool );
+  ulong const b3[] = { 5UL, 6UL, 7UL, 8UL, 1UL, 2UL };
+  check_refresh( take_refresh( pool ), 0UL, b3, 6UL );
+
+  /* finalizing slot 1 prunes it and leads each batch with its fast
+     finalization cert */
+
+  fast_finalize( pool, 1UL, hash[ 1 ] );
+  FD_TEST( ag_pool_finalized_slot( pool )==1UL );
+
+  ag_pool_refresh( pool );
+  ag_refresh_t const * rs = take_refresh( pool );
+  ulong const b4[] = { 3UL, 4UL, 5UL, 6UL, 7UL, 8UL };
+  check_refresh( rs, 1UL, b4, 6UL );
+  FD_TEST( rs->slot==1UL );
+  FD_TEST( rs->certs[ 0 ].kind==AG_CERT_KIND_FAST_FINAL );
+  FD_TEST( ag_cert_slot( &rs->certs[ 0 ] )==1UL );
+
+  ag_pool_refresh( pool );
+  ulong const b5[] = { 2UL, 3UL, 4UL, 5UL, 6UL, 7UL };
+  check_refresh( take_refresh( pool ), 1UL, b5, 6UL );
+
+  /* slot 9 was not scheduled by the standstill, so it is not refreshed
+     until the next one */
+
+  random_hash( hash[ 9 ] );
+  add_notar_votes( pool, 9UL, hash[ 9 ], 0UL, 7UL );
+
+  ag_pool_refresh( pool );
+  ulong const b6[] = { 8UL, 2UL, 3UL, 4UL, 5UL, 6UL };
+  check_refresh( take_refresh( pool ), 1UL, b6, 6UL );
+
+  ag_pool_standstill( pool );
+  FD_TEST( take_standstill( pool )==1UL );
+  ag_pool_refresh( pool );
+  ulong const b7[] = { 7UL, 8UL, 9UL, 2UL, 3UL, 4UL };
+  check_refresh( take_refresh( pool ), 1UL, b7, 6UL );
+
+  /* once finalization passes every scheduled slot, refresh stops */
+
+  fast_finalize( pool, 9UL, hash[ 9 ] );
+  ag_pool_refresh( pool );
+  FD_TEST( !take_events( pool ) );
 
   teardown_pool( pool );
 }
@@ -1455,17 +1603,32 @@ test_standstill_recovery_no_final_cert( void ) {
   FD_TEST(  ag_pool_finalized_slot( pool )==0UL );
   FD_TEST( !contains_slot( pool, 0UL ) );
 
-  ag_pool_recover_from_standstill( pool );
+  /* nothing above the finalized slot, so nothing to refresh */
 
-  ag_standstill_t const * ss = NULL;
-  ulong event_cnt = take_events( pool );
-  for( ulong i=0UL; i<event_cnt; i++ ) {
-    if( event( i )->kind==AG_EVENT_POOL_STANDSTILL ) ss = &event( i )->standstill;
-  }
-  FD_TEST( ss );
-  FD_TEST( ss->slot    ==1UL ); /* finalized slot + 1 */
-  FD_TEST( ss->cert_cnt==0UL );
-  FD_TEST( ss->vote_cnt==0UL );
+  ag_pool_standstill( pool );
+  FD_TEST( take_standstill( pool )==0UL );
+  ag_pool_refresh( pool );
+  FD_TEST( !take_events( pool ) );
+
+  /* a peer's vote gives the finalized slot a slot state that still has
+     no cert, and we vote on the slot after it */
+
+  ag_block_hash_t gh;    genesis_hash( gh );
+  ag_block_hash_t hash1; random_hash( hash1 );
+  add_notar_votes( pool, 0UL, gh,    1UL, 2UL );
+  add_notar_votes( pool, 1UL, hash1, 0UL, 1UL );
+  FD_TEST( contains_slot( pool, 0UL ) );
+
+  ag_pool_standstill( pool );
+  FD_TEST( take_standstill( pool )==0UL );
+  ag_pool_refresh( pool );
+  ag_refresh_t const * rs = take_refresh( pool );
+  FD_TEST( rs );
+  FD_TEST( rs->slot    ==0UL );
+  FD_TEST( rs->cert_cnt==0UL );
+  FD_TEST( rs->vote_cnt==1UL );
+  FD_TEST( rs->votes[0].kind==AG_VOTE_KIND_NOTAR );
+  FD_TEST( ag_vote_slot( &rs->votes[0] )==1UL );
 
   teardown_pool_only( pool );
 }
@@ -1555,6 +1718,7 @@ main( int     argc,
   test_epoch_installed_late();
   test_retired_epoch_already_pruned();
   test_standstill_recovery_no_final_cert();
+  test_standstill_refresh_paced();
   test_add_block_below_watermark();
 
   FD_LOG_NOTICE(( "pass" ));

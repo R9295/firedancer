@@ -1,5 +1,7 @@
 #include "ag_votor.c"
 #include "test_ag_cert_builder.h"
+#include "ag_cert_serde.h"
+#include "ag_vote_serde.h"
 
 #define NV                 (2UL)
 #define TEST_SLOT_MAX      (64UL)
@@ -384,6 +386,127 @@ test_prunes_to_finalized_window( void ) {
   teardown_votor( votor );
 }
 
+/* Firedancer-only test.
+
+   Agave extends the skip timeout by 5% per leader window since the slot
+   a standstill was detected at, capped at an hour, until a later
+   finalization.  timers.rs::test_calculate_timeout_multiplier and
+   event_handler.rs::test_received_standstill. */
+
+static void
+test_standstill_extends_timeouts( void ) {
+  ag_votor_t * votor = setup_votor( 0L );
+
+  FD_TEST( votor->standstill_slot==ULONG_MAX );
+  FD_TEST( delta_timeout( votor, 100UL*AG_SLOTS_PER_WINDOW )==AG_DELTA_TIMEOUT_NS );
+
+  ag_event_pool_t standstill = { .kind = AG_EVENT_POOL_STANDSTILL, .standstill = 0UL };
+  ag_votor_handle_pool_event( votor, &standstill, 0L );
+  FD_TEST( votor->standstill_slot==0UL );
+  FD_TEST_NO_MSG( votor );
+
+  long t1 = AG_DELTA_TIMEOUT_NS*21L/20L;
+  long t2 = t1*21L/20L;
+  FD_TEST( delta_timeout( votor, 0UL                        )==AG_DELTA_TIMEOUT_NS );
+  FD_TEST( delta_timeout( votor, AG_SLOTS_PER_WINDOW-1UL    )==AG_DELTA_TIMEOUT_NS );
+  FD_TEST( delta_timeout( votor, AG_SLOTS_PER_WINDOW        )==t1                  );
+  FD_TEST( delta_timeout( votor, 2UL*AG_SLOTS_PER_WINDOW    )==t2                  );
+  FD_TEST( delta_timeout( votor, 1000000UL                  )==AG_TIMEOUT_MAX_NS   );
+  FD_TEST( delta_timeout( votor, ULONG_MAX                  )==AG_TIMEOUT_MAX_NS   );
+
+  /* repeated standstill signals keep the slot it was first detected at */
+
+  standstill.standstill = AG_SLOTS_PER_WINDOW;
+  ag_votor_handle_pool_event( votor, &standstill, 0L );
+  FD_TEST( votor->standstill_slot==0UL );
+
+  /* a window whose parent becomes ready now times out later than the
+     genesis window, whose timeouts were set before the standstill */
+
+  ulong slot     = 40UL*AG_SLOTS_PER_WINDOW;
+  long  extended = delta_timeout( votor, slot );
+  FD_TEST( extended>TEST_WINDOW_ELAPSED_NS );
+
+  ag_event_pool_t parent_ready = { .kind = AG_EVENT_POOL_PARENT_READY };
+  parent_ready.parent_ready.slot   = slot;
+  parent_ready.parent_ready.parent = random_block_id( slot-1UL );
+  ag_votor_handle_pool_event( votor, &parent_ready, 0L );
+
+  handle_timeouts( votor, TEST_WINDOW_ELAPSED_NS );
+  for( ulong s=1UL; s<AG_SLOTS_PER_WINDOW; s++ ) {
+    ag_vote_t msg = recv( votor );
+    FD_TEST( msg.kind==AG_VOTE_KIND_SKIP );
+    FD_TEST( ag_vote_slot( &msg )==s );
+  }
+  FD_TEST_NO_MSG( votor );
+
+  handle_timeouts( votor, extended+TEST_WINDOW_ELAPSED_NS );
+  for( ulong s=slot; s<slot+AG_SLOTS_PER_WINDOW; s++ ) {
+    ag_vote_t msg = recv( votor );
+    FD_TEST( msg.kind==AG_VOTE_KIND_SKIP );
+    FD_TEST( ag_vote_slot( &msg )==s );
+  }
+  FD_TEST_NO_MSG( votor );
+
+  /* finalizing the slot standstill was detected at does not end it,
+     finalizing past it does */
+
+  ag_vote_t       fv   = ag_vote_construct_final( sec_sign_fn, &g_sk[1], 0UL, (ushort)1, TEST_SHRED_VERSION );
+  ag_event_pool_t cert = { .kind = AG_EVENT_POOL_CERT_CREATED, .cert_created = cert_build_final( &fv.final, 1UL, g_epoch_info ) };
+  ag_votor_handle_pool_event( votor, &cert, 0L );
+  FD_TEST( votor->standstill_slot==0UL );
+
+  fv                = ag_vote_construct_final( sec_sign_fn, &g_sk[1], 1UL, (ushort)1, TEST_SHRED_VERSION );
+  cert.cert_created = cert_build_final( &fv.final, 1UL, g_epoch_info );
+  ag_votor_handle_pool_event( votor, &cert, 0L );
+  FD_TEST( votor->standstill_slot==ULONG_MAX );
+  FD_TEST( delta_timeout( votor, slot )==AG_DELTA_TIMEOUT_NS );
+
+  teardown_votor( votor );
+}
+
+/* Firedancer-only test.
+
+   Votor relays a refresh batch from the pool onto its vote and cert
+   streams unchanged. */
+
+static void
+test_refresh_relayed( void ) {
+  ag_votor_t *  votor  = setup_votor( 0L );
+  ag_block_id_t parent = genesis_block_id();
+
+  ag_vote_t vote = send_block_and_expect_notar( votor, 1UL, &parent );
+  ag_cert_t cert = cert_build_notar( &vote.notar, 1UL, g_epoch_info );
+
+  ag_event_pool_t refresh = { .kind = AG_EVENT_POOL_REFRESH };
+  refresh.refresh = (ag_refresh_t){ .slot = 0UL, .certs = &cert, .cert_cnt = 1UL, .votes = &vote, .vote_cnt = 1UL };
+  ag_votor_handle_pool_event( votor, &refresh, 0L );
+
+  uchar want[ AG_VOTE_SER_SZ( 1 ) > AG_CERT_SER_MAX ? AG_VOTE_SER_SZ( 1 ) : AG_CERT_SER_MAX ];
+  uchar got [ sizeof(want) ];
+
+  ag_vote_t msg     = recv( votor );
+  ulong     want_sz = ag_vote_ser( &vote, want );
+  FD_TEST( ag_vote_ser( &msg, got )==want_sz );
+  FD_TEST( !memcmp( got, want, want_sz ) );
+  FD_TEST_NO_MSG( votor );
+
+  ag_event_cert_t cert_event;
+  FD_TEST( ag_votor_poll_cert_event( votor, &cert_event ) );
+  want_sz = ag_cert_ser( &cert, want );
+  FD_TEST( ag_cert_ser( &cert_event.cert, got )==want_sz );
+  FD_TEST( !memcmp( got, want, want_sz ) );
+  FD_TEST( !ag_votor_poll_cert_event( votor, &cert_event ) );
+
+  /* a refresh is not a state transition: no finalize vote for the
+     refreshed notar cert */
+
+  FD_TEST( votor->standstill_slot==ULONG_MAX );
+  FD_TEST_NO_MSG( votor );
+
+  teardown_votor( votor );
+}
+
 int
 main( int     argc,
       char ** argv ) {
@@ -396,6 +519,8 @@ main( int     argc,
   test_safe_to_notar();
   test_safe_to_skip();
   test_prunes_to_finalized_window();
+  test_standstill_extends_timeouts();
+  test_refresh_relayed();
 
   FD_LOG_NOTICE(( "pass" ));
   fd_halt();
