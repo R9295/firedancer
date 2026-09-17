@@ -16,6 +16,7 @@
 #include "../../flamenco/gossip/fd_gossip_message.h"
 #include "../../flamenco/leaders/fd_leaders_base.h"
 #include "../../flamenco/leaders/fd_multi_epoch_leaders.h"
+#include "../../flamenco/stakes/fd_stake_weight.h"
 #include "../../util/net/fd_net_headers.h"
 #include "../../waltz/quic/fd_quic.h"
 #include "../../waltz/quic/fd_quic_conn.h"
@@ -32,17 +33,17 @@
 #define OUT_IDX_VOTOR (0UL)
 #define OUT_IDX_NET   (1UL)
 
-#define QUIC_CONN_MAX (AG_VAT_MAX * 2)
+#define QUIC_CONN_MAX (AG_VAT_MAX * 2) /* each validator is alloted 2 concurrent conns */
 
 #define QUIC_RECONCILE_NS         (1000000000L) /* Match Agave's one-second peer reconciliation loop. */
 #define QUIC_HANDSHAKE_TIMEOUT_NS (2000000000L) /* Bound a single outbound handshake attempt. */
 
-#define CLOSE_CODE_INVALID_IDENTITY  (2U)
-#define CLOSE_CODE_NOT_ADMITTED      (3U)
-#define CLOSE_CODE_BANNED            (4U)
-#define CLOSE_CODE_HANDSHAKE_TIMEOUT (5U)
+#define QUIC_CLOSE_CODE_UNKNOWN           (2U)
+#define QUIC_CLOSE_CODE_EVICTED           (3U)
+#define QUIC_CLOSE_CODE_BANNED            (4U)
+#define QUIC_CLOSE_CODE_HANDSHAKE_TIMEOUT (5U)
 
-#define BAN_TIMEOUT_NS (10L*1000L*1000L*1000L) /* 10 seconds */
+#define QUIC_BAN_TIMEOUT_NS (10L*1000L*1000L*1000L) /* 10 seconds */
 
 static fd_quic_limits_t quic_client_limits = {
   .conn_cnt                    = AG_VAT_MAX,
@@ -143,6 +144,53 @@ typedef struct peer peer_t;
 #define MAP_MEMOIZE           0
 #include "../../util/tmpl/fd_map.c"
 
+#define RANK_VOTERS_LG_SLOT_CNT (12) /* AG_VAT_MAX keys, fill ratio 0.49 */
+FD_STATIC_ASSERT( (1UL<<RANK_VOTERS_LG_SLOT_CNT)>=2UL*AG_VAT_MAX, rank_voters );
+
+union bls_key {
+  uchar uc[ FD_BLS_PUB_COMPRESSED_SZ ];
+  ulong ul[ FD_BLS_PUB_COMPRESSED_SZ/sizeof(ulong) ];
+};
+typedef union bls_key bls_key_t;
+
+struct bls_key_cnt {
+  bls_key_t key;
+  ulong     cnt;
+};
+typedef struct bls_key_cnt bls_key_cnt_t;
+
+#define MAP_NAME              bls_key_cnts
+#define MAP_T                 bls_key_cnt_t
+#define MAP_LG_SLOT_CNT       RANK_VOTERS_LG_SLOT_CNT
+#define MAP_KEY               key
+#define MAP_KEY_T             bls_key_t
+#define MAP_KEY_NULL          ((bls_key_t){ .ul = {0} }) /* no compressed BLS key is all zero */
+#define MAP_KEY_INVAL(k)      (!((k).ul[0]|(k).ul[1]|(k).ul[2]|(k).ul[3]|(k).ul[4]|(k).ul[5]))
+#define MAP_KEY_EQUAL(k0,k1)  (!memcmp( &(k0), &(k1), sizeof(bls_key_t) ))
+#define MAP_KEY_EQUAL_IS_SLOW 1
+#define MAP_KEY_HASH(key)     ((uint)fd_hash( 0UL, &(key), sizeof(bls_key_t) ))
+#define MAP_MEMOIZE           0
+#include "../../util/tmpl/fd_map.c"
+
+struct id_key_cnt {
+  fd_pubkey_t key;
+  ulong       cnt;
+};
+typedef struct id_key_cnt id_key_cnt_t;
+
+#define MAP_NAME              id_key_cnts
+#define MAP_T                 id_key_cnt_t
+#define MAP_LG_SLOT_CNT       RANK_VOTERS_LG_SLOT_CNT
+#define MAP_KEY               key
+#define MAP_KEY_T             fd_pubkey_t
+#define MAP_KEY_NULL          ((fd_pubkey_t){ .ul = {0} }) /* no validator identity is the zero pubkey */
+#define MAP_KEY_INVAL(k)      (!((k).ul[0]|(k).ul[1]|(k).ul[2]|(k).ul[3]))
+#define MAP_KEY_EQUAL(k0,k1)  (!memcmp( &(k0), &(k1), sizeof(fd_pubkey_t) ))
+#define MAP_KEY_EQUAL_IS_SLOW 1
+#define MAP_KEY_HASH(key)     ((uint)fd_hash( 0UL, &(key), sizeof(fd_pubkey_t) ))
+#define MAP_MEMOIZE           0
+#include "../../util/tmpl/fd_map.c"
+
 #define CERT_SLOT_MAX (4UL*AG_SLOTS_PER_WINDOW)
 
 struct final_notar_join {
@@ -200,7 +248,7 @@ struct fd_votor_tile {
   fd_quic_t *        quic_client;
   fd_quic_t *        quic_server;
   long               next_reconcile;
-  uchar              quic_tx_aio[ 128 ] __attribute__((aligned(alignof(fd_aio_t))));
+  fd_aio_t           quic_tx_aio[ 1 ];
   ushort             quic_client_listen_port;
   ushort             quic_server_listen_port;
   uint               src_ip_addr;
@@ -227,7 +275,8 @@ struct fd_votor_tile {
   ulong  votor_out_wmark;
   ulong  votor_out_chunk;
 
-  fd_stem_context_t * stem;
+  ulong                                        net_tx_cnt;
+  struct { ulong chunk; ulong sz; ulong sig; } net_tx[ FD_VOTOR_NET_BURST ];
 
   /* Scratch */
 
@@ -244,8 +293,10 @@ struct fd_votor_tile {
     ag_epoch_info_t prev_epoch_info;
     ag_epoch_info_t curr_epoch_info;
     ag_epoch_info_t next_epoch_info;
+    bls_key_cnt_t   bls_key_cnts[ 1UL<<RANK_VOTERS_LG_SLOT_CNT ];
+    id_key_cnt_t    id_key_cnts [ 1UL<<RANK_VOTERS_LG_SLOT_CNT ];
 
-    uchar ser[ AG_VOTE_SER_SZ( 1 ) > AG_CERT_SER_MAX ? AG_VOTE_SER_SZ( 1 ) : AG_CERT_SER_MAX ];
+    uchar ser[ AG_VOTE_SER_MAX > AG_CERT_SER_MAX ? AG_VOTE_SER_MAX : AG_CERT_SER_MAX ];
 
     fd_bls_set_t bad[ fd_bls_set_word_cnt ];
   } scratch;
@@ -320,12 +371,12 @@ ban_peer( peer_t * peer ) {
   FD_LOG_WARNING(( "banning peer %s", id_key_b58 ));
   if( FD_LIKELY( peer->rx_conn ) ) {
     fd_quic_conn_set_context( peer->rx_conn, NULL );
-    fd_quic_conn_close( peer->rx_conn, CLOSE_CODE_BANNED );
+    fd_quic_conn_close( peer->rx_conn, QUIC_CLOSE_CODE_BANNED );
     peer->rx_conn = NULL;
   }
   if( FD_LIKELY( peer->tx_conn ) ) {
     fd_quic_conn_set_context( peer->tx_conn, NULL );
-    fd_quic_conn_close( peer->tx_conn, CLOSE_CODE_BANNED );
+    fd_quic_conn_close( peer->tx_conn, QUIC_CLOSE_CODE_BANNED );
     peer->tx_conn          = NULL;
     peer->connect_deadline = LONG_MAX;
   }
@@ -337,13 +388,14 @@ ban_bad_ranks( fd_votor_tile_t *    ctx,
                fd_bls_set_t const * bad,
                ulong                slot_as_of ) {
   ag_epoch_info_t const * epoch_info = fd_ptr_if( slot_as_of>=ctx->next_epoch_slot, ctx->next_epoch_info, fd_ptr_if( slot_as_of>=ctx->curr_epoch_slot, ctx->curr_epoch_info, ctx->prev_epoch_info ) );
+  if( FD_UNLIKELY( !epoch_info ) ) return;
   long                    now        = fd_log_wallclock();
   for( ulong rank = fd_bls_set_const_iter_init( bad );
                    !fd_bls_set_const_iter_done( rank );
              rank = fd_bls_set_const_iter_next( bad, rank ) ) {
     fd_pubkey_t id_key; memcpy( id_key.uc, epoch_info->validators[ rank ].id_key, sizeof(ag_id_key_t) );
     peer_t * peer = peers_query( ctx->peers, id_key, NULL );
-    if( FD_UNLIKELY( !peer || now<peer->ban_ts+BAN_TIMEOUT_NS ) ) continue;
+    if( FD_UNLIKELY( !peer || now<peer->ban_ts+QUIC_BAN_TIMEOUT_NS ) ) continue;
     ban_peer( peer );
   }
 }
@@ -363,15 +415,14 @@ publish_reward_certs( fd_votor_tile_t * ctx,
     return;
   }
   ag_epoch_info_t const *       epoch_info  = state->epoch_info;
-  ag_slot_voted_stake_t const * voted_stake = &state->voted_stakes;
+  ag_slot_voted_stake_t const * voted_stake = &state->votes;
 
   uchar msg[ AG_VOTE_SIGNING_SER_MAX ];
   ulong msg_sz;
   int   err;
 
   uchar const *                      hash = voted_stake->top_notar_hash;
-  ag_slot_voted_stake_hash_t const * top  = NULL;
-  for( ulong i=0UL; i<voted_stake->notar_cnt; i++ ) if( FD_LIKELY( !memcmp( voted_stake->notar[ i ].hash, hash, sizeof(ag_block_hash_t) ) ) ) top = &voted_stake->notar[ i ];
+  ag_slot_voted_stake_hash_t const * top  = notar_map_query_const( voted_stake->notar, FD_LOAD( ag_block_hash_key_t, hash ), NULL );
   if( FD_LIKELY( top ) ) {
     fd_bls_agg_t agg = top->agg;
     msg_sz = ag_vote_signing_ser( AG_VOTE_KIND_NOTAR, slot, hash, ctx->shred_version, msg );
@@ -405,9 +456,9 @@ publish_reward_certs( fd_votor_tile_t * ctx,
 static void
 sign_ed25519( void *      signer_ctx,
               uchar       sig[ static FD_ED25519_SIG_SZ ],
-              uchar const msg[ static 130 ] ) {
+              uchar const msg[ static FD_TLS_CV_SIGN_SZ ] ) {
   fd_votor_tile_t * ctx = signer_ctx;
-  fd_keyguard_client_sign( ctx->keyguard_client, sig, msg, 130UL, FD_KEYGUARD_SIGN_TYPE_ED25519 );
+  fd_keyguard_client_sign( ctx->keyguard_client, sig, msg, FD_TLS_CV_SIGN_SZ, FD_KEYGUARD_SIGN_TYPE_ED25519 );
 }
 
 FD_STATIC_ASSERT( FD_BLS_SIG_SZ==FD_KEYGUARD_BLS_SIG_SZ, bls_sig_sz );
@@ -434,6 +485,10 @@ quic_aio_tx( void *                    _ctx,
   fd_votor_tile_t * ctx = _ctx;
 
   for( ulong i=0UL; i<batch_cnt; i++ ) {
+    if( FD_UNLIKELY( ctx->net_tx_cnt==FD_VOTOR_NET_BURST ) ) {
+      if( FD_LIKELY( opt_batch_idx ) ) *opt_batch_idx = i;
+      return FD_AIO_ERR_AGAIN;
+    }
     if( FD_UNLIKELY( batch[ i ].buf_sz<FD_NETMUX_SIG_MIN_HDR_SZ ) ) continue;
 
     ulong const sz_l2 = sizeof(fd_eth_hdr_t) + batch[ i ].buf_sz;
@@ -446,12 +501,12 @@ quic_aio_tx( void *                    _ctx,
     FD_STORE( ushort, packet_l2+offsetof( fd_eth_hdr_t, net_type ), fd_ushort_bswap( FD_ETH_HDR_TYPE_IP ) );
     fd_memcpy( packet_l3, batch[ i ].buf, batch[ i ].buf_sz );
 
-    ulong sig   = fd_disco_netmux_sig( ip_dst, 0U, ip_dst, DST_PROTO_OUTGOING, FD_NETMUX_SIG_MIN_HDR_SZ );
-    ulong chunk = ctx->net_out_chunk;
-    ulong ctl   = fd_frag_meta_ctl( 0UL, 1, 1, 0 );
-    fd_stem_publish( ctx->stem, OUT_IDX_NET, sig, chunk, sz_l2, ctl, 0L, 0L );
+    ctx->net_tx[ ctx->net_tx_cnt ].chunk = ctx->net_out_chunk;
+    ctx->net_tx[ ctx->net_tx_cnt ].sz    = sz_l2;
+    ctx->net_tx[ ctx->net_tx_cnt ].sig   = fd_disco_netmux_sig( ip_dst, 0U, ip_dst, DST_PROTO_OUTGOING, FD_NETMUX_SIG_MIN_HDR_SZ );
+    ctx->net_tx_cnt++;
 
-    ctx->net_out_chunk = fd_dcache_compact_next( chunk, FD_NET_MTU, ctx->net_out_chunk0, ctx->net_out_wmark );
+    ctx->net_out_chunk = fd_dcache_compact_next( ctx->net_out_chunk, FD_NET_MTU, ctx->net_out_chunk0, ctx->net_out_wmark );
   }
 
   if( FD_LIKELY( opt_batch_idx ) ) *opt_batch_idx = batch_cnt;
@@ -461,8 +516,8 @@ quic_aio_tx( void *                    _ctx,
 
 static void
 quic_client_conn_final( fd_quic_conn_t * conn,
-                        void *           _ctx ) {
-  fd_votor_tile_t *   ctx    = _ctx;
+                        void *           quic_ctx ) {
+  fd_votor_tile_t *   ctx    = quic_ctx;
   fd_pubkey_t const * id_key = fd_quic_conn_get_context( conn );
   if( FD_UNLIKELY( !id_key ) ) return;
   peer_t * peer = peers_query( ctx->peers, *id_key, NULL );
@@ -474,13 +529,13 @@ quic_client_conn_final( fd_quic_conn_t * conn,
 
 static void
 quic_client_conn_hs_complete( fd_quic_conn_t * conn,
-                              void *           _ctx ) {
-  fd_votor_tile_t *   ctx    = _ctx;
+                              void *           quic_ctx ) {
+  fd_votor_tile_t *   ctx    = quic_ctx;
   fd_pubkey_t const * id_key = fd_quic_conn_get_context( conn );
   if( FD_UNLIKELY( !id_key ) ) return;
 
   if( FD_LIKELY( !conn->tls_hs || memcmp( conn->tls_hs->hs.cli.server_pubkey, id_key->uc, sizeof(fd_pubkey_t) ) ) ) {
-    fd_quic_conn_close( conn, CLOSE_CODE_INVALID_IDENTITY );
+    fd_quic_conn_close( conn, QUIC_CLOSE_CODE_UNKNOWN );
     return;
   }
 
@@ -489,10 +544,11 @@ quic_client_conn_hs_complete( fd_quic_conn_t * conn,
 }
 
 static void
-quic_client_datagram_tx( fd_votor_tile_t * ctx,
-                         fd_quic_conn_t *  conn,
-                         uchar const *     buf,
-                         ulong             buf_sz ) {
+quic_client_datagram_tx( fd_votor_tile_t *   ctx,
+                         fd_stem_context_t * stem,
+                         fd_quic_conn_t *    conn,
+                         uchar const *       buf,
+                         ulong               buf_sz ) {
   uchar * packet_l2 = fd_chunk_to_laddr( ctx->net_out_mem, ctx->net_out_chunk );
   uchar * payload   = packet_l2 + sizeof(fd_ip4_udp_hdrs_t);
 
@@ -515,18 +571,19 @@ quic_client_datagram_tx( fd_votor_tile_t * ctx,
   uint  ip_dst = hdr->ip4->daddr;
   ulong sig    = fd_disco_netmux_sig( ip_dst, 0U, ip_dst, DST_PROTO_OUTGOING, FD_NETMUX_SIG_MIN_HDR_SZ );
   ulong sz_l2  = sizeof(fd_ip4_udp_hdrs_t) + pkt_sz;
-  fd_stem_publish( ctx->stem, OUT_IDX_NET, sig, ctx->net_out_chunk, sz_l2, fd_frag_meta_ctl( 0UL, 1, 1, 0 ), 0L, 0L );
+  fd_stem_publish( stem, OUT_IDX_NET, sig, ctx->net_out_chunk, sz_l2, fd_frag_meta_ctl( 0UL, 1, 1, 0 ), 0L, 0L );
   ctx->net_out_chunk = fd_dcache_compact_next( ctx->net_out_chunk, FD_NET_MTU, ctx->net_out_chunk0, ctx->net_out_wmark );
 }
 
 static void
-quic_client_broadcast( fd_votor_tile_t * ctx,
-                       uchar const *     buf,
-                       ulong             buf_sz ) {
+quic_client_broadcast( fd_votor_tile_t *   ctx,
+                       fd_stem_context_t * stem,
+                       uchar const *       buf,
+                       ulong               buf_sz ) {
   for( ulong slot=0UL; slot<peers_slot_cnt(); slot++ ) {
     peer_t const * peer = &ctx->peers[ slot ];
     if( FD_LIKELY( peers_key_inval( peer->id_key ) || !peer->tx_conn || peer->tx_conn->state!=FD_QUIC_CONN_STATE_ACTIVE ) ) continue;
-    quic_client_datagram_tx( ctx, peer->tx_conn, buf, buf_sz );
+    quic_client_datagram_tx( ctx, stem, peer->tx_conn, buf, buf_sz );
   }
 }
 
@@ -536,19 +593,20 @@ quic_client_broadcast( fd_votor_tile_t * ctx,
    There is no proof for the slot we booted from. */
 
 static void
-quic_client_refresh_final( fd_votor_tile_t * ctx ) {
+quic_client_refresh_final( fd_votor_tile_t *   ctx,
+                           fd_stem_context_t * stem ) {
   ag_slot_state_t const * state = ag_pool_slot_state( ctx->pool, ag_pool_finalized_slot( ctx->pool ) );
   if( FD_UNLIKELY( !state ) ) return;
 
   ag_slot_certs_t const * certs = &state->certs;
   if( FD_LIKELY( certs->fast_finalize.slot!=ULONG_MAX ) ) {
     ag_cert_t cert = { .kind = AG_CERT_KIND_FAST_FINAL, .fast_final = certs->fast_finalize };
-    quic_client_broadcast( ctx, ctx->scratch.ser, ag_cert_ser( &cert, ctx->scratch.ser ) );
+    quic_client_broadcast( ctx, stem, ctx->scratch.ser, ag_cert_ser( &cert, ctx->scratch.ser ) );
   } else if( FD_LIKELY( certs->finalize.slot!=ULONG_MAX && certs->notar.slot!=ULONG_MAX ) ) {
     ag_cert_t notar = { .kind = AG_CERT_KIND_NOTAR, .notar = certs->notar };
-    quic_client_broadcast( ctx, ctx->scratch.ser, ag_cert_ser( &notar, ctx->scratch.ser ) );
+    quic_client_broadcast( ctx, stem, ctx->scratch.ser, ag_cert_ser( &notar, ctx->scratch.ser ) );
     ag_cert_t final = { .kind = AG_CERT_KIND_FINAL, .final = certs->finalize };
-    quic_client_broadcast( ctx, ctx->scratch.ser, ag_cert_ser( &final, ctx->scratch.ser ) );
+    quic_client_broadcast( ctx, stem, ctx->scratch.ser, ag_cert_ser( &final, ctx->scratch.ser ) );
   }
 }
 
@@ -557,7 +615,7 @@ quic_client_connect_peer( fd_votor_tile_t * ctx,
                           peer_t *          peer,
                           long              now ) {
   if( FD_UNLIKELY( peer->tx_conn ||
-                   now<peer->ban_ts+BAN_TIMEOUT_NS ||
+                   now<peer->ban_ts+QUIC_BAN_TIMEOUT_NS ||
                    fd_pubkey_eq( &peer->id_key, &ctx->id_key ) ) ) return;
 
   contact_info_t const * ci = contact_infos_query_const( ctx->contact_infos, peer->id_key, NULL );
@@ -582,7 +640,7 @@ quic_client_reconcile( fd_votor_tile_t * ctx,
     if( FD_UNLIKELY( peer->tx_conn &&
                      ( peer->tx_conn->state==FD_QUIC_CONN_STATE_HANDSHAKE || peer->tx_conn->state==FD_QUIC_CONN_STATE_HANDSHAKE_COMPLETE ) &&
                      now>=peer->connect_deadline ) ) {
-      fd_quic_conn_close( peer->tx_conn, CLOSE_CODE_HANDSHAKE_TIMEOUT );
+      fd_quic_conn_close( peer->tx_conn, QUIC_CLOSE_CODE_HANDSHAKE_TIMEOUT );
       peer->connect_deadline = LONG_MAX;
       continue;
     }
@@ -603,8 +661,8 @@ quic_server_conn_new( fd_quic_conn_t * conn,
     fd_quic_conn_close( conn, 0U );
     return;
   }
-  if( FD_UNLIKELY( peer && fd_log_wallclock()<peer->ban_ts+BAN_TIMEOUT_NS ) ) {
-    fd_quic_conn_close( conn, CLOSE_CODE_BANNED );
+  if( FD_UNLIKELY( peer && fd_log_wallclock()<peer->ban_ts+QUIC_BAN_TIMEOUT_NS ) ) {
+    fd_quic_conn_close( conn, QUIC_CLOSE_CODE_BANNED );
     return;
   }
   ctx->server_peer_id_keys[ conn->conn_idx ] = *id_key;
@@ -659,16 +717,23 @@ quic_server_datagram_rx( fd_quic_conn_t * conn,
     if( FD_UNLIKELY( !id_key ) ) { ctx->metrics.vote_rx[ FD_METRICS_ENUM_VOTE_RX_RESULT_V_UNKNOWN_SIGNER_IDX ]++; return; }
     peer_t const * peer = peers_query( ctx->peers, *id_key, NULL );
     if( FD_UNLIKELY( !peer ) ) { ctx->metrics.vote_rx[ FD_METRICS_ENUM_VOTE_RX_RESULT_V_NOT_A_PEER_IDX ]++; return; }
-    if( FD_UNLIKELY( fd_log_wallclock()<peer->ban_ts+BAN_TIMEOUT_NS ) ) {
+    if( FD_UNLIKELY( fd_log_wallclock()<peer->ban_ts+QUIC_BAN_TIMEOUT_NS ) ) {
       ctx->metrics.vote_rx[FD_METRICS_ENUM_VOTE_RX_RESULT_V_BANNED_IDX]++;
-      fd_quic_conn_close( conn, CLOSE_CODE_BANNED );
+      fd_quic_conn_close( conn, QUIC_CLOSE_CODE_BANNED );
       return;
     }
 
     ulong  vote_slot = ag_vote_slot( vote  );
     ushort rank      = fd_ushort_if( vote_slot>=ctx->next_epoch_slot, peer->next_rank, fd_ushort_if( vote_slot>=ctx->curr_epoch_slot, peer->curr_rank, peer->prev_rank ) );
     if( FD_UNLIKELY( rank==USHORT_MAX ) ) { ctx->metrics.vote_rx[ FD_METRICS_ENUM_VOTE_RX_RESULT_V_NOT_RANKED_IDX ]++; return; } /* peer is not ranked in their vote slot's epoch */
-    ag_vote_set_rank( vote, rank );
+    switch( vote->kind ) {
+    case AG_VOTE_KIND_NOTAR:          vote->notar.rank          = rank; break;
+    case AG_VOTE_KIND_FINAL:          vote->final.rank          = rank; break;
+    case AG_VOTE_KIND_SKIP:           vote->skip.rank           = rank; break;
+    case AG_VOTE_KIND_NOTAR_FALLBACK: vote->notar_fallback.rank = rank; break;
+    case AG_VOTE_KIND_SKIP_FALLBACK:  vote->skip_fallback.rank  = rank; break;
+    default:                          FD_LOG_CRIT(( "unreachable" ));
+    }
 
     switch( ag_pool_add_vote( ctx->pool, &ctx->scratch.vote, ctx->scratch.bad ) ) {
     case AG_POOL_SUCCESS:                ctx->metrics.vote_rx[ FD_METRICS_ENUM_VOTE_RX_RESULT_V_SUCCESS_IDX            ]++; break;
@@ -699,7 +764,7 @@ quic_server_datagram_rx( fd_quic_conn_t * conn,
     if( FD_UNLIKELY( !id_key ) ) { ctx->metrics.cert_rx[ FD_METRICS_ENUM_CERT_RX_RESULT_V_UNKNOWN_SIGNER_IDX ]++; return; }
     peer_t * peer = peers_query( ctx->peers, *id_key, NULL );
     if( FD_UNLIKELY( !peer ) ) { ctx->metrics.cert_rx[ FD_METRICS_ENUM_CERT_RX_RESULT_V_NOT_A_PEER_IDX ]++; return; }
-    if( FD_UNLIKELY( fd_log_wallclock()<peer->ban_ts+BAN_TIMEOUT_NS ) ) { ctx->metrics.cert_rx[ FD_METRICS_ENUM_CERT_RX_RESULT_V_BANNED_IDX ]++; fd_quic_conn_close( conn, CLOSE_CODE_BANNED ); return; }
+    if( FD_UNLIKELY( fd_log_wallclock()<peer->ban_ts+QUIC_BAN_TIMEOUT_NS ) ) { ctx->metrics.cert_rx[ FD_METRICS_ENUM_CERT_RX_RESULT_V_BANNED_IDX ]++; fd_quic_conn_close( conn, QUIC_CLOSE_CODE_BANNED ); return; }
 
     ulong  cert_slot = ag_cert_slot( &ctx->scratch.cert );
     ushort rank      = fd_ushort_if( cert_slot>=ctx->next_epoch_slot, peer->next_rank, fd_ushort_if( cert_slot>=ctx->curr_epoch_slot, peer->curr_rank, peer->prev_rank ) );
@@ -725,22 +790,93 @@ quic_server_datagram_rx( fd_quic_conn_t * conn,
   }
 }
 
+struct rank_voter { ulong stake; uchar const * bls; ulong src; fd_bls_pub_t pk; };
+typedef struct rank_voter rank_voter_t;
+
+#define SORT_NAME        rank_voters_sort
+#define SORT_KEY_T       rank_voter_t
+#define SORT_BEFORE(a,b) ( (a).stake>(b).stake ||                                            \
+                          ( (a).stake==(b).stake &&                                         \
+                            memcmp( (a).bls, (b).bls, FD_BLS_PUB_COMPRESSED_SZ )<0 ) )
+#include "../../util/tmpl/fd_sort.c"
+
+FD_STATIC_ASSERT( sizeof(((fd_vote_stake_weight_t *)0)->bls_key)==FD_BLS_PUB_COMPRESSED_SZ, bls_key_sz );
+
+static ag_epoch_info_t *
+rank_voters( fd_votor_tile_t *              ctx,
+             ag_epoch_info_t *              mem,
+             fd_vote_stake_weight_t const * stakes,
+             ulong                          stake_cnt ) {
+  bls_key_cnt_t * bls_key_cnts = bls_key_cnts_join( bls_key_cnts_new( ctx->scratch.bls_key_cnts ) );
+  id_key_cnt_t *  id_key_cnts  = id_key_cnts_join ( id_key_cnts_new ( ctx->scratch.id_key_cnts  ) );
+
+  rank_voter_t rank[ AG_VAT_MAX ]; /* surviving validators, pre-sort */
+  ulong        in_cnt = fd_ulong_min( stake_cnt, AG_VAT_MAX );
+  ulong        m      = 0UL;
+  for( ulong i=0UL; i<in_cnt; i++ ) {
+    if( FD_UNLIKELY( !stakes[i].stake ) ) continue; /* re-check nonzero stake, in case stakes came verbatim from a snapshot */
+    uchar const * bls = stakes[i].bls_key;
+    if( FD_UNLIKELY( fd_bls_pub_de( &rank[m].pk, bls, FD_BLS_PUB_COMPRESSED_SZ ) ) ) continue; /* no / invalid BLS key */
+    rank[m].stake = stakes[i].stake;
+    rank[m].bls   = bls;
+    rank[m].src   = i;
+    m++;
+
+    bls_key_cnt_t * bls_key_cnt = bls_key_cnts_query( bls_key_cnts, FD_LOAD( bls_key_t, bls ), NULL );
+    if( FD_LIKELY( !bls_key_cnt ) ) { bls_key_cnt = bls_key_cnts_insert( bls_key_cnts, FD_LOAD( bls_key_t, bls ) ); bls_key_cnt->cnt = 0UL; }
+    bls_key_cnt->cnt++;
+    id_key_cnt_t * id_key_cnt = id_key_cnts_query( id_key_cnts, stakes[i].id_key, NULL );
+    if( FD_LIKELY( !id_key_cnt ) ) { id_key_cnt = id_key_cnts_insert( id_key_cnts, stakes[i].id_key ); id_key_cnt->cnt = 0UL; }
+    id_key_cnt->cnt++;
+  }
+
+  /* ALL copies of a duplicated BLS key or identity are dropped */
+
+  ulong k = 0UL;
+  for( ulong i=0UL; i<m; i++ ) {
+    if( FD_UNLIKELY( bls_key_cnts_query( bls_key_cnts, FD_LOAD( bls_key_t, rank[i].bls ), NULL )->cnt!=1UL ) ) continue;
+    if( FD_UNLIKELY( id_key_cnts_query ( id_key_cnts,  stakes[ rank[i].src ].id_key,       NULL )->cnt!=1UL ) ) continue;
+    rank[k++] = rank[i];
+  }
+
+  if( FD_UNLIKELY( !k ) ) { FD_LOG_WARNING(( "no validators survived ranking" )); return NULL; }
+
+  rank_voters_sort_inplace( rank, k );
+
+  ag_epoch_info_t * epoch_info = mem;
+
+  ulong total = 0UL;
+  for( ulong r=0UL; r<k; r++ ) {
+    ulong                 src = rank[r].src;
+    ag_validator_info_t * vi  = epoch_info->validators + r;
+    memset( vi, 0, sizeof(ag_validator_info_t) );
+    vi->id    = r;
+    vi->stake = stakes[src].stake;
+    memcpy( vi->id_key,   stakes[src].id_key.uc,   sizeof(ag_id_key_t)   );
+    memcpy( vi->vote_key, stakes[src].vote_key.uc, sizeof(ag_vote_key_t) );
+    vi->bls_key            = rank[r].pk;
+    epoch_info->pubkeys[r] = rank[r].pk;
+    total += vi->stake;
+  }
+  epoch_info->validator_cnt = k;
+  epoch_info->total_stake   = total;
+  return mem;
+}
+
 static void
 handle_epoch( fd_votor_tile_t *           ctx,
               fd_epoch_info_msg_t const * msg ) {
 
   ag_epoch_info_t * epoch_info;
-  if     ( FD_UNLIKELY( !ctx->curr_epoch_info ) )                      epoch_info = &ctx->scratch.curr_epoch_info;
-  else if( FD_UNLIKELY( !ctx->next_epoch_info ) )                      epoch_info = &ctx->scratch.next_epoch_info;
-  else if( FD_UNLIKELY( ctx->prev_epoch_info==ctx->curr_epoch_info ) ) epoch_info = &ctx->scratch.prev_epoch_info;
-  else                                                                 epoch_info = ctx->prev_epoch_info;
-  ag_epoch_info_rank( epoch_info, fd_epoch_info_msg_stake_weights( msg ), msg->staked_vote_cnt );
+  if     ( FD_UNLIKELY( !ctx->curr_epoch_info ) ) epoch_info = &ctx->scratch.curr_epoch_info;
+  else if( FD_UNLIKELY( !ctx->next_epoch_info ) ) epoch_info = &ctx->scratch.next_epoch_info;
+  else if( FD_UNLIKELY( !ctx->prev_epoch_info ) ) epoch_info = &ctx->scratch.prev_epoch_info;
+  else                                            epoch_info = ctx->prev_epoch_info;
+  rank_voters( ctx, epoch_info, fd_epoch_info_msg_stake_weights( msg ), msg->staked_vote_cnt );
 
   /* swap pointers */
 
   if( FD_UNLIKELY( !ctx->curr_epoch_info ) ) {
-    ctx->prev_epoch_info = epoch_info;
-    ctx->prev_epoch_slot = msg->start_slot;
     ctx->curr_epoch_info = epoch_info;
     ctx->curr_epoch_slot = msg->start_slot;
   } else {
@@ -766,7 +902,8 @@ handle_epoch( fd_votor_tile_t *           ctx,
 
   /* unmark all ranked in prev epoch */
 
-  for( ulong rank=0UL; rank<ctx->prev_epoch_info->validator_cnt; rank++ ) {
+  ulong prev_cnt = ctx->prev_epoch_info ? ctx->prev_epoch_info->validator_cnt : 0UL;
+  for( ulong rank=0UL; rank<prev_cnt; rank++ ) {
     fd_pubkey_t id_key;
     memcpy( id_key.uc, ctx->prev_epoch_info->validators[ rank ].id_key, sizeof(ag_id_key_t) );
 
@@ -842,13 +979,13 @@ handle_epoch( fd_votor_tile_t *           ctx,
     if( FD_LIKELY( peer->prev_rank!=USHORT_MAX || peer->curr_rank!=USHORT_MAX || peer->next_rank!=USHORT_MAX ) ) { slot++; continue; }
     if( FD_LIKELY( peer->tx_conn ) ) {
       fd_quic_conn_set_context( peer->tx_conn, NULL );
-      fd_quic_conn_close( peer->tx_conn, CLOSE_CODE_NOT_ADMITTED );
+      fd_quic_conn_close( peer->tx_conn, QUIC_CLOSE_CODE_EVICTED );
       peer->tx_conn          = NULL;
       peer->connect_deadline = LONG_MAX;
     }
     if( FD_LIKELY( peer->rx_conn ) ) {
       fd_quic_conn_set_context( peer->rx_conn, NULL );
-      fd_quic_conn_close( peer->rx_conn, CLOSE_CODE_NOT_ADMITTED );
+      fd_quic_conn_close( peer->rx_conn, QUIC_CLOSE_CODE_EVICTED );
       peer->rx_conn = NULL;
     }
     peers_remove( ctx->peers, peer ); /* relocates, so reconsider the freed slot */
@@ -994,13 +1131,14 @@ after_credit( fd_votor_tile_t *   ctx,
               int *               charge_busy ) {
 
   long now     = fd_log_wallclock();
-  ctx->stem    = stem;
   *charge_busy = fd_quic_service( ctx->quic_client, now ) | fd_quic_service( ctx->quic_server, now );
+  for( ulong i=0UL; i<ctx->net_tx_cnt; i++ ) fd_stem_publish( stem, OUT_IDX_NET, ctx->net_tx[ i ].sig, ctx->net_tx[ i ].chunk, ctx->net_tx[ i ].sz, fd_frag_meta_ctl( 0UL, 1, 1, 0 ), 0L, 0L );
+  ctx->net_tx_cnt = 0UL;
 
   if( FD_UNLIKELY( now>=ctx->next_reconcile ) ) {
     ctx->next_reconcile = fd_long_sat_add( now, QUIC_RECONCILE_NS );
     quic_client_reconcile( ctx, now );
-    if( FD_LIKELY( ctx->init ) ) quic_client_refresh_final( ctx );
+    if( FD_LIKELY( ctx->init ) ) quic_client_refresh_final( ctx, stem );
     *charge_busy = 1;
   }
 
@@ -1118,12 +1256,12 @@ after_credit( fd_votor_tile_t *   ctx,
     ulong                   vote_slot  = ag_vote_slot( &ctx->scratch.vote_event.vote );
     ag_epoch_info_t const * epoch_info = fd_ptr_if( vote_slot>=ctx->next_epoch_slot, ctx->next_epoch_info, fd_ptr_if( vote_slot>=ctx->curr_epoch_slot, ctx->curr_epoch_info, ctx->prev_epoch_info ) );
     ulong                   rank       = ag_vote_rank( &ctx->scratch.vote_event.vote );
-    if( FD_LIKELY( vote_slot>=ctx->prev_epoch_slot && epoch_info && rank<epoch_info->validator_cnt ) ) {
+    if( FD_LIKELY( epoch_info && rank<epoch_info->validator_cnt ) ) {
       ag_pool_add_vote( ctx->pool, &ctx->scratch.vote_event.vote, ctx->scratch.bad );
       if( FD_UNLIKELY( !fd_bls_set_is_null( ctx->scratch.bad ) ) ) ban_bad_ranks( ctx, ctx->scratch.bad, vote_slot );
 
       ulong ser_sz = ag_vote_ser( &ctx->scratch.vote_event.vote, ctx->scratch.ser );
-      quic_client_broadcast( ctx, ctx->scratch.ser, ser_sz );
+      quic_client_broadcast( ctx, stem, ctx->scratch.ser, ser_sz );
 
       *charge_busy = 1;
     }
@@ -1134,15 +1272,15 @@ after_credit( fd_votor_tile_t *   ctx,
     if( FD_UNLIKELY( !fd_bls_set_is_null( ctx->scratch.bad ) ) ) ban_bad_ranks( ctx, ctx->scratch.bad, ag_cert_slot( &ctx->scratch.cert_event.cert ) );
 
     ulong ser_sz = ag_cert_ser( &ctx->scratch.cert_event.cert, ctx->scratch.ser );
-    quic_client_broadcast( ctx, ctx->scratch.ser, ser_sz );
+    quic_client_broadcast( ctx, stem, ctx->scratch.ser, ser_sz );
 
     /* A slow FINAL can arrive before its NOTAR.  In that ordering, processing
        the later NOTAR is what advances the finality tracker, so root whenever
        any certificate event moves the finalized slot. */
 
-    ulong           finalized_slot = ag_pool_finalized_slot( ctx->pool );
-    ag_block_hash_t finalized_hash;
-    if( FD_LIKELY( finalized_slot>ctx->rooted_block_id.slot && ag_pool_finalized_block_hash( ctx->pool, finalized_slot, finalized_hash ) ) ) {
+    ulong         finalized_slot = ag_pool_finalized_slot( ctx->pool );
+    uchar const * finalized_hash = ag_pool_finalized_block_hash( ctx->pool );
+    if( FD_LIKELY( finalized_hash && finalized_slot>ctx->rooted_block_id.slot ) ) {
       try_advance_root( ctx, ag_block_id( finalized_slot, finalized_hash ) );
     }
     *charge_busy = 1;
@@ -1256,8 +1394,6 @@ after_frag( fd_votor_tile_t *   ctx,
             fd_stem_context_t * stem ) {
   (void)seq; (void)tsorig; (void)tspub;
 
-  ctx->stem = stem;
-
   switch( ctx->in_kind[ in_idx ] ) {
   case IN_KIND_EPOCH:
     /* reliable link, handled in during_frag */
@@ -1281,6 +1417,8 @@ after_frag( fd_votor_tile_t *   ctx,
     if( FD_UNLIKELY( dport!=ctx->quic_client_listen_port && dport!=ctx->quic_server_listen_port ) ) break;
     fd_quic_t * quic = fd_ptr_if( dport==ctx->quic_client_listen_port, ctx->quic_client, ctx->quic_server );
     fd_quic_process_packet( quic, ctx->net_buf+sizeof(fd_eth_hdr_t), sz-sizeof(fd_eth_hdr_t), fd_log_wallclock() );
+    for( ulong i=0UL; i<ctx->net_tx_cnt; i++ ) fd_stem_publish( stem, OUT_IDX_NET, ctx->net_tx[ i ].sig, ctx->net_tx[ i ].chunk, ctx->net_tx[ i ].sz, fd_frag_meta_ctl( 0UL, 1, 1, 0 ), 0L, 0L );
+    ctx->net_tx_cnt = 0UL;
     break;
   }
   case IN_KIND_REPLAY:
@@ -1387,6 +1525,7 @@ unprivileged_init( fd_topo_t const *      topo,
   FD_TEST( ctx->mleaders );
 
   ctx->init             = 0;
+  ctx->net_tx_cnt       = 0UL;
   ctx->next_leader_slot = ULONG_MAX;
   for( ulong i=0UL; i<CERT_SLOT_MAX; i++ ) ctx->final_notar_join[ i ].slot = ULONG_MAX;
 
@@ -1427,6 +1566,7 @@ unprivileged_init( fd_topo_t const *      topo,
 
   fd_topo_link_t const * net_out = &topo->links[ tile->out_link_id[ OUT_IDX_NET ] ];
   FD_TEST( !strcmp( net_out->name, "votor_net" ) );
+  FD_TEST( net_out->burst>=FD_VOTOR_NET_BURST );
   ctx->net_out_mem    = topo->workspaces[ topo->objs[ net_out->dcache_obj_id ].wksp_id ].wksp;
   ctx->net_out_chunk0 = fd_dcache_compact_chunk0( ctx->net_out_mem, net_out->dcache );
   ctx->net_out_wmark  = fd_dcache_compact_wmark ( ctx->net_out_mem, net_out->dcache, net_out->mtu );

@@ -104,7 +104,7 @@ test_client_reconnect( void ) {
   mock_close_call_cnt   = 0UL;
   mock_close_reason     = 0U;
 
-  long const start = BAN_TIMEOUT_NS+10L*QUIC_RECONCILE_NS;
+  long const start = QUIC_BAN_TIMEOUT_NS+10L*QUIC_RECONCILE_NS;
 
   /* A transient synchronous fd_quic_connect failure leaves no sticky state;
      the next reconciliation attempts the peer again. */
@@ -131,7 +131,7 @@ test_client_reconnect( void ) {
 
   quic_client_reconcile( ctx, deadline );
   FD_TEST( mock_close_call_cnt==1UL );
-  FD_TEST( mock_close_reason==CLOSE_CODE_HANDSHAKE_TIMEOUT );
+  FD_TEST( mock_close_reason==QUIC_CLOSE_CODE_HANDSHAKE_TIMEOUT );
   FD_TEST( peer->tx_conn==first );
   FD_TEST( peer->connect_deadline==LONG_MAX );
   FD_TEST( mock_connect_call_cnt==2UL );

@@ -84,12 +84,12 @@ struct __attribute__((aligned(128UL))) ag_votor {
   ulong           highest_final_cert_slot;
   ulong           standstill_slot; /* highest finalized slot when standstill was detected, ULONG_MAX if not in standstill */
 
-  ulong        prev_epoch_rank;
-  ulong        prev_epoch_slot;
-  ulong        curr_epoch_rank;
-  ulong        curr_epoch_slot;
-  ulong        next_epoch_rank;
-  ulong        next_epoch_slot;
+  ulong prev_epoch_rank;
+  ulong prev_epoch_slot;
+  ulong curr_epoch_rank;
+  ulong curr_epoch_slot;
+  ulong next_epoch_rank;
+  ulong next_epoch_slot;
 
   ag_event_vote_t * vote_events;
   ag_event_cert_t * cert_events;
@@ -171,7 +171,7 @@ ag_votor_align( void ) {
 ulong
 ag_votor_footprint( ulong slot_max ) {
   if( FD_UNLIKELY( slot_max<AG_SLOTS_PER_WINDOW ) ) return 0UL;
-  ulong events_max = 2UL*slot_max;
+  ulong events_max = slot_max*( AG_NOTAR_FALLBACK_CERT_MAX + 1UL /* notar */ + 1UL /* skip */ ); /* a standstill bundle, see ag_pool_footprint */
   ulong slot_state_chain_cnt = slot_state_map_chain_cnt_est( slot_max );
   return FD_LAYOUT_FINI(
     FD_LAYOUT_APPEND(
@@ -215,7 +215,7 @@ ag_votor_new( void * mem,
   }
   fd_memset( mem, 0, footprint );
 
-  ulong events_max           = 2UL*slot_max;
+  ulong events_max           = slot_max*( AG_NOTAR_FALLBACK_CERT_MAX + 1UL /* notar */ + 1UL /* skip */ );
   ulong slot_state_chain_cnt = slot_state_map_chain_cnt_est( slot_max );
 
   FD_SCRATCH_ALLOC_INIT( l, mem );
@@ -238,11 +238,11 @@ ag_votor_new( void * mem,
   votor->slot_states->map        = slot_state_map_join ( slot_state_map_new ( slot_state_map,  slot_state_chain_cnt, seed ) );
   votor->highest_final_cert_slot = ULONG_MAX;
   votor->standstill_slot         = ULONG_MAX;
-  votor->prev_epoch_rank         = 0UL;
+  votor->prev_epoch_rank         = USHORT_MAX;
   votor->prev_epoch_slot         = ULONG_MAX;
-  votor->curr_epoch_rank         = 0UL;
+  votor->curr_epoch_rank         = USHORT_MAX;
   votor->curr_epoch_slot         = ULONG_MAX;
-  votor->next_epoch_rank         = 0UL;
+  votor->next_epoch_rank         = USHORT_MAX;
   votor->next_epoch_slot         = ULONG_MAX;
   votor->vote_events             = vote_events_join( vote_events_new( vote_events, events_max ) );
   votor->cert_events             = cert_events_join( cert_events_new( cert_events, events_max ) );
@@ -544,8 +544,6 @@ ag_votor_advance_epoch( ag_votor_t * self,
                         ulong        epoch_rank,
                         ulong        epoch_slot ) {
   if( FD_UNLIKELY( self->curr_epoch_slot==ULONG_MAX ) ) {
-    self->prev_epoch_rank = epoch_rank;
-    self->prev_epoch_slot = epoch_slot;
     self->curr_epoch_rank = epoch_rank;
     self->curr_epoch_slot = epoch_slot;
   } else if( FD_UNLIKELY( self->next_epoch_slot==ULONG_MAX ) ) {

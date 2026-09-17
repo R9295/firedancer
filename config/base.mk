@@ -4,7 +4,6 @@ BUILDDIR:=$(BUILDDIR1)
 endif
 
 VERBOSE?=0
-SHELL:=bash
 CPPFLAGS:=
 RUSTFLAGS:=-C force-frame-pointers=yes
 CFLAGS=-std=c17 -fwrapv
@@ -12,7 +11,8 @@ LDFLAGS:=-lm -ldl
 LDFLAGS_EXE:=
 LDFLAGS_SO:=-shared
 AR:=ar
-ARFLAGS:=rcs
+# thin archives; BSD/cctools ar (macOS) has no T (it truncates names)
+ARFLAGS:=$(if $(findstring darwin,$(MAKE_HOST)),rcs,rcsT)
 RANLIB:=ranlib
 CP:=cp -p
 RM:=rm -f
@@ -47,18 +47,41 @@ GENHTML=genhtml
 # Parameters passed to libFuzzer tests
 FUZZFLAGS:=-max_total_time=600 -timeout=10 -runs=10
 
-# Obtain compiler version so that decisions can be made on disabling/enabling
-# certain flags
-CC_MAJOR_VERSION:=$(shell $(CC) -dumpversion | cut -f1 -d.)
+# $(call which,name): first executable on PATH; a name with a slash resolves as-is
+which = $(if $(findstring /,$(1)),$(1),$(shell command -v $(1) 2>/dev/null))
+
+# Compiler version keys the default build dir and gates version-specific
+# flags.
+cc-version = $(or $(firstword $(shell $(1) -dumpfullversion -dumpversion)),unknown)
+ifneq ($(CC),$(CC_VERSION_OF))
+CC_VERSION:=$(call cc-version,$(CC))
+CC_VERSION_OF:=$(CC)
+endif
+CC_MAJOR_VERSION:=$(firstword $(subst ., ,$(filter-out unknown,$(CC_VERSION))))
 
 # Default _FORTIFY_SOURCE level
 FORTIFY_SOURCE?=2
 
-# Prefer LLD when available
+# linker: mold, else lld (compiler >= 9), else the toolchain default
 ifeq ($(CROSS),)
-ifneq ($(shell command -v ld.lld 2>/dev/null),)
-ifeq ($(shell test $(CC_MAJOR_VERSION) -ge 9 2>/dev/null && echo ok),ok)
+MOLD:=$(call which,mold)
+ifneq ($(CC_MAJOR_VERSION),)
+ifneq ($(MOLD),)
+ifeq ($(filter 0 1 2 3 4 5 6 7 8 9 10 11,$(CC_MAJOR_VERSION)),)
+LDFLAGS+=-fuse-ld=mold
+else
+MOLD_DIR:=$(firstword $(wildcard $(realpath $(dir $(realpath $(MOLD)))../libexec/mold)))
+ifeq ($(MOLD_DIR),)
+MOLD_DIR:=$(BASEDIR)/mold-ld
+_:=$(shell mkdir -p $(MOLD_DIR) && ln -sfn $(realpath $(MOLD)) $(MOLD_DIR)/ld)
+endif
+LDFLAGS+=-B$(MOLD_DIR)/
+endif
+LDFLAGS+=-Wl,-X
+else ifneq ($(call which,ld.lld),)
+ifeq ($(filter 0 1 2 3 4 5 6 7 8,$(CC_MAJOR_VERSION)),)
 LDFLAGS+=-fuse-ld=lld
+endif
 endif
 endif
 endif

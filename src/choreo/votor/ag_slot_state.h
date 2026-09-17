@@ -6,6 +6,7 @@
 #include "ag_epoch_info.h"
 #include "ag_event.h"
 #include "ag_vote.h"
+#include "../../util/fd_hash32.h"
 
 #define AG_PARENT_STATUS_KNOWN     (1)
 #define AG_PARENT_STATUS_CERTIFIED (2)
@@ -21,12 +22,44 @@
 #define AG_SLOT_STATE_OUT_EVENT_MAX  (3UL)
 #define AG_SLOT_STATE_OUT_REPAIR_MAX (3UL)
 
+#define AG_NOTAR_MAP_LG_SLOT_CNT          (11)
+#define AG_NOTAR_FALLBACK_MAP_LG_SLOT_CNT (13)
+FD_STATIC_ASSERT( AG_VAT_MAX                           <(1UL<<AG_NOTAR_MAP_LG_SLOT_CNT         ), notar_map          );
+FD_STATIC_ASSERT( AG_VAT_MAX*AG_NOTAR_FALLBACK_VOTE_MAX<(1UL<<AG_NOTAR_FALLBACK_MAP_LG_SLOT_CNT), notar_fallback_map );
+
 struct ag_slot_voted_stake_hash {
-  ag_block_hash_t hash;
-  ulong           stake;
-  fd_bls_agg_t    agg;
+  ag_block_hash_key_t hash;
+  ulong               stake;
+  fd_bls_agg_t        agg;
 };
 typedef struct ag_slot_voted_stake_hash ag_slot_voted_stake_hash_t;
+
+#define MAP_NAME              notar_map
+#define MAP_T                 ag_slot_voted_stake_hash_t
+#define MAP_LG_SLOT_CNT       AG_NOTAR_MAP_LG_SLOT_CNT
+#define MAP_KEY               hash
+#define MAP_KEY_T             ag_block_hash_key_t
+#define MAP_KEY_NULL          ((ag_block_hash_key_t){ .ul = { ULONG_MAX, ULONG_MAX, ULONG_MAX, ULONG_MAX } })
+#define MAP_KEY_INVAL(k)      (((k).ul[0]&(k).ul[1]&(k).ul[2]&(k).ul[3])==ULONG_MAX)
+#define MAP_KEY_EQUAL(k0,k1)  (!memcmp( &(k0), &(k1), sizeof(ag_block_hash_key_t) ))
+#define MAP_KEY_EQUAL_IS_SLOW 1
+#define MAP_KEY_HASH(key)     ((uint)fd_hash32( (key).uc, 42UL ))
+#define MAP_MEMOIZE           0
+#include "../../util/tmpl/fd_map.c"
+
+#define MAP_NAME              notar_fallback_map
+#define MAP_T                 ag_slot_voted_stake_hash_t
+#define MAP_LG_SLOT_CNT       AG_NOTAR_FALLBACK_MAP_LG_SLOT_CNT
+#define MAP_KEY               hash
+#define MAP_KEY_T             ag_block_hash_key_t
+#define MAP_KEY_NULL          ((ag_block_hash_key_t){ .ul = { ULONG_MAX, ULONG_MAX, ULONG_MAX, ULONG_MAX } })
+#define MAP_KEY_INVAL(k)      (((k).ul[0]&(k).ul[1]&(k).ul[2]&(k).ul[3])==ULONG_MAX)
+#define MAP_KEY_EQUAL(k0,k1)  (!memcmp( &(k0), &(k1), sizeof(ag_block_hash_key_t) ))
+#define MAP_KEY_EQUAL_IS_SLOW 1
+#define MAP_KEY_HASH(key)     ((uint)fd_hash32( (key).uc, 42UL ))
+#define MAP_MEMOIZE           0
+#include "../../util/tmpl/fd_map.c"
+
 
 struct ag_parent_status {
   ag_block_hash_t hash;
@@ -40,23 +73,13 @@ struct ag_block_hash_set {
 };
 typedef struct ag_block_hash_set ag_block_hash_set_t;
 
-struct ag_slot_votes {
-  ag_vote_notar_t          notar             [AG_VAT_MAX];
-  ag_vote_notar_fallback_t notar_fallback    [AG_VAT_MAX][AG_NOTAR_FALLBACK_VOTE_MAX];
-  uchar                    notar_fallback_cnt[AG_VAT_MAX];
-  ag_vote_skip_t           skip              [AG_VAT_MAX];
-  ag_vote_skip_fallback_t  skip_fallback     [AG_VAT_MAX];
-  ag_vote_final_t          finalize          [AG_VAT_MAX];
-};
-typedef struct ag_slot_votes ag_slot_votes_t;
-
 struct ag_slot_voted_stake {
-  ag_slot_voted_stake_hash_t notar[AG_VAT_MAX];
-  ulong                      notar_cnt;
+  ag_slot_voted_stake_hash_t notar[ 1UL<<AG_NOTAR_MAP_LG_SLOT_CNT ];
   fd_bls_sig_t               notar_sig[ AG_VAT_MAX ];
-  ag_slot_voted_stake_hash_t notar_fallback[AG_VAT_MAX * AG_NOTAR_FALLBACK_VOTE_MAX];
-  ulong                      notar_fallback_cnt;
+  ag_slot_voted_stake_hash_t notar_fallback[ 1UL<<AG_NOTAR_FALLBACK_MAP_LG_SLOT_CNT ];
   fd_bls_sig_t               notar_fallback_sig[ AG_VAT_MAX ][ AG_NOTAR_FALLBACK_VOTE_MAX ];
+  ag_block_hash_t            notar_fallback_sig_hash[ AG_VAT_MAX ][ AG_NOTAR_FALLBACK_VOTE_MAX ];
+  uchar                      notar_fallback_sig_cnt[ AG_VAT_MAX ];
   ulong                      skip;
   fd_bls_sig_t               skip_sig[ AG_VAT_MAX ];
   fd_bls_agg_t               skip_agg;
@@ -83,8 +106,7 @@ struct ag_slot_certs {
 typedef struct ag_slot_certs ag_slot_certs_t;
 
 struct __attribute__((aligned(128UL))) ag_slot_state {
-  ag_slot_votes_t       votes;
-  ag_slot_voted_stake_t voted_stakes;
+  ag_slot_voted_stake_t votes; /* the reference's votes and voted_stakes combined */
   ag_slot_certs_t       certs;
 
   ag_parent_status_t parents[ AG_EQVOC_BLOCK_HASH_MAX ];
@@ -94,8 +116,9 @@ struct __attribute__((aligned(128UL))) ag_slot_state {
   ag_block_hash_set_t sent_safe_to_notar;
   int                 sent_safe_to_skip;
 
-  ulong slot;
-  ulong own_rank;
+  ulong  slot;
+  ulong  own_rank;
+  ushort shred_version;
 
   ag_epoch_info_t const * epoch_info;
 };
@@ -141,11 +164,6 @@ ag_slot_state_check_slashable_offence( ag_slot_state_t const * self,
 FD_FN_PURE int
 ag_slot_state_should_ignore_vote( ag_slot_state_t const * self,
                                   ag_vote_t const *       vote );
-
-FD_FN_PURE ulong
-ag_slot_state_stake( ag_slot_voted_stake_hash_t const * ele,
-                     ulong                              cnt,
-                     ag_block_hash_t const              block_hash );
 
 FD_FN_PURE int
 ag_slot_state_is_notar_fallback( ag_slot_state_t const * self,

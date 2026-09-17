@@ -4,11 +4,11 @@
 
 #define _GNU_SOURCE
 #include "fd_runtime.h"
-#include "fd_runtime_stack.h"
+#include "fd_runtime_stack_tmpl.h"
 #include "fd_bank.h"
 #include "fd_system_ids.h"
 #include "program/fd_vote_program.h"
-#include "program/vote/fd_vote_codec.h"
+#include "program/vote/fd_vote_codec_tmpl.h"
 #include "sysvar/fd_sysvar_rent.h"
 #include "sysvar/fd_sysvar_epoch_schedule.h"
 #include "sysvar/fd_sysvar_stake_history.h"

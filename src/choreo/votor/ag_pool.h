@@ -106,10 +106,8 @@ ag_pool_refresh( ag_pool_t * self );
 FD_FN_PURE ulong
 ag_pool_finalized_slot( ag_pool_t const * self );
 
-int
-ag_pool_finalized_block_hash( ag_pool_t const * self,
-                              ulong             slot,
-                              ag_block_hash_t   out_hash );
+FD_FN_PURE uchar const *
+ag_pool_finalized_block_hash( ag_pool_t const * self );
 
 ag_block_id_t const *
 ag_pool_parents_ready( ag_pool_t * self,

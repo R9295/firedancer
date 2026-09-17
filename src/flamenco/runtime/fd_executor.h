@@ -2,6 +2,7 @@
 #define HEADER_fd_src_flamenco_runtime_fd_executor_h
 
 #include "info/fd_instr_info.h"
+#include "../../util/spad/fd_spad.h"
 #include "../../disco/fd_txn_p.h"
 #include "sysvar/fd_sysvar_rent.h"
 
@@ -50,8 +51,8 @@ fd_executor_check_transactions( fd_runtime_t *      runtime,
                                 fd_txn_out_t *      txn_out );
 
 /* fd_execute_instr creates a new fd_exec_instr_ctx_t and performs
-   instruction processing.  Does fd_spad_t allocations.  Returns an
-   error code in FD_EXECUTOR_INSTR_{ERR_{...},SUCCESS}.
+   instruction processing.  Returns an error code in
+   FD_EXECUTOR_INSTR_{ERR_{...},SUCCESS}.
 
    IMPORTANT: instr_info must have the same lifetime as txn_ctx. This can
    be achieved by using fd_executor_acquire_instr_info_elem( txn_ctx ) to

@@ -3,6 +3,7 @@
 
 #include "fd_tls_estate.h"
 #include "../../ballet/chacha/fd_chacha_rng.h"
+#include "../../ballet/ed25519/fd_ed25519.h"
 #include "../../ballet/x509/fd_x509_ca_store.h"
 
 /* fd_tls implements a subset of the TLS v1.3 (RFC 8446) handshake
@@ -19,6 +20,11 @@
    Peers are authenticated with X.509 certificates containing Ed25519
    public keys.  Client cert authentication is optional for
    fd_tls_client_t and mandatory for fd_tls_server_t.
+
+   Outside of QUIC mode, the client additionally accepts servers with
+   ECDSA P-256 and RSA (2048 to 4096 bit) leaf keys, signing the
+   handshake with ecdsa_secp256r1_sha256 or rsa_pss_rsae_sha{256,384,
+   512}, so that it can talk to Web PKI servers.
 
    ### Key Exchange
 
@@ -62,6 +68,15 @@
 
      RFC 5288: AES Galois Counter Mode (GCM) Cipher Suites for TLS
      https://datatracker.ietf.org/doc/html/rfc5288 */
+
+/* Constants **********************************************************/
+
+/* FD_TLS_CV_SIGN_SZ is the size of the TLS 1.3 CertificateVerify
+   signing payload: 64 bytes of 0x20 padding, the 33 byte context
+   string, a zero separator and the 32 byte transcript hash (RFC 8446,
+   Section 4.4.3). */
+
+#define FD_TLS_CV_SIGN_SZ (130UL)
 
 /* Callbacks **********************************************************/
 
@@ -126,8 +141,9 @@ typedef void
 
    ctx is an arbitrary pointer that is provided as a callback argument.
    sig points to a 64 byte buffer where the implementor should store the
-   ed25519 signature of the payload.  Payload will point to a 130 byte
-   buffer containing the TLS 1.3 CertificateVerify payload.
+   ed25519 signature of the payload.  Payload will point to a
+   FD_TLS_CV_SIGN_SZ byte buffer containing the TLS 1.3 CertificateVerify
+   payload.
 
    This function must not fail.  Lifetime of the payload buffer ends at
    return.
@@ -142,8 +158,8 @@ typedef void
 
 typedef void
 (* fd_tls_sign_fn_t)( void *        ctx,
-                      uchar         sig[ static 64 ],
-                      uchar const   payload[ static 130 ] );
+                      uchar         sig[ static FD_ED25519_SIG_SZ ],
+                      uchar const   payload[ static FD_TLS_CV_SIGN_SZ ] );
 
 struct fd_tls_sign_vt {
   void *           ctx;
@@ -154,8 +170,8 @@ typedef struct fd_tls_sign_vt fd_tls_sign_t;
 
 static inline void
 fd_tls_sign( fd_tls_sign_t const * sign,
-             uchar                 sig[ static 64 ],
-             uchar const           payload[ static 130 ] ) {
+             uchar                 sig[ static FD_ED25519_SIG_SZ ],
+             uchar const           payload[ static FD_TLS_CV_SIGN_SZ ] ) {
   sign->sign_fn( sign->ctx, sig, payload );
 }
 
@@ -288,6 +304,7 @@ typedef struct fd_tls fd_tls_t;
 #define FD_TLS_REASON_WRONG_PUBKEY    (11)  /* peer cert has different pubkey than expected */
 #define FD_TLS_REASON_ED25519_FAIL    (12)  /* Ed25519 signature validation failed */
 #define FD_TLS_REASON_SECP256R1_FAIL  (14)  /* ECDSA P-256 signature validation failed */
+#define FD_TLS_REASON_RSA_FAIL        (15)  /* RSA-PSS signature validation failed */
 
 #define FD_TLS_REASON_CH_EXPECTED    (101)  /* wanted ClientHello, got another msg type */
 #define FD_TLS_REASON_CH_PARSE       (103)  /* failed to parse ClientHello */

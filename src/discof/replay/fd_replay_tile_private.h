@@ -3,7 +3,6 @@
 
 #include "fd_vote_tracker.h"
 #include "../../disco/fd_clock_tile.h"
-#include "../../disco/topo/fd_wksp_mon.h"
 #include "../../disco/store/fd_store.h"
 #include "../../disco/bundle/fd_bundle_crank.h"
 #include "../../disco/keyguard/fd_keyswitch.h"
@@ -443,6 +442,7 @@ struct fd_replay_tile {
   fd_block_footer_t leader_footer[ 1 ];
 
   fd_votor_certed_t votor_final[ 1 ];                                                /* ALPENGLOW-ONLY: highest finalization, fast over slow at the same slot */
+  fd_votor_leader_t votor_leader[ 1 ];                                               /* ALPENGLOW-ONLY: ParentReady trigger behind next_leader_slot     */
   fd_votor_reward_t votor_reward[ FD_NUM_SLOTS_FOR_REWARD+AG_SLOTS_PER_WINDOW+1UL ];
 
   ulong       next_leader_slot;

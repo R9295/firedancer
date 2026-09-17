@@ -13,7 +13,6 @@ ZSTD_OBJS:=\
   compress/zstd_compress_superblock \
   compress/zstd_double_fast \
   compress/zstd_fast \
-  compress/zstd_lazy \
   compress/zstd_ldm \
   compress/zstd_opt \
   compress/zstd_preSplit \
@@ -22,7 +21,10 @@ ZSTD_OBJS:=\
   decompress/zstd_decompress \
   decompress/zstd_decompress_block
 
-ZSTD_CFLAGS_NOWARN:=$(filter-out -W%,$(filter-out -Werror,$(CPPFLAGS) $(CFLAGS))) -DZSTD_TRACE=0 -DDEBUGLEVEL=0 -DZSTD_LEGACY_SUPPORT=0 -DZSTD_ASAN_DONT_POISON_WORKSPACE=1 -DZSTD_MSAN_DONT_POISON_WORKSPACE=1
+ZSTD_DEFS:=-DZSTD_TRACE=0 -DDEBUGLEVEL=0 -DZSTD_LEGACY_SUPPORT=0 -DZSTD_ASAN_DONT_POISON_WORKSPACE=1 -DZSTD_MSAN_DONT_POISON_WORKSPACE=1
+# levels 4-15 (zstd_lazy.c) unused: callers use 1, 3, 19; an excluded level cascades to dfast
+ZSTD_DEFS+=-DZSTD_EXCLUDE_GREEDY_BLOCK_COMPRESSOR -DZSTD_EXCLUDE_LAZY_BLOCK_COMPRESSOR -DZSTD_EXCLUDE_LAZY2_BLOCK_COMPRESSOR -DZSTD_EXCLUDE_BTLAZY2_BLOCK_COMPRESSOR
+ZSTD_CFLAGS_NOWARN:=$(filter-out -W%,$(filter-out -Werror,$(CPPFLAGS) $(CFLAGS))) $(ZSTD_DEFS)
 # huf_decompress_amd64.S is the only asm; keep the C path for machines
 # without FD_HAS_X86 (noarch etc.) so it stays exercised.
 ifndef FD_HAS_X86
@@ -30,21 +32,18 @@ ZSTD_CFLAGS_NOWARN+=-DZSTD_DISABLE_ASM
 endif
 
 $(OBJDIR)/obj/third_party/zstd/lib/%.o : src/third_party/zstd/lib/%.c $(OBJDIR)/.flags src/third_party/zstd/Local.mk
-	@echo -e "CC\t$(notdir $@)"
-	$(Q)$(MKDIR) $(dir $@) && \
-$(CC) $(ZSTD_CFLAGS_NOWARN) $(DEPFLAGS) -c $< -o $@ && $(DEPFIX)
+	@$(info CC$(TAB)$(notdir $@))
+	$(Q)$(CC) $(ZSTD_CFLAGS_NOWARN) $(DEPFLAGS) -c $< -o $@ && $(DEPFIX)
 
 # upstream builds this TU with -fno-tree-vectorize
 $(OBJDIR)/obj/third_party/zstd/lib/decompress/zstd_decompress_block.o : src/third_party/zstd/lib/decompress/zstd_decompress_block.c $(OBJDIR)/.flags src/third_party/zstd/Local.mk
-	@echo -e "CC\t$(notdir $@)"
-	$(Q)$(MKDIR) $(dir $@) && \
-$(CC) $(ZSTD_CFLAGS_NOWARN) $(DEPFLAGS) -fno-tree-vectorize -c $< -o $@ && $(DEPFIX)
+	@$(info CC$(TAB)$(notdir $@))
+	$(Q)$(CC) $(ZSTD_CFLAGS_NOWARN) $(DEPFLAGS) -fno-tree-vectorize -c $< -o $@ && $(DEPFIX)
 
 # self-gated on __x86_64__/ZSTD_ASM_SUPPORTED; empty object elsewhere
 $(OBJDIR)/obj/third_party/zstd/lib/decompress/huf_decompress_amd64.o : src/third_party/zstd/lib/decompress/huf_decompress_amd64.S $(OBJDIR)/.flags src/third_party/zstd/Local.mk
-	@echo -e "AS\t$(notdir $@)"
-	$(Q)$(MKDIR) $(dir $@) && \
-$(CC) $(ZSTD_CFLAGS_NOWARN) $(DEPFLAGS) -c $< -o $@ && $(DEPFIX)
+	@$(info AS$(TAB)$(notdir $@))
+	$(Q)$(CC) $(ZSTD_CFLAGS_NOWARN) $(DEPFLAGS) -c $< -o $@ && $(DEPFIX)
 
 ASM_DEPFILES+=$(OBJDIR)/obj/third_party/zstd/lib/decompress/huf_decompress_amd64.d
 
