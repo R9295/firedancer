@@ -25,9 +25,9 @@
         other originating (origin) nodes to them, because they already
         have a lot of paths from that node.  This is called a prune.
 
-   Complication (1) is handled by keeping a list of the top 12 peers
-   (sorted by stake) for each of 25 buckets of stakes.  These buckets
-   are all rotated together.
+   Complication (1) is handled by keeping up to 12 stake-weighted peers
+   for each of 25 stake buckets, rotating one bucket at a time.  An
+   empty local-identity bucket is seeded as soon as a peer is usable.
 
    And problem (2) is solved by keeping a bloom filter for each of the
    12 peers in each bucket.  The bloom filter is used to track which
@@ -113,7 +113,12 @@ fd_active_set_push( fd_active_set_t *   active_set,
                     long                now,
                     int                 flush_immediately );
 
-void
+/* Advances pending pushes and the normal bucket rotation.  Also seeds
+   an empty local-identity bucket as soon as an eligible peer exists.
+   Returns 1 when a peer was added to that bucket, so the caller can
+   advertise its contact info immediately, otherwise 0. */
+
+int
 fd_active_set_advance( fd_active_set_t *   active_set,
                        fd_stem_context_t * stem,
                        long                now,

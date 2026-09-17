@@ -1131,7 +1131,11 @@ fd_gossip_advance( fd_gossip_t *       gossip,
   outbound_budget_replenish( gossip, now );
 
   fd_gossip_purged_expire( gossip->purged, now );
-  fd_active_set_advance( gossip->active_set, stem, now, charge_busy );
+  if( FD_UNLIKELY( fd_active_set_advance( gossip->active_set, stem, now, charge_busy ) ) ) {
+    /* A newly selected peer should learn how to reach us now, not at
+       the next periodic contact-info refresh (another 7.5s away). */
+    gossip->timers.next_contact_info_refresh = now;
+  }
   fd_crds_advance( gossip->crds, now, stem, charge_busy );
 
   tx_ping( gossip, stem, now, charge_busy );

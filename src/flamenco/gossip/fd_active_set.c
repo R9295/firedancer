@@ -229,6 +229,9 @@ fd_active_set_remove_peer( fd_active_set_t * active_set,
       if( FD_UNLIKELY( active_set->peers[ b*12UL+peer_idx ].ci_idx==ci_idx ) ) {
         fd_active_set_peer_t * peer = &active_set->peers[ b*12UL+peer_idx ];
         if( FD_UNLIKELY( peer->txbuild->crds_len ) ) push_dlist_ele_remove( active_set->push_dlist, peer, active_set->peers );
+        /* Release the bucket reservation so a peer that becomes usable
+           again can be selected.  The sampler still enforces eligibility. */
+        fd_gossip_wsample_add_bucket( active_set->wsample, b, ci_idx );
 
         for( ulong j=i; j<entry->nodes_len-1UL; j++ ) {
           ulong from_idx = b*12UL+(entry->nodes_idx+j+1UL) % 12UL;
@@ -284,14 +287,13 @@ fd_active_set_push( fd_active_set_t *   active_set,
   }
 }
 
-static inline void
+static inline int
 rotate_active_set( fd_active_set_t *   active_set,
+                   ulong               bucket,
                    fd_stem_context_t * stem,
                    long                now ) {
   ulong num_bloom_filter_items = fd_ulong_max( fd_crds_peer_count( active_set->crds ), 512UL );
 
-  ulong bucket = active_set->rotate_bucket;
-  active_set->rotate_bucket = (active_set->rotate_bucket+1UL) % 25UL;
   fd_active_set_entry_t * entry = active_set->entries[ bucket ];
 
   /* Sample a new peer BEFORE evicting the oldest.  This prevents the
@@ -299,7 +301,7 @@ rotate_active_set( fd_active_set_t *   active_set,
      immediately re-sample it, creating a duplicate. */
 
   ulong added_ci_idx = fd_gossip_wsample_sample_remove_bucket( active_set->wsample, bucket );
-  if( FD_UNLIKELY( added_ci_idx==ULONG_MAX ) ) return;
+  if( FD_UNLIKELY( added_ci_idx==ULONG_MAX ) ) return 0;
 
   ulong replace_idx;
   if( FD_LIKELY( entry->nodes_len==12UL ) ) {
@@ -322,10 +324,11 @@ rotate_active_set( fd_active_set_t *   active_set,
   fd_bloom_insert( replace->bloom, new_pubkey, 32UL );
   entry->nodes_len = fd_ulong_min( entry->nodes_len+1UL, 12UL );
   fd_gossip_txbuild_init( replace->txbuild, active_set->identity_pubkey, FD_GOSSIP_MESSAGE_PUSH );
+  return 1;
 }
 
 
-void
+int
 fd_active_set_advance( fd_active_set_t *   active_set,
                        fd_stem_context_t * stem,
                        long                now,
@@ -338,9 +341,23 @@ fd_active_set_advance( fd_active_set_t *   active_set,
     if( charge_busy ) *charge_busy = 1;
   }
 
+  /* Our contact info uses our own stake bucket.  Do not leave it empty
+     until the round-robin rotation reaches it (up to 7.5s).  Sampling
+     uses the usual stake/pong eligibility checks and excludes self. */
+  ulong own_bucket = fd_active_set_stake_bucket( active_set->identity_stake );
+  int advertise = 0;
+  if( FD_UNLIKELY( !active_set->entries[ own_bucket ]->nodes_len ) ) {
+    advertise = rotate_active_set( active_set, own_bucket, stem, now );
+    if( FD_UNLIKELY( advertise && charge_busy ) ) *charge_busy = 1;
+  }
+
   if( FD_UNLIKELY( now>=active_set->next_rotate_nanos ) ) {
-    rotate_active_set( active_set, stem, now );
+    ulong bucket = active_set->rotate_bucket;
+    active_set->rotate_bucket = (bucket+1UL) % 25UL;
+    int added = rotate_active_set( active_set, bucket, stem, now );
+    advertise |= added && bucket==own_bucket;
     active_set->next_rotate_nanos = now+300L*1000L*1000L;
     if( charge_busy ) *charge_busy = 1;
   }
+  return advertise;
 }
