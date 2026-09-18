@@ -2461,6 +2461,15 @@ test_process_rotor_fec_skip_replayed( fd_wksp_t * wksp ) {
   FD_TEST( fd_banks_pool_used_cnt( ctx->banks )==used0 );   /* no duplicate bank */
   FD_TEST( ele5->block_id_seen==1 );                        /* existing ele untouched */
 
+  /* A turbine slot-complete FEC carries the same block_id with
+     known_id clear.  It must resolve to the existing verified bank and
+     skip before trying to re-key its parallel {slot, 0} bank. */
+  r = deliver_rotor_fec_bid( ctx, 5UL, 0U, 0UL, &parent_bid, &B, &mrX, 1 /*slot_complete*/, 0 /*turbine*/ );
+  FD_TEST( r==0 );
+  FD_TEST( ctx->metrics.store_query_cnt==q0 );
+  FD_TEST( fd_banks_pool_used_cnt( ctx->banks )==used0 );
+  FD_TEST( ele5->block_id_seen==1 );
+
   /* (2) Redelivered FEC for a NOT-yet-replayed block {6, C}: processed
      past the skip check.  Model rotor removing the FEC between delivery
      and replay's payload acquisition.  This must be treated as a pruned

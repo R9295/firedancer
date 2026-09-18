@@ -36,12 +36,10 @@
    re-key its replay bank from {slot, 0} to a {slot, block_id} that the
    verified copy's bank already occupies.
 
-   To prevent that, the chainer ABANDONS the turbine version of a slot
-   the moment a votor-driven version of it is created while the turbine
-   block_id is still unknown (see fd_chainer.h): the abandoned version
-   keeps absorbing turbine shreds (they fill the FECs the verified
-   version shares) but never delivers another FEC and never finalizes a
-   block_id.
+   The chainer keeps the turbine version active when a votor-driven
+   version appears.  This preserves positional repair as a fallback if
+   block-id repair is unsupported or unanswered.  Both versions may
+   therefore complete, and replay must resolve them by block_id.
 
    Consider this case:
    Slot A (started receiving through turbine): received FEC 0, 1, and 5
@@ -51,18 +49,16 @@
 
    Get a notar fallback for slot A'. No equivocation occurred, but we
    can't tell, so we also start repairing A' using ag block id repair,
-   and the turbine version of the slot is abandoned.  Slot A' is
+   while the turbine version continues positional repair.  Slot A' is
    immediately able to complete FEC 0 and 1 (the shreds are local), and
    they are re-delivered to replay with {verified=1, block_id=A'}.
    Remaining shreds of FEC 2 -- whether they arrive through turbine or
    ShredForBlockId repair -- fill the shared FEC, and FEC 2 is delivered
-   once, under A', with {verified=1, block_id=A'}.
+   for each active version that owns it.
 
    The effect is that in time of network blips, replay ends up
-   allocating up to two banks for the same slot/block: the turbine bank
-   keyed {slot, 0} receives only a prefix of the block, never completes,
-   never gets re-keyed (so it can never collide with the verified bank
-   keyed {slot, block_id}), and is eventually evicted or pruned.
+   allocating up to two banks for the same slot/block.  Root publication
+   identifies the canonical block_id and prunes the other version.
 
    INPUTS: REPLAY
 

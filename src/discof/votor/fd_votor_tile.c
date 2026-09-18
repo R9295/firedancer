@@ -400,6 +400,78 @@ ban_bad_ranks( fd_votor_tile_t *    ctx,
   }
 }
 
+/* publish_cert_created reports a certificate the pool just created to
+   replay.
+
+   A slow finalization is reported as one message carrying both its
+   FINAL and its NOTAR aggregate, but the two certificates are created
+   independently and in either order.  final_notar_join holds whichever
+   arrived first, keyed by slot, until its partner shows up.  FINAL is
+   therefore never published on its own, and the joined message is
+   published from whichever of the pair completes it. */
+
+static void
+publish_cert_created( fd_votor_tile_t * ctx,
+                      ag_cert_t const * cert ) {
+  ulong                slot = ag_cert_slot( cert );
+  final_notar_join_t * cs   = &ctx->final_notar_join[ slot%CERT_SLOT_MAX ];
+  if( FD_UNLIKELY( cs->slot!=slot ) ) {
+    cs->slot      = slot;
+    cs->has_notar = 0;
+    cs->has_final = 0;
+  }
+
+  publish_t pub = { .sig = FD_VOTOR_SIG_CERTED };
+  fd_votor_certed_t * certed = &pub.msg.certed;
+  memset( certed, 0, sizeof(fd_votor_certed_t) );
+  certed->kind = cert->kind;
+  certed->slot = slot;
+  switch( cert->kind ) {
+  case AG_CERT_KIND_FINAL: /* reported with its notarization below */
+    cs->has_final = 1;
+    cs->final     = cert->final.agg;
+    break;
+  case AG_CERT_KIND_FAST_FINAL:
+    memcpy( certed->block_id.uc, cert->fast_final.block_hash, sizeof(fd_hash_t) );
+    certed->agg = cert->fast_final.agg;
+    break;
+  case AG_CERT_KIND_NOTAR:
+    memcpy( certed->block_id.uc, cert->notar.block_hash, sizeof(fd_hash_t) );
+    certed->agg = cert->notar.agg;
+    cs->has_notar = 1;
+    cs->notar     = cert->notar.agg;
+    memcpy( cs->notar_block_hash, cert->notar.block_hash, sizeof(ag_block_hash_t) );
+    break;
+  case AG_CERT_KIND_NOTAR_FALLBACK:
+    memcpy( certed->block_id.uc, cert->notar_fallback.block_hash, sizeof(fd_hash_t) );
+    certed->agg  = cert->notar_fallback.agg_notar;
+    certed->agg2 = cert->notar_fallback.agg_notar_fallback;
+    break;
+  case AG_CERT_KIND_SKIP:
+    certed->agg  = cert->skip.agg_skip;
+    certed->agg2 = cert->skip.agg_skip_fallback;
+    break;
+  default:
+    FD_LOG_CRIT(( "unreachable" ));
+  }
+  if( FD_LIKELY( cert->kind!=AG_CERT_KIND_FINAL ) ) {
+    FD_TEST( !publishes_full( ctx->publishes ) );
+    publishes_push( ctx->publishes, pub );
+  }
+
+  if( FD_UNLIKELY( cs->has_final && cs->has_notar ) ) {
+    memset( certed, 0, sizeof(fd_votor_certed_t) );
+    certed->kind = AG_CERT_KIND_FINAL;
+    certed->slot = slot;
+    certed->agg  = cs->final;
+    certed->agg2 = cs->notar;
+    memcpy( certed->block_id.uc, cs->notar_block_hash, sizeof(fd_hash_t) );
+    cs->has_final = 0;
+    FD_TEST( !publishes_full( ctx->publishes ) );
+    publishes_push( ctx->publishes, pub );
+  }
+}
+
 static void
 publish_reward_certs( fd_votor_tile_t * ctx,
                       ulong             slot ) {
@@ -584,29 +656,6 @@ quic_client_broadcast( fd_votor_tile_t *   ctx,
     peer_t const * peer = &ctx->peers[ slot ];
     if( FD_LIKELY( peers_key_inval( peer->id_key ) || !peer->tx_conn || peer->tx_conn->state!=FD_QUIC_CONN_STATE_ACTIVE ) ) continue;
     quic_client_datagram_tx( ctx, stem, peer->tx_conn, buf, buf_sz );
-  }
-}
-
-/* A reconnecting peer might have missed the proof that advanced our root.
-   QUIC DATAGRAM has no delivery acknowledgement, so refresh the latest proof
-   at a fixed rate instead of treating a local enqueue as peer delivery.
-   There is no proof for the slot we booted from. */
-
-static void
-quic_client_refresh_final( fd_votor_tile_t *   ctx,
-                           fd_stem_context_t * stem ) {
-  ag_slot_state_t const * state = ag_pool_slot_state( ctx->pool, ag_pool_finalized_slot( ctx->pool ) );
-  if( FD_UNLIKELY( !state ) ) return;
-
-  ag_slot_certs_t const * certs = &state->certs;
-  if( FD_LIKELY( certs->fast_finalize.slot!=ULONG_MAX ) ) {
-    ag_cert_t cert = { .kind = AG_CERT_KIND_FAST_FINAL, .fast_final = certs->fast_finalize };
-    quic_client_broadcast( ctx, stem, ctx->scratch.ser, ag_cert_ser( &cert, ctx->scratch.ser ) );
-  } else if( FD_LIKELY( certs->finalize.slot!=ULONG_MAX && certs->notar.slot!=ULONG_MAX ) ) {
-    ag_cert_t notar = { .kind = AG_CERT_KIND_NOTAR, .notar = certs->notar };
-    quic_client_broadcast( ctx, stem, ctx->scratch.ser, ag_cert_ser( &notar, ctx->scratch.ser ) );
-    ag_cert_t final = { .kind = AG_CERT_KIND_FINAL, .final = certs->finalize };
-    quic_client_broadcast( ctx, stem, ctx->scratch.ser, ag_cert_ser( &final, ctx->scratch.ser ) );
   }
 }
 
@@ -1138,7 +1187,6 @@ after_credit( fd_votor_tile_t *   ctx,
   if( FD_UNLIKELY( now>=ctx->next_reconcile ) ) {
     ctx->next_reconcile = fd_long_sat_add( now, QUIC_RECONCILE_NS );
     quic_client_reconcile( ctx, now );
-    if( FD_LIKELY( ctx->init ) ) quic_client_refresh_final( ctx, stem );
     *charge_busy = 1;
   }
 
@@ -1177,63 +1225,7 @@ after_credit( fd_votor_tile_t *   ctx,
     ag_votor_handle_pool_event( ctx->votor, &ctx->scratch.pool_event, now );
     ag_cert_t const * cert = &ctx->scratch.pool_event.cert_created;
     if( FD_UNLIKELY( ctx->scratch.pool_event.kind==AG_EVENT_POOL_CERT_CREATED ) ) {
-      ulong                slot = ag_cert_slot( cert );
-      final_notar_join_t * cs   = &ctx->final_notar_join[ slot%CERT_SLOT_MAX ];
-      if( FD_UNLIKELY( cs->slot!=slot ) ) {
-        cs->slot      = slot;
-        cs->has_notar = 0;
-        cs->has_final = 0;
-      }
-
-      publish_t pub = { .sig = FD_VOTOR_SIG_CERTED };
-      fd_votor_certed_t * certed = &pub.msg.certed;
-      memset( certed, 0, sizeof(fd_votor_certed_t) );
-      certed->kind = cert->kind;
-      certed->slot = slot;
-      switch( cert->kind ) {
-      case AG_CERT_KIND_FINAL: /* reported with its notarization below */
-        cs->has_final = 1;
-        cs->final     = cert->final.agg;
-        break;
-      case AG_CERT_KIND_FAST_FINAL:
-        memcpy( certed->block_id.uc, cert->fast_final.block_hash, sizeof(fd_hash_t) );
-        certed->agg = cert->fast_final.agg;
-        break;
-      case AG_CERT_KIND_NOTAR:
-        memcpy( certed->block_id.uc, cert->notar.block_hash, sizeof(fd_hash_t) );
-        certed->agg = cert->notar.agg;
-        cs->has_notar = 1;
-        cs->notar     = cert->notar.agg;
-        memcpy( cs->notar_block_hash, cert->notar.block_hash, sizeof(ag_block_hash_t) );
-        break;
-      case AG_CERT_KIND_NOTAR_FALLBACK:
-        memcpy( certed->block_id.uc, cert->notar_fallback.block_hash, sizeof(fd_hash_t) );
-        certed->agg  = cert->notar_fallback.agg_notar;
-        certed->agg2 = cert->notar_fallback.agg_notar_fallback;
-        break;
-      case AG_CERT_KIND_SKIP:
-        certed->agg  = cert->skip.agg_skip;
-        certed->agg2 = cert->skip.agg_skip_fallback;
-        break;
-      default:
-        FD_LOG_CRIT(( "unreachable" ));
-      }
-      if( FD_LIKELY( cert->kind!=AG_CERT_KIND_FINAL ) ) {
-        FD_TEST( !publishes_full( ctx->publishes ) );
-        publishes_push( ctx->publishes, pub );
-      }
-
-      if( FD_UNLIKELY( cs->has_final && cs->has_notar ) ) {
-        memset( certed, 0, sizeof(fd_votor_certed_t) );
-        certed->kind = AG_CERT_KIND_FINAL;
-        certed->slot = slot;
-        certed->agg  = cs->final;
-        certed->agg2 = cs->notar;
-        memcpy( certed->block_id.uc, cs->notar_block_hash, sizeof(fd_hash_t) );
-        cs->has_final = 0;
-        FD_TEST( !publishes_full( ctx->publishes ) );
-        publishes_push( ctx->publishes, pub );
-      }
+      publish_cert_created( ctx, cert );
     }
     *charge_busy = 1;
   }

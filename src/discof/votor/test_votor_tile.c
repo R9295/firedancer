@@ -186,11 +186,148 @@ test_client_reconnect( void ) {
   FD_TEST( ctx->next_reconcile==456L );
 }
 
+/* Build an aggregate whose bytes are a function of tag, so a test can
+   tell which aggregate ended up in which field of the published
+   message. */
+
+static fd_bls_agg_t
+mock_agg( uchar tag ) {
+  fd_bls_agg_t agg;
+  fd_memset( &agg, tag, sizeof(fd_bls_agg_t) );
+  return agg;
+}
+
+static fd_votor_tile_t *
+join_certed_ctx( void ) {
+  static fd_votor_tile_t ctx[ 1 ];
+
+  fd_memset( ctx, 0, sizeof(fd_votor_tile_t) );
+  void * publish_mem = aligned_alloc( publishes_align(), fd_ulong_align_up( publishes_footprint( 16UL ), publishes_align() ) );
+  FD_TEST( publish_mem );
+  ctx->publishes = publishes_join( publishes_new( publish_mem, 16UL ) );
+  FD_TEST( ctx->publishes );
+  for( ulong i=0UL; i<CERT_SLOT_MAX; i++ ) ctx->final_notar_join[ i ].slot = ULONG_MAX;
+  return ctx;
+}
+
+static void
+push_notar( fd_votor_tile_t * ctx,
+            ulong             slot,
+            uchar             hash_tag,
+            uchar             agg_tag ) {
+  ag_cert_t cert;
+  fd_memset( &cert, 0, sizeof(ag_cert_t) );
+  cert.kind       = AG_CERT_KIND_NOTAR;
+  cert.notar.slot = slot;
+  cert.notar.agg  = mock_agg( agg_tag );
+  fd_memset( cert.notar.block_hash, hash_tag, sizeof(ag_block_hash_t) );
+  publish_cert_created( ctx, &cert );
+}
+
+static void
+push_final( fd_votor_tile_t * ctx,
+            ulong             slot,
+            uchar             agg_tag ) {
+  ag_cert_t cert;
+  fd_memset( &cert, 0, sizeof(ag_cert_t) );
+  cert.kind       = AG_CERT_KIND_FINAL;
+  cert.final.slot = slot;
+  cert.final.agg  = mock_agg( agg_tag );
+  publish_cert_created( ctx, &cert );
+}
+
+/* A slow finalization needs both a FINAL and a NOTAR for the same slot,
+   and the two certificates are created independently.  Whichever
+   arrives second must publish the joined message, and FINAL must never
+   be published alone. */
+
+static void
+test_final_notar_join( void ) {
+  fd_votor_tile_t * ctx = join_certed_ctx();
+
+  /* NOTAR first: it publishes itself, then FINAL completes the pair. */
+
+  push_notar( ctx, 10UL, 0xa1, 0xb1 );
+  FD_TEST( publishes_cnt( ctx->publishes )==1UL );
+  publish_t pub = publishes_pop( ctx->publishes );
+  FD_TEST( pub.sig==FD_VOTOR_SIG_CERTED );
+  FD_TEST( pub.msg.certed.kind==AG_CERT_KIND_NOTAR );
+  FD_TEST( pub.msg.certed.slot==10UL );
+
+  push_final( ctx, 10UL, 0xc1 );
+  FD_TEST( publishes_cnt( ctx->publishes )==1UL );
+  pub = publishes_pop( ctx->publishes );
+  FD_TEST( pub.sig==FD_VOTOR_SIG_CERTED );
+  FD_TEST( pub.msg.certed.kind==AG_CERT_KIND_FINAL );
+  FD_TEST( pub.msg.certed.slot==10UL );
+  FD_TEST( pub.msg.certed.agg.set[ 0 ]==mock_agg( 0xc1 ).set[ 0 ] );
+  FD_TEST( pub.msg.certed.agg2.set[ 0 ]==mock_agg( 0xb1 ).set[ 0 ] );
+  FD_TEST( pub.msg.certed.block_id.uc[ 0 ]==0xa1 );
+
+  /* FINAL first: nothing is published until its NOTAR arrives, and then
+     the NOTAR and the joined FINAL are published in that order. */
+
+  push_final( ctx, 11UL, 0xc2 );
+  FD_TEST( publishes_empty( ctx->publishes ) );
+
+  push_notar( ctx, 11UL, 0xa2, 0xb2 );
+  FD_TEST( publishes_cnt( ctx->publishes )==2UL );
+  pub = publishes_pop( ctx->publishes );
+  FD_TEST( pub.msg.certed.kind==AG_CERT_KIND_NOTAR );
+  FD_TEST( pub.msg.certed.slot==11UL );
+  FD_TEST( pub.msg.certed.agg.set[ 0 ]==mock_agg( 0xb2 ).set[ 0 ] );
+
+  pub = publishes_pop( ctx->publishes );
+  FD_TEST( pub.msg.certed.kind==AG_CERT_KIND_FINAL );
+  FD_TEST( pub.msg.certed.slot==11UL );
+  FD_TEST( pub.msg.certed.agg.set[ 0 ]==mock_agg( 0xc2 ).set[ 0 ] );
+  FD_TEST( pub.msg.certed.agg2.set[ 0 ]==mock_agg( 0xb2 ).set[ 0 ] );
+  FD_TEST( pub.msg.certed.block_id.uc[ 0 ]==0xa2 );
+
+  /* The pair is published once.  A duplicate NOTAR does not re-join a
+     FINAL that was already reported. */
+
+  push_notar( ctx, 11UL, 0xa2, 0xb2 );
+  FD_TEST( publishes_cnt( ctx->publishes )==1UL );
+  pub = publishes_pop( ctx->publishes );
+  FD_TEST( pub.msg.certed.kind==AG_CERT_KIND_NOTAR );
+
+  /* Entries are keyed by slot modulo CERT_SLOT_MAX.  A slot that evicts
+     a half-populated entry must not inherit its partner. */
+
+  push_final( ctx, 12UL, 0xc3 );
+  FD_TEST( publishes_empty( ctx->publishes ) );
+
+  push_notar( ctx, 12UL+CERT_SLOT_MAX, 0xa4, 0xb4 );
+  FD_TEST( publishes_cnt( ctx->publishes )==1UL );
+  pub = publishes_pop( ctx->publishes );
+  FD_TEST( pub.msg.certed.kind==AG_CERT_KIND_NOTAR );
+  FD_TEST( pub.msg.certed.slot==12UL+CERT_SLOT_MAX );
+
+  /* A fast finalization is self-contained and is published immediately,
+     without consulting the join table. */
+
+  ag_cert_t fast;
+  fd_memset( &fast, 0, sizeof(ag_cert_t) );
+  fast.kind            = AG_CERT_KIND_FAST_FINAL;
+  fast.fast_final.slot = 13UL;
+  fast.fast_final.agg  = mock_agg( 0xd1 );
+  fd_memset( fast.fast_final.block_hash, 0xa5, sizeof(ag_block_hash_t) );
+  publish_cert_created( ctx, &fast );
+  FD_TEST( publishes_cnt( ctx->publishes )==1UL );
+  pub = publishes_pop( ctx->publishes );
+  FD_TEST( pub.msg.certed.kind==AG_CERT_KIND_FAST_FINAL );
+  FD_TEST( pub.msg.certed.slot==13UL );
+  FD_TEST( pub.msg.certed.agg.set[ 0 ]==mock_agg( 0xd1 ).set[ 0 ] );
+  FD_TEST( pub.msg.certed.block_id.uc[ 0 ]==0xa5 );
+}
+
 int
 main( int     argc,
       char ** argv ) {
   fd_boot( &argc, &argv );
   test_client_reconnect();
+  test_final_notar_join();
   FD_LOG_NOTICE(( "pass" ));
   fd_halt();
   return 0;
