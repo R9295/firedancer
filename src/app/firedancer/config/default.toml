@@ -204,6 +204,16 @@ telemetry = true
     # Firedancer instance.
     accounts = ""
 
+    # File path used to create the temporary stake-delegation spill
+    # file.  If no path is provided, it defaults to the
+    # `stakedelegations.db` path within the base directory above.
+    #
+    # Two substitutions will be performed on this string.  If "{user}"
+    # is present it will be replaced with the user running Firedancer,
+    # as above, and "{name}" will be replaced with the name of the
+    # Firedancer instance.
+    stake_delegations = ""
+
     # File path to the shreds database file.
     #
     # The shreds database stores recorded and reconstructed shreds
@@ -2011,7 +2021,7 @@ telemetry = true
         # The maximum size of the genesis file that is either loaded
         # from the disk or downloaded from the network.
         # Must be in [1, 4055].
-        max_file_size_mib = 10
+        max_file_size_mib = 16
 
         # When creating a new chain from genesis during development,
         # this option can be used to specify the number of hashes in

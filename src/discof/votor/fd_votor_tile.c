@@ -89,6 +89,8 @@ struct publish {
 };
 typedef struct publish publish_t;
 
+/* Root notifications can cover an entire replayed lineage.  Drain them
+   separately so each callback stays within the output burst. */
 #define QUEUE_NAME publishes
 #define QUEUE_T    publish_t
 #include "../../util/tmpl/fd_queue_dynamic.c"
@@ -257,7 +259,8 @@ struct fd_votor_tile {
 
   /* Links */
 
-  int in_kind[ 32 ];
+  fd_stem_context_t * stem;
+  int                 in_kind[ 32 ];
   struct {
     fd_wksp_t * mem;
     ulong       chunk0;
@@ -602,7 +605,7 @@ quic_client_conn_final( fd_quic_conn_t * conn,
 static void
 quic_client_conn_hs_complete( fd_quic_conn_t * conn,
                               void *           quic_ctx ) {
-  fd_votor_tile_t *   ctx    = quic_ctx;
+  fd_votor_tile_t * ctx = quic_ctx;
   fd_pubkey_t const * id_key = fd_quic_conn_get_context( conn );
   if( FD_UNLIKELY( !id_key ) ) return;
 
@@ -961,9 +964,9 @@ handle_epoch( fd_votor_tile_t *           ctx,
       peer              = peers_insert( ctx->peers, id_key );
       peer->curr_rank   = USHORT_MAX;
       peer->next_rank   = USHORT_MAX;
-      peer->tx_conn          = NULL;
-      peer->rx_conn          = NULL;
-      peer->ban_ts           = 0L;
+      peer->tx_conn     = NULL;
+      peer->rx_conn     = NULL;
+      peer->ban_ts      = 0L;
       peer->connect_deadline = LONG_MAX;
     }
     peer->prev_rank = (ushort)rank;
@@ -982,9 +985,9 @@ handle_epoch( fd_votor_tile_t *           ctx,
       peer              = peers_insert( ctx->peers, id_key );
       peer->prev_rank   = USHORT_MAX;
       peer->next_rank   = USHORT_MAX;
-      peer->tx_conn          = NULL;
-      peer->rx_conn          = NULL;
-      peer->ban_ts           = 0L;
+      peer->tx_conn     = NULL;
+      peer->rx_conn     = NULL;
+      peer->ban_ts      = 0L;
       peer->connect_deadline = LONG_MAX;
     }
     peer->curr_rank = (ushort)rank;
@@ -1000,12 +1003,12 @@ handle_epoch( fd_votor_tile_t *           ctx,
 
     peer_t * peer = peers_query( ctx->peers, id_key, NULL );
     if( FD_UNLIKELY( !peer ) ) {
-      peer              = peers_insert( ctx->peers, id_key );
-      peer->prev_rank   = USHORT_MAX;
-      peer->curr_rank   = USHORT_MAX;
-      peer->tx_conn          = NULL;
-      peer->rx_conn          = NULL;
-      peer->ban_ts           = 0L;
+      peer            = peers_insert( ctx->peers, id_key );
+      peer->prev_rank = USHORT_MAX;
+      peer->curr_rank = USHORT_MAX;
+      peer->tx_conn   = NULL;
+      peer->rx_conn   = NULL;
+      peer->ban_ts    = 0L;
       peer->connect_deadline = LONG_MAX;
     }
     peer->next_rank = (ushort)rank;
@@ -1179,6 +1182,7 @@ after_credit( fd_votor_tile_t *   ctx,
               int *               opt_poll_in,
               int *               charge_busy ) {
 
+  ctx->stem    = stem;
   long now     = fd_log_wallclock();
   *charge_busy = fd_quic_service( ctx->quic_client, now ) | fd_quic_service( ctx->quic_server, now );
   for( ulong i=0UL; i<ctx->net_tx_cnt; i++ ) fd_stem_publish( stem, OUT_IDX_NET, ctx->net_tx[ i ].sig, ctx->net_tx[ i ].chunk, ctx->net_tx[ i ].sz, fd_frag_meta_ctl( 0UL, 1, 1, 0 ), 0L, 0L );
@@ -1195,8 +1199,8 @@ after_credit( fd_votor_tile_t *   ctx,
     memcpy( fd_chunk_to_laddr( ctx->votor_out_mem, ctx->votor_out_chunk ), &pub.msg, sizeof(fd_votor_msg_t) );
     fd_stem_publish( stem, OUT_IDX_VOTOR, pub.sig, ctx->votor_out_chunk, sizeof(fd_votor_msg_t), 0UL, fd_frag_meta_ts_comp( fd_tickcount() ), fd_frag_meta_ts_comp( fd_tickcount() ) );
     ctx->votor_out_chunk = fd_dcache_compact_next( ctx->votor_out_chunk, sizeof(fd_votor_msg_t), ctx->votor_out_chunk0, ctx->votor_out_wmark );
-    *opt_poll_in         = 0; /* drain the publishes */
-    *charge_busy         = 1;
+    *opt_poll_in = 0; /* drain root notifications before processing more input */
+    *charge_busy = 1;
     return;
   }
 
@@ -1276,6 +1280,12 @@ after_credit( fd_votor_tile_t *   ctx,
       try_advance_root( ctx, ag_block_id( finalized_slot, finalized_hash ) );
     }
     *charge_busy = 1;
+  }
+
+  /* Deliver newly queued roots before any leader notification. */
+  if( FD_UNLIKELY( !publishes_empty( ctx->publishes ) ) ) {
+    *opt_poll_in = 0;
+    return;
   }
 
   if( FD_LIKELY( ctx->next_leader_slot==ULONG_MAX ) ) return; /* never will be leader */
