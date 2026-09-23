@@ -313,6 +313,12 @@ ag_votor_init( ag_votor_t *   self,
   state->parents_ready_cnt       = 1UL;
   state->retired                 = 1;
 
+  for( ulong s=ag_first_slot_in_window( slot ); s<slot; s++ ) {
+    slot_state_ele_t * below = state_mut( self, s );
+    below->voted               = 1;
+    below->retired             = 1;
+  }
+
   set_timeouts( self, ag_first_slot_in_window( slot ) );
 }
 
@@ -677,11 +683,6 @@ ag_votor_handle_replay_event( ag_votor_t *              self,
       state->pending_block      = 1;
       state->pending_block_info = event->block_info;
     }
-    break;
-
-  case AG_EVENT_REPLAY_DEAD:
-    FD_LOG_WARNING(( "replay marked slot %lu dead, skipping window", slot ));
-    try_skip_window( self, slot );
     break;
 
   default:

@@ -342,28 +342,23 @@ fd_gui_printf_catch_up_history( fd_gui_t * gui ) {
 #define SHREDS_REV_ITER( age_ns, code_archive ) \
         do { \
           if( FD_UNLIKELY( gui->summary.boot_progress.catching_up_time_nanos==0L ) ) break; \
-          void * _db = gui->db; \
-          if( FD_LIKELY( _db ) ) { \
-            long _hi_ns = gui->summary.boot_progress.catching_up_time_nanos; \
-            long _lo_ns = _hi_ns - (long)(age_ns); \
-            fd_gui_hist_iter_t _it; \
-            if( FD_LIKELY( !fd_gui_hist_range_begin( gui, &_it, FD_GUI_HIST_SHRED_EVENTS, _lo_ns, _hi_ns, NULL, NULL ) ) ) { \
-              while( fd_gui_hist_range_next( &_it ) ) { \
-                fd_gui_slot_history_shred_event_t const * event = (fd_gui_slot_history_shred_event_t const *)_it.rec; (void)event; \
-                ulong db_event_slot = event->slot; (void)db_event_slot; \
-                if( FD_UNLIKELY( event->timestamp < _lo_ns ) ) continue; \
-                do { code_archive } while (0); \
-              } \
-              fd_gui_hist_range_end( &_it ); \
-            } \
+          long _hi_ns = gui->summary.boot_progress.catching_up_time_nanos; \
+          long _lo_ns = _hi_ns - (long)(age_ns); \
+          fd_gui_shred_event_iter_t _it[ 1 ]; \
+          fd_gui_shred_event_iter_begin( gui, _it, _lo_ns, _hi_ns ); \
+          while( fd_gui_shred_event_iter_next( _it ) ) { \
+            fd_gui_shred_event_t const * event = &_it->event; (void)event; \
+            ulong db_event_slot = event->slot; (void)db_event_slot; \
+            do { code_archive } while (0); \
           } \
+          fd_gui_shred_event_iter_end( _it ); \
         } while(0);
 
         SHREDS_REV_ITER(
           15000000000,
           {
             min_slot = fd_ulong_min( min_slot, db_event_slot );
-            min_ts = fd_long_min( min_ts, event->timestamp );
+            min_ts = fd_long_min( min_ts, event->event_time_ns );
           }
         )
 
@@ -381,7 +376,7 @@ fd_gui_printf_catch_up_history( fd_gui_t * gui ) {
             SHREDS_REV_ITER(
               15000000000L,
               {
-                if( FD_LIKELY( event->shred_idx!=USHORT_MAX ) ) jsonp_ulong( gui->http, NULL, event->shred_idx );
+                if( FD_LIKELY( event->idx!=USHORT_MAX ) ) jsonp_ulong( gui->http, NULL, event->idx );
                 else                                            jsonp_null ( gui->http, NULL );
               }
             )
@@ -395,7 +390,7 @@ fd_gui_printf_catch_up_history( fd_gui_t * gui ) {
           jsonp_open_array( gui->http, "event_ts_delta" );
             SHREDS_REV_ITER(
               15000000000L,
-              { jsonp_long_as_str( gui->http, NULL, event->timestamp-min_ts ); }
+              { jsonp_ulong_as_str( gui->http, NULL, (ulong)event->event_time_ns-(ulong)min_ts ); }
             )
           jsonp_close_array( gui->http );
         jsonp_close_object( gui->http );
@@ -578,8 +573,8 @@ fd_gui_printf_block_engine( fd_gui_t * gui ) {
 }
 
 static char const *
-fd_gui_tile_priority_cstr( char const * tile_name ) {
-  switch( fd_topob_tile_priority_type( tile_name ) ) {
+fd_gui_tile_priority_cstr( fd_topo_tile_t const * tile ) {
+  switch( fd_topob_tile_priority_type( tile ) ) {
     case FD_TOPOB_PRIORITY_FLOATING: return "floating";
     case FD_TOPOB_PRIORITY_STARTUP:  return "startup";
     case FD_TOPOB_PRIORITY_NORMAL:   return "normal";
@@ -604,7 +599,7 @@ fd_gui_printf_tiles( fd_gui_t * gui ) {
           jsonp_string( gui->http, "kind",     tile->name );
           jsonp_ulong(  gui->http, "kind_id",  tile->kind_id );
           jsonp_ulong(  gui->http, "pid",      fd_metrics_tile( tile->metrics )[ MIDX( GAUGE, TILE, PID ) ] );
-          jsonp_string( gui->http, "priority", fd_gui_tile_priority_cstr( tile->name ) );
+          jsonp_string( gui->http, "priority", fd_gui_tile_priority_cstr( tile ) );
         jsonp_close_object( gui->http );
       }
     jsonp_close_array( gui->http );
@@ -1034,7 +1029,7 @@ fd_gui_printf_tile_metrics( fd_gui_t *                        gui,
   jsonp_open_array( gui->http, "priority" );
     for( ulong i=0UL; i<gui->summary.tile_cnt; i++ ) {
       fd_topo_tile_t const * tile = &gui->topo->tiles[ gui->summary.tile[ i ] ];
-      jsonp_string( gui->http, NULL, fd_gui_tile_priority_cstr( tile->name ) );
+      jsonp_string( gui->http, NULL, fd_gui_tile_priority_cstr( tile ) );
     }
   jsonp_close_array( gui->http );
 }
@@ -1173,6 +1168,8 @@ fd_gui_printf_system_resources( fd_gui_t * gui ) {
           jsonp_open_object( gui->http, NULL );
             jsonp_bool(  gui->http, "online",    cpu->online   );
             jsonp_ulong( gui->http, "numa_node", cpu->numa_idx );
+            if( FD_LIKELY( cpu->die_idx!=USHORT_MAX ) ) jsonp_ulong( gui->http, "die_idx", cpu->die_idx );
+            else                                        jsonp_null ( gui->http, "die_idx"               );
             if( FD_LIKELY( cpu->sibling_idx!=USHORT_MAX ) ) jsonp_ulong( gui->http, "sibling_cpu", cpu->sibling_idx );
             else                                            jsonp_null ( gui->http, "sibling_cpu"                  );
             jsonp_open_array( gui->http, "tile_idxs" );
@@ -1581,17 +1578,14 @@ fd_gui_printf_accounts_stats( fd_gui_t * gui ) {
         jsonp_close_array( gui->http );
       jsonp_close_object( gui->http );
 
-      /* Per-tile breakdown.  Iterate the slot table built at init.
-         snapwr's row disappears when it has reached the shutdown
-         status (matching how snapwr drops out of the overview tiles
-         table). */
+      /* Per-tile breakdown.  Iterate the slot table built at init. */
       jsonp_open_array( gui->http, "tiles" );
         for( ulong s=0UL; s<gui->summary.accdb->accdb_tile_cnt; s++ ) {
           ulong t_idx = (ulong)gui->summary.accdb->accdb_tile_topo_idx[ s ];
           fd_topo_tile_t const * tile = &gui->topo->tiles[ t_idx ];
           uchar kind = gui->summary.accdb->accdb_tile_kind[ s ];
 
-          if( kind==FD_GUI_ACCDB_TILE_KIND_SNAPWR && gui->summary.accdb->tile_cur_status[ s ]==2U ) continue;
+          if( kind==FD_GUI_ACCDB_TILE_KIND_SNAPIN && gui->summary.accdb->tile_cur_status[ s ]==2U ) continue;
 
           double t_acq_rate    = WRATE( gui->summary.accdb->tile_acquired_win         [ s ] );
           double t_acq_wr_rate = WRATE( gui->summary.accdb->tile_acquired_writable_win[ s ] );
@@ -1608,7 +1602,7 @@ fd_gui_printf_accounts_stats( fd_gui_t * gui ) {
           char const * joiner;
           switch( kind ) {
             case FD_GUI_ACCDB_TILE_KIND_RW:     joiner = "RW"; break;
-            case FD_GUI_ACCDB_TILE_KIND_SNAPWR: joiner = "RW"; break;
+            case FD_GUI_ACCDB_TILE_KIND_SNAPIN: joiner = "RW"; break;
             case FD_GUI_ACCDB_TILE_KIND_ACCDB:  joiner = "RW"; break;
             default:                            joiner = "RO"; break;
           }
@@ -2064,6 +2058,12 @@ fd_gui_printf_slot_proofs( fd_gui_t *            gui,
   } else {
     jsonp_bool( gui->http, "vote_rewarded", vote_rewarded==FD_GUI_VOTE_REWARDED_YES );
   }
+
+  ushort vote_count = slot->vote_count;
+  ushort epoch_vote_count = fd_gui_slot_vote_count( gui, slot->slot );
+  if( FD_LIKELY( epoch_vote_count!=USHORT_MAX ) ) vote_count = epoch_vote_count;
+  if( FD_UNLIKELY( vote_count==USHORT_MAX ) ) jsonp_null ( gui->http, "vote_count" );
+  else                                        jsonp_ulong( gui->http, "vote_count", vote_count );
 }
 
 static void
@@ -2316,8 +2316,8 @@ fd_gui_printf_slot_transactions_request( fd_gui_t *            gui,
   jsonp_open_envelope( gui->http, "slot", "query_transactions" );
     jsonp_ulong( gui->http, "id", id );
     jsonp_open_object( gui->http, "value" );
-      fd_gui_leader_slot_t lmeta[ 1 ];
-      int have_lmeta = fd_gui_load_leader_meta( gui, _slot, lmeta );
+      fd_gui_leader_slot_t const * lmeta = slot->bank_seq==ULONG_MAX ? fd_gui_slot_leader_get_any( gui, _slot ) : fd_gui_slot_leader_get( gui, _slot, slot->bank_seq );
+      int have_lmeta = !!lmeta;
 
       jsonp_open_object( gui->http, "publish" );
         jsonp_ulong( gui->http, "slot", _slot );
@@ -2457,13 +2457,9 @@ fd_gui_printf_slot_transactions_request( fd_gui_t *            gui,
       ulong                      txn_cnt   = 0UL;
       int                        have_txns = gui->db && processed_all_microblocks && have_leader_window;
 
-      if( FD_LIKELY( have_txns ) ) {
-        /* Bound both scans to this slot's leader window, widened by a
-           slack to prevent losing txn's that come in right before or
-           right after the recorded leader window. */
-        long const txn_window_slack_ns = 2L*1000L*1000L*1000L; /* 2 s */
-        long txn_lo_ns = lmeta->leader_start_time - txn_window_slack_ns;
-        long txn_hi_ns = lmeta->leader_end_time   + txn_window_slack_ns;
+      if( FD_LIKELY( have_txns && lmeta->txn_insert_time_min_ns<=lmeta->txn_insert_time_max_ns ) ) {
+        long txn_lo_ns = lmeta->txn_insert_time_min_ns;
+        long txn_hi_ns = lmeta->txn_insert_time_max_ns;
 
         /* Scan the start half, keeping only this slot's records. */
         fd_gui_hist_iter_t it;
@@ -2808,6 +2804,13 @@ fd_gui_printf_boot_progress( fd_gui_t * gui ) {
         default: FD_LOG_ERR(( "unknown phase %d", gui->summary.boot_progress.phase ));
       }
 
+      if( FD_LIKELY( gui->summary.boot_progress.phase>=FD_GUI_BOOT_PROGRESS_TYPE_WAITING_FOR_SUPERMAJORITY
+                  && gui->summary.boot_progress.boot_target_slot_duration_nanos!=ULONG_MAX ) ) {
+        jsonp_ulong( gui->http, "boot_target_slot_duration_nanos", gui->summary.boot_progress.boot_target_slot_duration_nanos );
+      } else {
+        jsonp_null( gui->http, "boot_target_slot_duration_nanos" );
+      }
+
       jsonp_string( gui->http, "accounts_database_path", gui->summary.accounts_database_path );
       jsonp_string( gui->http, "gui_database_path", gui->summary.gui_database_path );
 
@@ -2826,9 +2829,6 @@ fd_gui_printf_boot_progress( fd_gui_t * gui ) {
         jsonp_ulong_as_str( gui->http, "loading_" FD_STRINGIFY(snapshot_type) "_snapshot_decompress_bytes_compressed",      gui->summary.boot_progress.loading_snapshot[ snapshot_idx ].decompress_bytes_compressed                          ); \
         jsonp_ulong_as_str( gui->http, "loading_" FD_STRINGIFY(snapshot_type) "_snapshot_insert_bytes_decompressed",        gui->summary.boot_progress.loading_snapshot[ snapshot_idx ].insert_bytes_decompressed                            ); \
         jsonp_ulong       ( gui->http, "loading_" FD_STRINGIFY(snapshot_type) "_snapshot_insert_accounts",                  gui->summary.boot_progress.loading_snapshot[ snapshot_idx ].insert_accounts_current                              ); \
-        jsonp_ulong_as_str( gui->http, "loading_" FD_STRINGIFY(snapshot_type) "_snapshot_snapwr_in_bytes_decompressed",     gui->summary.boot_progress.loading_snapshot[ snapshot_idx ].snapwr_in_bytes_decompressed                         ); \
-        jsonp_ulong_as_str( gui->http, "loading_" FD_STRINGIFY(snapshot_type) "_snapshot_snapwr_out_bytes_decompressed",    gui->summary.boot_progress.loading_snapshot[ snapshot_idx ].snapwr_out_bytes_decompressed                        ); \
-        jsonp_ulong       ( gui->http, "loading_" FD_STRINGIFY(snapshot_type) "_snapshot_snapwr_accounts",                  gui->summary.boot_progress.loading_snapshot[ snapshot_idx ].snapwr_accounts_current                              ); \
       } else { \
         jsonp_null( gui->http, "loading_" FD_STRINGIFY(snapshot_type) "_snapshot_elapsed_seconds"                  ); \
         jsonp_null( gui->http, "loading_" FD_STRINGIFY(snapshot_type) "_snapshot_reset_count"                      ); \
@@ -2840,9 +2840,6 @@ fd_gui_printf_boot_progress( fd_gui_t * gui ) {
         jsonp_null( gui->http, "loading_" FD_STRINGIFY(snapshot_type) "_snapshot_decompress_bytes_compressed"      ); \
         jsonp_null( gui->http, "loading_" FD_STRINGIFY(snapshot_type) "_snapshot_insert_bytes_decompressed"        ); \
         jsonp_null( gui->http, "loading_" FD_STRINGIFY(snapshot_type) "_snapshot_insert_accounts"                  ); \
-        jsonp_null( gui->http, "loading_" FD_STRINGIFY(snapshot_type) "_snapshot_snapwr_in_bytes_decompressed"     ); \
-        jsonp_null( gui->http, "loading_" FD_STRINGIFY(snapshot_type) "_snapshot_snapwr_out_bytes_decompressed"    ); \
-        jsonp_null( gui->http, "loading_" FD_STRINGIFY(snapshot_type) "_snapshot_snapwr_accounts"                  ); \
       } \
     }
 
@@ -3205,36 +3202,28 @@ fd_gui_printf_shreds_window( fd_gui_t * gui, long after_ns, long before_ns ) {
   /* find the min slot / min ts across the window (for delta encoding). */
   ulong min_slot = ULONG_MAX;
   long  min_ts   = LONG_MAX;
-  if( FD_LIKELY( gui->db ) ) {
-    fd_gui_hist_iter_t it;
-    if( FD_LIKELY( !fd_gui_hist_range_begin( gui, &it, FD_GUI_HIST_SHRED_EVENTS, after_ns, before_ns, NULL, NULL ) ) ) {
-      while( fd_gui_hist_range_next( &it ) ) {
-        fd_gui_slot_history_shred_event_t const * e = (fd_gui_slot_history_shred_event_t const *)it.rec;
-        if( FD_UNLIKELY( e->timestamp<after_ns || e->timestamp>before_ns ) ) continue;
-        min_slot = fd_ulong_min( min_slot, e->slot );
-        min_ts   = fd_long_min ( min_ts,   e->timestamp );
-      }
-      fd_gui_hist_range_end( &it );
-    }
+  fd_gui_shred_event_iter_t it[ 1 ];
+  fd_gui_shred_event_iter_begin( gui, it, after_ns, before_ns );
+  while( fd_gui_shred_event_iter_next( it ) ) {
+    fd_gui_shred_event_t const * e = &it->event;
+    min_slot = fd_ulong_min( min_slot, e->slot );
+    min_ts   = fd_long_min ( min_ts,   e->event_time_ns );
   }
+  fd_gui_shred_event_iter_end( it );
 
   jsonp_ulong      ( gui->http, "reference_slot", min_slot );
   jsonp_long_as_str( gui->http, "reference_ts",   min_ts   );
 
 #define SHREDS_WINDOW_ITER( code ) \
   do { \
-    if( FD_LIKELY( gui->db ) ) { \
-      fd_gui_hist_iter_t it; \
-      if( FD_LIKELY( !fd_gui_hist_range_begin( gui, &it, FD_GUI_HIST_SHRED_EVENTS, after_ns, before_ns, NULL, NULL ) ) ) { \
-        while( fd_gui_hist_range_next( &it ) ) { \
-          fd_gui_slot_history_shred_event_t const * e = (fd_gui_slot_history_shred_event_t const *)it.rec; (void)e; \
-          ulong db_event_slot = e->slot; (void)db_event_slot; \
-          if( FD_UNLIKELY( e->timestamp<after_ns || e->timestamp>before_ns ) ) continue; \
-          do { code } while(0); \
-        } \
-        fd_gui_hist_range_end( &it ); \
-      } \
+    fd_gui_shred_event_iter_t _it[ 1 ]; \
+    fd_gui_shred_event_iter_begin( gui, _it, after_ns, before_ns ); \
+    while( fd_gui_shred_event_iter_next( _it ) ) { \
+      fd_gui_shred_event_t const * e = &_it->event; (void)e; \
+      ulong db_event_slot = e->slot; (void)db_event_slot; \
+      do { code } while(0); \
     } \
+    fd_gui_shred_event_iter_end( _it ); \
   } while(0)
 
   jsonp_open_array( gui->http, "slot_delta" );
@@ -3242,7 +3231,7 @@ fd_gui_printf_shreds_window( fd_gui_t * gui, long after_ns, long before_ns ) {
   jsonp_close_array( gui->http );
   jsonp_open_array( gui->http, "shred_idx" );
     SHREDS_WINDOW_ITER({
-      if( FD_LIKELY( e->shred_idx!=USHORT_MAX ) ) jsonp_ulong( gui->http, NULL, e->shred_idx );
+      if( FD_LIKELY( e->idx!=USHORT_MAX ) ) jsonp_ulong( gui->http, NULL, e->idx );
       else                                        jsonp_null ( gui->http, NULL );
     });
   jsonp_close_array( gui->http );
@@ -3250,7 +3239,7 @@ fd_gui_printf_shreds_window( fd_gui_t * gui, long after_ns, long before_ns ) {
     SHREDS_WINDOW_ITER( { jsonp_ulong( gui->http, NULL, e->event ); } );
   jsonp_close_array( gui->http );
   jsonp_open_array( gui->http, "event_ts_delta" );
-    SHREDS_WINDOW_ITER( { jsonp_long_as_str( gui->http, NULL, e->timestamp-min_ts ); } );
+    SHREDS_WINDOW_ITER( { jsonp_long_as_str( gui->http, NULL, e->event_time_ns-min_ts ); } );
   jsonp_close_array( gui->http );
 
 #undef SHREDS_WINDOW_ITER

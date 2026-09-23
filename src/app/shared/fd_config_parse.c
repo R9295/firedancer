@@ -92,6 +92,7 @@ fd_config_extract_podf( uchar *        pod,
   CFG_POP      ( uint,   layout.execle_tile_count                            );
   CFG_POP      ( uint,   layout.gossvf_tile_count                            );
   CFG_POP      ( uint,   layout.snapdc_tile_count                            );
+  CFG_POP      ( uint,   layout.snapin_tile_count                            );
   CFG_POP      ( uint,   layout.snapzp_tile_count                            );
   CFG_POP      ( uint,   layout.snapsv_tile_count                            );
   CFG_POP      ( uint,   layout.snapsv_io_worker_count                       );
@@ -282,7 +283,6 @@ fd_config_extract_pod( uchar *       pod,
   CFG_POP      ( ushort, tiles.gui.gui_listen_port                        );
   CFG_POP      ( ulong,  tiles.gui.max_http_connections                   );
   CFG_POP      ( ulong,  tiles.gui.max_websocket_connections              );
-  CFG_POP      ( ulong,  tiles.gui.max_http_request_length                );
   CFG_POP      ( ulong,  tiles.gui.send_buffer_size_mb                    );
   CFG_POP      ( ulong,  tiles.gui.db_size_gib                            );
 
@@ -291,7 +291,6 @@ fd_config_extract_pod( uchar *       pod,
   CFG_POP      ( ushort, tiles.rpc.rpc_listen_port                        );
   CFG_POP      ( ulong,  tiles.rpc.max_http_connections                   );
   CFG_POP      ( ulong,  tiles.rpc.max_websocket_connections              );
-  CFG_POP      ( ulong,  tiles.rpc.max_http_request_length                );
   CFG_POP      ( ulong,  tiles.rpc.send_buffer_size_mb                    );
   CFG_POP      ( bool,   tiles.rpc.delay_startup                          );
 

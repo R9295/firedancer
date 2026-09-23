@@ -566,6 +566,7 @@ Some interesting transitions are,
 	"key": "boot_progress",
     "value": {
         "phase": "waiting_for_supermajority",
+        "boot_target_slot_duration_nanos": 400000000,
         "accounts_database_path": "/path/to/accounts.db",
         "gui_database_path": "/path/to/gui.db",
         "joining_gossip_elapsed_seconds": 5,
@@ -579,9 +580,6 @@ Some interesting transitions are,
         "loading_full_snapshot_decompress_bytes_compressed": "826495323",
         "loading_full_snapshot_insert_bytes_decompressed": "4864409599",
         "loading_full_snapshot_insert_accounts": 10634591,
-        "loading_full_snapshot_snapwr_in_bytes_decompressed": "4864409599",
-        "loading_full_snapshot_snapwr_out_bytes_decompressed": "4892160000",
-        "loading_full_snapshot_snapwr_accounts": 10634591,
         "loading_incremental_snapshot_elapsed_seconds": null,
         "loading_incremental_snapshot_reset_count": null,
         "loading_incremental_snapshot_slot": null,
@@ -592,9 +590,6 @@ Some interesting transitions are,
         "loading_incremental_snapshot_decompress_bytes_compressed": null,
         "loading_incremental_snapshot_insert_bytes_decompressed": null,
         "loading_incremental_snapshot_insert_accounts": null,
-        "loading_incremental_snapshot_snapwr_in_bytes_decompressed": null,
-        "loading_incremental_snapshot_snapwr_out_bytes_decompressed": null,
-        "loading_incremental_snapshot_snapwr_accounts": null,
         "wait_for_supermajority_bank_hash": "2CeCyRoYmcctDmbXWrSUfTT4aQkGVCnArAmbdmQ5dGFi",
         "wait_for_supermajority_shred_version": "37500",
         "wait_for_supermajority_attempt": 1,
@@ -614,6 +609,7 @@ Some interesting transitions are,
 | Field                                                                 | Type            | Description |
 |-----------------------------------------------------------------------|-----------------|-------------|
 | phase                                                                 | `string`        | One of `joining_gossip`, `loading_full_snapshot`, `loading_incremental_snapshot`, `catching_up`, `waiting_for_supermajority`, or `running`. This indicates the current phase of the boot process |
+| boot_target_slot_duration_nanos                                       | `number\|null`  | Target slot duration in nanoseconds for the epoch containing the boot snapshot slot, preferring the incremental snapshot over the full snapshot. `null` at startup until known |
 | accounts_database_path                                                | `string`        | Absolute path to the on-disk accounts database file that this validator loads accounts into |
 | gui_database_path                                                     | `string`        | Absolute path to the on-disk gui database file that this validator saves historical monitoring info into |
 | joining_gossip_elapsed_seconds                                        | `number`        | If the phase is `joining_gossip`, this is the duration, in seconds, spent joining the gossip network |
@@ -627,9 +623,6 @@ Some interesting transitions are,
 | loading_{full\|incremental}_snapshot_decompress_bytes_compressed      | `number\|null`  | If the phase is at least `loading_{full\|incremental}_snapshot`, this is the (compressed) number of bytes processed by decompress from the snapshot so far. Otherwise, `null` |
 | loading_{full\|incremental}_snapshot_insert_bytes_decompressed        | `number\|null`  | If the phase is at least `loading_{full\|incremental}_snapshot`, this is the (decompressed) number of bytes processed from the snapshot by the snapshot insert time so far. Otherwise, `null` |
 | loading_{full\|incremental}_snapshot_insert_accounts                  | `number\|null`  | If the phase is at least `loading_{full\|incremental}_snapshot`, this is the current number of accounts inserted into the validator's accounts database from this snapshot. Otherwise, `null` |
-| loading_{full\|incremental}_snapshot_snapwr_in_bytes_decompressed     | `number\|null`  | If the phase is at least `loading_{full\|incremental}_snapshot`, this is the (decompressed) number of bytes consumed from the snapshot by the snapshot write (snapwr) stage so far. Otherwise, `null` |
-| loading_{full\|incremental}_snapshot_snapwr_out_bytes_decompressed    | `number\|null`  | If the phase is at least `loading_{full\|incremental}_snapshot`, this is the number of bytes written to the on-disk account database by the snapshot write (snapwr) stage for this snapshot so far. Otherwise, `null` |
-| loading_{full\|incremental}_snapshot_snapwr_accounts                  | `number\|null`  | If the phase is at least `loading_{full\|incremental}_snapshot`, this is the current number of accounts written to the on-disk account database by the snapshot write (snapwr) stage for this snapshot so far. Otherwise, `null` |
 | wait_for_supermajority_bank_hash                                      | `string\|null`  | If the client was configured to include the `waiting_for_supermajority` phase at startup, this is the expected bank hash of the snapshot bank.  This ensures all validators join the cluster with the same starting state. `null` if wait for supermajority is not enabled |
 | wait_for_supermajority_shred_version                                  | `string\|null`  | If the client was configured to include the `waiting_for_supermajority` phase at startup, this is the expected shred version it was configured with.  Shred version is functionally a hash of (genesis_hash, cluster_restart_history) which ensures only nodes which explicitly agree on the restart slot and restart attempt count can communicate with each other. `null` if wait for supermajority is not configured |
 | wait_for_supermajority_attempt                                        | `number\|null`  | If the client was configured to include the `waiting_for_supermajority` phase at startup, this is the number of times this cluster has been restarted onto the snapshot slot, including the current attempt. `null` if wait for supermajority is not configured |
@@ -1631,9 +1624,9 @@ seconds. The Firedancer allocation breakdown is fixed at startup.
     "key": "live_system_resources",
     "value": {
         "cpus": [
-            { "online": true, "numa_node": 0, "sibling_cpu": 2, "tile_idxs": [0, 3] },
-            { "online": true, "numa_node": 0, "sibling_cpu": null, "tile_idxs": [1] },
-            { "online": true, "numa_node": 0, "sibling_cpu": 0, "tile_idxs": [] }
+            { "online": true, "numa_node": 0, "die_idx": 0, "sibling_cpu": 2, "tile_idxs": [0, 3] },
+            { "online": true, "numa_node": 0, "die_idx": 0, "sibling_cpu": null, "tile_idxs": [1] },
+            { "online": true, "numa_node": 0, "die_idx": 0, "sibling_cpu": 0, "tile_idxs": [] }
         ],
         "memory": {
             "available_bytes": 326417514496,
@@ -1699,6 +1692,7 @@ seconds. The Firedancer allocation breakdown is fixed at startup.
 |-------------|------------------|-------------|
 | online      | `boolean`        | Whether the CPU was online at validator startup |
 | numa_node   | `number`         | NUMA node containing this CPU |
+| die_idx     | `number \| null` | Linux-reported processor die containing this CPU, or `null` when package or die metadata is unavailable or invalid. Known `die_idx` values are dense, zero-based indices assigned to distinct Linux `(physical_package_id, die_id)` pairs in ascending logical CPU order |
 | sibling_cpu | `number \| null` | Logical CPU ID of the other hyperthread on the same physical core, or `null` when there is no known sibling. This ID indexes the `cpus` array |
 | tile_idxs   | `number[]`       | Indices in `summary.tiles` of tiles pinned to this CPU. Multiple entries indicate configured CPU sharing, for example between startup and post-start tiles. Tiles the kernel schedules across CPUs are not listed |
 
@@ -1980,7 +1974,7 @@ since process start.
 | compaction        | `Compaction`     | Aggregate compaction activity (see below) |
 | cache             | `Cache`          | In-memory cache occupancy and per-size-class metrics (see below) |
 | io                | `Io`             | Aggregate IO counters and rates across all accdb joiners (see below) |
-| tiles             | `Tile[]`         | Per-tile breakdown of accdb activity, one entry per consumer tile in stable order. The snapshot-loader `snapwr` row disappears once it reaches the shutdown status |
+| tiles             | `Tile[]`         | Per-tile breakdown of accdb activity in stable order. Snapshot-loader `snapin` rows disappear after shutdown |
 | partitions        | `Partition[]`    | Per-partition snapshot. Partitions that have never been written and are not being compacted are omitted |
 
 **`Disk`**
@@ -2061,23 +2055,23 @@ to 128 B, `1` covers 129 B - 512 B, `2` covers 513 B - 2 KiB, `3` covers
 **`Tile`**
 | Field                       | Type     | Description |
 |-----------------------------|----------|-------------|
-| name                        | `string` | Tile kind name, e.g. `execle`, `execrp`, `replay`, `tower`, `rpc`, `resolv`, or `snapwr` |
+| name                        | `string` | Tile kind name, e.g. `execle`, `execrp`, `replay`, `tower`, `rpc`, `resolv`, or `accdb` |
 | kind_id                     | `number` | Instance index within this tile kind |
-| joiner_type                 | `string` | `RW` if the tile reads and writes accounts (`execle`, `execrp`, `replay`, `tower`, `snapwr`), `RO` if it only reads (`rpc`, `resolv`) |
+| joiner_type                 | `string` | `RW` if the tile reads and writes accounts (`execle`, `execrp`, `replay`, `tower`, `accdb`), `RO` if it only reads (`rpc`, `resolv`) |
 | status                      | `number` | `1` if the tile is running, `2` if it has gracefully shut down |
 | acquired                    | `number` | Cumulative count of accounts this tile has acquired since startup |
 | bytes_read                  | `number` | Cumulative bytes this tile has read from disk since startup |
 | bytes_written               | `number` | Cumulative bytes this tile has written to disk since startup |
 | acquired_per_sec            | `number` | Recent acquire rate for this tile, in accounts per second |
-| acquired_writable_per_sec   | `number` | Recent writable acquire rate for this tile, in accounts per second (always `0` for `RO` tiles and `snapwr`) |
+| acquired_writable_per_sec   | `number` | Recent writable acquire rate for this tile, in accounts per second (always `0` for `RO` tiles and `accdb`) |
 | bytes_read_per_sec          | `number` | Recent disk read throughput for this tile, in bytes per second |
 | bytes_copied_per_sec        | `number` | Recent cache-hit copy throughput for this tile, in bytes per second |
 | bytes_written_per_sec       | `number` | Recent disk write throughput for this tile, in bytes per second |
 | read_ops_per_sec            | `number` | Recent disk read operation rate for this tile |
 | write_ops_per_sec           | `number` | Recent disk write operation rate for this tile |
 | not_found_per_sec           | `number` | Recent rate of cache misses (account had to be read from disk) for this tile |
-| evicted_per_sec             | `number` | Recent rate at which this tile's commits evicted lines from the cache (always `0` for `RO` tiles and `snapwr`) |
-| committed_per_sec           | `number` | Recent rate of account version commits (new + overwrite) by this tile (always `0` for `RO` tiles and `snapwr`) |
+| evicted_per_sec             | `number` | Recent rate at which this tile's commits evicted lines from the cache (always `0` for `RO` tiles) |
+| committed_per_sec           | `number` | Recent rate of account version commits (new + overwrite) by this tile (always `0` for `RO` tiles and `accdb`) |
 | acquire_calls_per_sec       | `number` | Recent rate of accounts database acquire calls (account lookups) by this tile |
 | hit_rate_ema                | `number` | Recent cache hit rate for this tile, in the range `[0, 1]` |
 
@@ -2828,15 +2822,16 @@ UNIX nanosecond timestamp window.
 
 | param    | type     | description |
 |----------|----------|-------------|
-| start_ns | `string` | Inclusive lower bound of the UNIX nanosecond timestamp window to query for shred events |
-| end_ns   | `string` | Inclusive upper bound of the UNIX nanosecond timestamp window to query for shred events |
+| start_ns | `string` | Inclusive lower bound of the GUI insertion-time window, as a UNIX timestamp in nanoseconds |
+| end_ns   | `string` | Inclusive upper bound of the GUI insertion-time window, as a UNIX timestamp in nanoseconds |
 
 WebSocket clients may request historical shred metadata over a UNIX
-nanosecond timestamp window.  The requested window must not exceed 10
+nanosecond timestamp window.  The requested window must not exceed 60
 seconds.  The response has the same shape as the live `slot.live_shreds`
-topic and covers every shred event recorded in the window across all
-slots.  If no shred events fall in the window, the response arrays will
-be empty.
+topic and includes retained events which were inserted into the server
+database during that window.  Events are available as they arrive,
+without waiting for replay completion. If no shred events fall in the
+window, the response arrays are empty.
 
 ::: details Example
 
@@ -2987,6 +2982,7 @@ and the validator changes which block it associates with the slot.
 | finalization_kind       | `string\|null`  | Strongest finality proof known for this slot: `fast`, `slow`, `implicit`, or `null`. `fast` supersedes `slow`, and either direct proof supersedes `implicit`. A terminal `rooted` or `skipped` level always has a non-null value; `skipped` uses `implicit` |
 | vote_slot               | `number\|null`  | Latest slot for which this validator's vote was included in a reward certificate, as of this slot's replay. It is the slot voted on, not the slot which carried the certificate. It is `null` when this validator has no recorded reward-certificate participation yet |
 | vote_rewarded           | `boolean\|null` | Whether this validator's ordinary notarize or skip vote for this slot was included in the reward certificate carried by `slot + 8`. It is `null` until the reward outcome is known, or when `is_voter` for this slot is false. Once resolved, the server republishes this slot with `true` or `false`. |
+| vote_count              | `number\|null`  | Number of distinct validators that voted for this slot, counting each signer once across the notarize and skip reward certificates carried by `slot + 8`. It is `null` before those certificates are replayed |
 
 #### `slot.skipped_history`
 | frequency | type       | example |
@@ -3117,7 +3113,7 @@ and is broadcast to all WebSocket clients.
 | reference_ts    | `number`           | The smallest UNIX nanosecond event timestamp number across all the events in a given message |
 | slot_delta      | `number[]`         | `reference_slot + slot_delta[i]` is the slot to which shred event `i` belongs |
 | shred_idx       | `(number\|null)[]` | `shred_idx[i]` is the slot shred index of the shred for shred event `i`.  If null, then shred event `i` applies to all shreds in the slot (i.e. this is used for `slot_complete`) |
-| event           | `number[]`         | `event[i]` is the enum value for shred event `i`. Possible values are `repair_request` (0), `shred_received_turbine` (1), `shred_received_repair` (2), `shred_replay_exec_done` (3), `shred_replay_exec_start` (4), and `slot_complete` (5) |
+| event           | `number[]`         | `event[i]` is the enum value for shred event `i`. Possible values are `repair_request` (0), `shred_received_turbine` (1), `shred_received_repair` (2), `shred_replay_exec_done` (3), `slot_complete` (4), and `shred_published` (6) |
 | event_ts_delta  | `string[]`         | `reference_ts + event_ts_delta[i]` is the UNIX nanosecond timestamp when shred event `i` occurred |
 
 #### `slot.update`
@@ -3263,7 +3259,8 @@ explicitly mentioned, skipped slots are not included.
             "tips": "0",
             "is_voter": true,
             "vote_slot": 289245043,
-            "vote_rewarded": true
+            "vote_rewarded": true,
+            "vote_count": 115
         }
     }
 }
@@ -3319,7 +3316,8 @@ explicitly mentioned, skipped slots are not included.
             "tips": "0",
             "is_voter": true,
             "vote_slot": 289245043,
-            "vote_rewarded": true
+            "vote_rewarded": true,
+            "vote_count": 115
         },
         "waterfall": {
             "in": {
@@ -3485,7 +3483,8 @@ explicitly mentioned, skipped slots are not included.
             "tips": "0",
             "is_voter": true,
             "vote_slot": 289245043,
-            "vote_rewarded": true
+            "vote_rewarded": true,
+            "vote_count": 115
         },
         "limits": {
             "used_total_block_cost": 10000000,

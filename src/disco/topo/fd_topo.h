@@ -229,8 +229,10 @@ struct fd_topo_tile {
     struct {
       fd_topo_net_tile_t net;
       /* sock specific options */
-      int so_sndbuf;
-      int so_rcvbuf;
+      int   so_sndbuf;
+      int   so_rcvbuf;
+      int   only_recv_lo;
+      ulong net_tile_id;
     } sock;
 
     struct {
@@ -435,7 +437,6 @@ struct fd_topo_tile {
 
       ulong  max_http_connections;
       ulong  max_websocket_connections;
-      ulong  max_http_request_length;
       ulong  send_buffer_size_mb;
       ulong  db_size_gib;
       int    schedule_strategy;
@@ -458,7 +459,6 @@ struct fd_topo_tile {
       ulong max_http_connections;
       ulong max_websocket_connections;
       ulong send_buffer_size_mb;
-      ulong max_http_request_length;
 
       ulong max_live_slots;
       ulong genesis_max_message_size;
@@ -723,12 +723,9 @@ struct fd_topo_tile {
       ulong accdb_obj_id;
       ulong txncache_obj_id;
       ulong banks_obj_id;
+      ulong shmem_obj_id; /* shared parallel snapin state */
       ulong max_txn_per_slot;
     } snapin;
-
-    struct {
-      ulong partition_sz;
-    } snapwr;
 
     struct {
 

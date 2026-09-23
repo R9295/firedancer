@@ -405,6 +405,11 @@ fd_topo_initialize( config_t * config ) {
   }
   FD_TEST( fd_pod_insertf_ulong( topo->props, pohh_shred_obj->id, "pohh_shred" ) );
 
+  if( 0==strcmp( config->net.provider, "mlx5" ) ) {
+    ulong net_tile_id = fd_topo_find_tile( topo, fd_net_tile_name( config->net.provider ), 0UL );
+    FD_TEST( net_tile_id!=ULONG_MAX );
+    fd_topos_sock_lo( topo, &topo->tiles[ net_tile_id ] );
+  }
   FOR(net_tile_cnt) fd_topos_net_tile_finish( topo, i );
 
   fd_topob_waker( topo );
@@ -575,7 +580,6 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     fd_cstr_ncpy( tile->gui.vote_key_path, config->paths.vote_account, sizeof(tile->gui.vote_key_path) );
     tile->gui.max_http_connections      = config->tiles.gui.max_http_connections;
     tile->gui.max_websocket_connections = config->tiles.gui.max_websocket_connections;
-    tile->gui.max_http_request_length   = config->tiles.gui.max_http_request_length;
     tile->gui.send_buffer_size_mb       = config->tiles.gui.send_buffer_size_mb;
     tile->gui.schedule_strategy         = config->tiles.pack.schedule_strategy_enum;
     tile->gui.websocket_compression     = config->development.gui.websocket_compression;

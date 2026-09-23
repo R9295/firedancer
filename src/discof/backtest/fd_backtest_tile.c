@@ -8,7 +8,8 @@
 #include "../../discof/rotor/fd_rotor_tile.h"
 #include "../../discof/restore/utils/fd_ssmsg.h"
 #include "../../discof/tower/fd_tower_tile.h"
-#include "../../discof/votor/fd_votor_rooted.h"
+#include "../../discof/votor/fd_votor_tile.h"
+#include "../../choreo/votor/ag_cert.h"
 #include "../../discof/genesis/fd_genesi_tile.h"
 #include "../../discof/genesis/genesis_hash.h"
 #include "../../util/pod/fd_pod.h"
@@ -248,15 +249,19 @@ after_credit( fd_backt_tile_t *   ctx,
   }
 
   fd_store_fec_t * fec = fd_store_query( ctx->map_join, &mr );
-  if( FD_UNLIKELY( !fec->data_sz ) ) memset( fec->shred_offs, 0, sizeof(fec->shred_offs) );
+  if( FD_UNLIKELY( !fec->data_sz ) ) memset( fec->shred_sz, 0, sizeof(fec->shred_sz) );
   if( FD_UNLIKELY( fec->data_sz+fd_shred_payload_sz( shred )>ctx->store->fec_data_max ) ) {
     FD_LOG_ERR(( "backtest FEC payload exceeds store maximum (%lu>%lu)",
                  fec->data_sz+fd_shred_payload_sz( shred ), ctx->store->fec_data_max ));
   }
-  fd_memcpy( fd_store_fec_data( ctx->store, fec ) + fec->data_sz, fd_shred_data_payload( shred ), fd_shred_payload_sz( shred ) );
-  fec->data_sz += fd_shred_payload_sz( shred );
+  ulong payload_sz = fd_shred_payload_sz( shred );
+  fd_memcpy( fd_store_fec_data( ctx->store, fec ) + fec->data_sz, fd_shred_data_payload( shred ), payload_sz );
+  fec->data_sz += (uint)payload_sz;
   ulong shred_idx = out_shred_idx - ctx->out_fec_set_idx;
-  if( FD_LIKELY( shred_idx<FD_FEC_SHRED_CNT ) ) fec->shred_offs[ shred_idx ] = (uint)fec->data_sz;
+  if( FD_LIKELY( shred_idx<FD_FEC_SHRED_CNT ) ) {
+    FD_TEST( payload_sz<=USHORT_MAX );
+    fec->shred_sz[ shred_idx ] = (ushort)payload_sz;
+  }
   if( FD_UNLIKELY( completes_fec_set ) ) fd_store_fec_data_publish( ctx->store, fec );
 
   ctx->shreds_idx = (ctx->shreds_idx+1UL)%SHRED_BUFFER_LEN;
@@ -280,6 +285,8 @@ after_credit( fd_backt_tile_t *   ctx,
     rotor_fec->parent_slot   = parent_slot;
     rotor_fec->data_complete = !!(shred->data.flags & FD_SHRED_DATA_FLAG_DATA_COMPLETE);
     rotor_fec->slot_complete = completes_slot;
+
+    rotor_fec->metrics.highest_fec_complete_slot = shred->slot;
     if( FD_UNLIKELY( ctx->out_fec_set_idx==0UL ) ) {
       if( FD_UNLIKELY( parent_slot==ctx->start_slot ) ) {
         rotor_fec->parent_block_id = ctx->rooted_slots_block_id[ parent_slot % BANK_HASH_BUFFER_LEN ];
@@ -563,15 +570,17 @@ returnable_frag( fd_backt_tile_t *   ctx,
       int root_advanced = root_slot!=ctx->prev_root;
       ctx->prev_root    = root_slot;
 
-      /* If we are in Alpenglow mode, send votor rooted frags to
-         advance replay. */
+      /* Under Alpenglow the backtest tile stands in for votor and
+         certifies the root slot fast finalized so replay roots it. */
       if( ctx->alpenglow ) {
         if( FD_LIKELY( root_advanced ) ) {
-          fd_votor_rooted_t * rooted = fd_chunk_to_laddr( ctx->votor_out->mem, ctx->votor_out->chunk );
-          rooted->slot     = root_slot;
-          rooted->block_id = ctx->rooted_slots_block_id[ root_slot%BANK_HASH_BUFFER_LEN ];
-          fd_stem_publish( stem, ctx->votor_out->idx, FD_VOTOR_SIG_ROOTED, ctx->votor_out->chunk, sizeof(fd_votor_rooted_t), 0UL, tspub, fd_frag_meta_ts_comp( fd_tickcount() ) );
-          ctx->votor_out->chunk = fd_dcache_compact_next( ctx->votor_out->chunk, sizeof(fd_votor_rooted_t), ctx->votor_out->chunk0, ctx->votor_out->wmark );
+          fd_votor_certed_t * certed = fd_chunk_to_laddr( ctx->votor_out->mem, ctx->votor_out->chunk );
+          memset( certed, 0, sizeof(fd_votor_certed_t) );
+          certed->kind     = AG_CERT_KIND_FAST_FINAL;
+          certed->slot     = root_slot;
+          certed->block_id = ctx->rooted_slots_block_id[ root_slot%BANK_HASH_BUFFER_LEN ];
+          fd_stem_publish( stem, ctx->votor_out->idx, FD_VOTOR_SIG_CERTED, ctx->votor_out->chunk, sizeof(fd_votor_msg_t), 0UL, tspub, fd_frag_meta_ts_comp( fd_tickcount() ) );
+          ctx->votor_out->chunk = fd_dcache_compact_next( ctx->votor_out->chunk, sizeof(fd_votor_msg_t), ctx->votor_out->chunk0, ctx->votor_out->wmark );
         }
         break;
       }

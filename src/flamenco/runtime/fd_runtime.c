@@ -1640,7 +1640,7 @@ fd_runtime_init_bank_from_genesis( fd_banks_t *         banks,
     /* A chain may activate Alpenglow in genesis.  Epoch 0 does not
        cross an epoch boundary, so assign ranks to the copied t-2 set
        here just as fd_vote_stakes_new_fork does at later boundaries. */
-    fd_vote_stakes_finalize( vote_stakes, 0UL );
+    fd_vote_stakes_finalize( vote_stakes, fork_id, FD_VOTE_STAKES_ITER_T_2 );
     fd_vote_stakes_refresh( vote_stakes, fork_id, accdb, bank->accdb_fork_id );
   }
 

@@ -73,13 +73,21 @@
    update with the parentUpdate marker.
 */
 
+#include <math.h>
+
 #include "../../disco/fd_disco_base.h"
 #include "../../disco/shred/fd_fec_set.h"
 #include "../../disco/store/fd_store.h"
 
 #define FD_CHAINER_MAGIC (0xf17eda2ce7c4a112UL) /* firedancer chainer v1 */
 
-#define FD_CHAINER_SLOT_VER_MAX 7 /* see Corollary 50 */
+#define FD_CHAINER_SLOT_VER_MAX      7 /* see Corollary 50 */
+#define FD_CHAINER_EXPECTED_SLOT_CNT (2.2) /* =(0.8*1 + 0.2*7). 80% of nodes expected to produce 1 version, 20% expected to produce up to 7. */
+
+#define FD_CHAINER_SRC_TURBINE   (0)
+#define FD_CHAINER_SRC_REPAIR    (1)
+#define FD_CHAINER_SRC_RECOVERED (2)
+#define FD_CHAINER_SRC_LEADER    (3)
 
 FD_STATIC_ASSERT( FD_FEC_SHRED_CNT==32UL, fd_chainer_fec_bitmap );
 
@@ -149,6 +157,31 @@ struct fd_chainer_slotv {
      re-add, so keeping the high-water mark here preserves it across
      those cycles. */
   uint            highest_requested; /* highest idx we've issued a repair request for, UINT_MAX = none */
+
+  /* Reception statistics. */
+  struct {
+    uint turbine_cnt;   /* data shreds received via turbine, plus every coding shred */
+    uint repair_cnt;    /* data shreds received via repair */
+    uint recovered_cnt; /* data shreds reconstructed via reed-solomon */
+    uint parity_cnt;    /* coding shreds received */
+
+    uint last_completed_fec_idx; /* fec_set_idx of the FEC set that most recently completed for this version */
+
+    long first_shred_ts; /* the version's first shred arrived, wallclock ns */
+    long last_shred_ts;  /* the version became fully buffered (buffered_idx==complete_idx), wallclock ns */
+
+    uint req_window_cnt;     /* positional specific-shred requests sent (Shred) */
+    uint req_highest_cnt;    /* highest-shred requests sent (HighestShred) */
+    uint req_orphan_cnt;     /* ancestry requests sent (Orphan) */
+    uint req_shred_bid_cnt;  /* alpenglow specific-shred requests sent (ShredForBlockId) */
+    uint req_parent_cnt;     /* alpenglow ancestry requests sent (ParentAndFecCount) */
+    uint req_fec_root_cnt;   /* alpenglow FEC-set-root requests sent (FecRoot) */
+    uint req_retransmit_cnt; /* requests re-issued after a timeout or a bad response, shred or metadata */
+    uint repair_responses;   /* repair responses matched to an outstanding request */
+
+    long first_req_ts;        /* wallclock ns of the first specific-shred request sent, 0 if none */
+    long last_repair_resp_ts; /* wallclock ns of the most recent matched repair response, 0 if none */
+  } metrics;
 };
 typedef struct fd_chainer_slotv fd_chainer_slotv_t;
 
@@ -280,19 +313,22 @@ fd_chainer_align( void ) {
   return fd_ulong_max( alignof(fd_chainer_t), 128UL );
 }
 
-/* fd_chainer_footprint returns the footprint for ele_max slots, each
-   with up to FD_CHAINER_SLOT_VER_MAX versions of up to
-   max_shreds_per_block data shreds (FD_SHRED_BLK_MAX in production,
-   larger under bench limits).  Returns 0 if max_shreds_per_block is not
-   a positive multiple of FD_FEC_SHRED_CNT, exceeds the 28-bit
-   fec_set_idx, or asks for more FEC elements than the uint pool and map
-   indices can address. */
+/* fd_chainer_blk_max returns the max number of block versions the
+   chainer tracks across ele_max slots, ie. ele_max *
+   FD_CHAINER_EXPECTED_SLOT_CNT rounded up.  This is the expected, not
+   the worst case: a slot may have up to FD_CHAINER_SLOT_VER_MAX
+   versions, but only a minority of leaders are expected to equivocate. */
+
+FD_FN_CONST static inline ulong
+fd_chainer_blk_max( ulong ele_max ) {
+  return (ulong)ceil( (double)ele_max * FD_CHAINER_EXPECTED_SLOT_CNT );
+}
 
 FD_FN_CONST static inline ulong
 fd_chainer_footprint( ulong ele_max,
                       ulong max_shreds_per_block ) {
   if( FD_UNLIKELY( !max_shreds_per_block || max_shreds_per_block%FD_FEC_SHRED_CNT || max_shreds_per_block>FD_SHRED_BLK_MAX_RAISED ) ) return 0UL;
-  ulong blk_max       = ele_max * FD_CHAINER_SLOT_VER_MAX;
+  ulong blk_max       = fd_chainer_blk_max( ele_max );
   ulong fec_blk_max   = max_shreds_per_block / FD_FEC_SHRED_CNT;
   ulong fec_max       = blk_max * fec_blk_max;
   if( FD_UNLIKELY( !fd_fec_pool_footprint( fec_max ) ) ) return 0UL;
@@ -365,22 +401,32 @@ fd_chainer_init( fd_chainer_t *    chainer,
    (verified_parent_fec_count keeps its own contract, below.)  Pointers
    stay valid until the next fd_chainer_publish. */
 
-/* fd_chainer_shred_insert inserts a shred into the chainer.  If the
-   parent_slot is provided, parent_block_id must also be provided.
-   Otherwise caller should pass AG_UNKNOWN_SLOT for parent_slot.
+/* fd_chainer_shred_insert inserts a data shred into the chainer.  If
+   the parent_slot is provided, parent_block_id must also be provided.
+   Otherwise caller should pass AG_UNKNOWN_SLOT for parent_slot.  src is
+   one of FD_CHAINER_SRC_*.
 
    The shred may be rejected (unauthorized equivocation); the caller
    does not need to know.  Returns the turbine version if this call
    created it, else NULL. */
 
 fd_chainer_slotv_t *
-fd_chainer_shred_insert( fd_chainer_t *        chainer,
-                         ulong                 slot,
-                         uint                  shred_idx,
-                         int                   slot_complete,
-                         fd_hash_t const *     mr,
-                         ulong                 parent_slot,
-                         fd_hash_t const *     parent_block_id );
+fd_chainer_shred_insert( fd_chainer_t *    chainer,
+                         ulong             slot,
+                         uint              shred_idx,
+                         int               slot_complete,
+                         int               src,
+                         long              rx_ts,
+                         fd_hash_t const * mr,
+                         ulong             parent_slot,
+                         fd_hash_t const * parent_block_id );
+
+void
+fd_chainer_code_shred_insert( fd_chainer_t *    chainer,
+                              ulong             slot,
+                              uint              fec_set_idx,
+                              long              rx_ts,
+                              fd_hash_t const * mr );
 
 /* fd_chainer_fec_complete returns the turbine version if this call
    created it, else NULL.  If opt_rejected is non-NULL it is set to 1
@@ -394,6 +440,7 @@ fd_chainer_fec_complete( fd_chainer_t *        chainer,
                          int                   slot_complete,
                          int                   data_complete,
                          int                   is_leader,
+                         long                  rx_ts,
                          fd_hash_t *           mr,
                          int *                 opt_rejected );
 
@@ -486,6 +533,44 @@ fd_chainer_publish( fd_chainer_t *    chainer,
                     ulong             slot,
                     fd_hash_t const * block_id,
                     fd_store_t *      store );
+
+/* fd_chainer_repair_tally records one repair request or response
+   against a block version.  A re-issued request counts only
+   as a retransmit, not additionally as a request of its original kind. */
+
+#define FD_CHAINER_REQ_WINDOW     (0)
+#define FD_CHAINER_REQ_HIGHEST    (1)
+#define FD_CHAINER_REQ_ORPHAN     (2)
+#define FD_CHAINER_REQ_SHRED_BID  (3)
+#define FD_CHAINER_REQ_PARENT     (4)
+#define FD_CHAINER_REQ_FEC_ROOT   (5)
+#define FD_CHAINER_REQ_RETRANSMIT (6)
+#define FD_CHAINER_REQ_RESPONSE   (7)
+
+static inline void
+fd_chainer_repair_tally( fd_chainer_slotv_t * slotv, int kind, long now ) {
+  if( FD_UNLIKELY( !slotv ) ) return;
+
+  if( FD_LIKELY( now ) ) {
+    if( kind==FD_CHAINER_REQ_WINDOW || kind==FD_CHAINER_REQ_SHRED_BID ) {
+      if( FD_UNLIKELY( !slotv->metrics.first_req_ts ) ) slotv->metrics.first_req_ts = now;
+    } else if( kind==FD_CHAINER_REQ_RESPONSE ) {
+      slotv->metrics.last_repair_resp_ts = now;
+    }
+  }
+
+  switch( kind ) {
+    case FD_CHAINER_REQ_WINDOW:     slotv->metrics.req_window_cnt++;     break;
+    case FD_CHAINER_REQ_HIGHEST:    slotv->metrics.req_highest_cnt++;    break;
+    case FD_CHAINER_REQ_ORPHAN:     slotv->metrics.req_orphan_cnt++;     break;
+    case FD_CHAINER_REQ_SHRED_BID:  slotv->metrics.req_shred_bid_cnt++;  break;
+    case FD_CHAINER_REQ_PARENT:     slotv->metrics.req_parent_cnt++;     break;
+    case FD_CHAINER_REQ_FEC_ROOT:   slotv->metrics.req_fec_root_cnt++;   break;
+    case FD_CHAINER_REQ_RETRANSMIT: slotv->metrics.req_retransmit_cnt++; break;
+    case FD_CHAINER_REQ_RESPONSE:   slotv->metrics.repair_responses++;   break;
+    default: FD_LOG_CRIT(( "bad chainer repair tally kind %d", kind ));
+  }
+}
 
 static inline fd_chainer_slotv_t *
 fd_chainer_slot_version_query( fd_chainer_t *    chainer,
