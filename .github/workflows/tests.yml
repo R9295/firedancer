@@ -111,13 +111,6 @@ jobs:
           source /opt/${{ matrix.compiler }}/${{ matrix.compiler }}-${{ matrix.compiler-version }}/activate
           make run-fuzz-test
 
-      - name: run votor scenario tests
-        if: ${{ matrix.run-unit-tests }}
-        run: |
-          source /opt/${{ matrix.compiler }}/${{ matrix.compiler }}-${{ matrix.compiler-version }}/activate
-          ./contrib/make-j EXTRAS="$EXTRAS no-cert-verify" test_ag_votor_scenarios
-          "$(make --silent objdir EXTRAS="$EXTRAS no-cert-verify")/unit-test/test_ag_votor_scenarios" 'src/choreo/votor/scenarios/*.json'
-
       - name: run test-vector tests
         if: ${{ matrix.run-unit-tests && matrix.test-case == 'native' }}
         run: |

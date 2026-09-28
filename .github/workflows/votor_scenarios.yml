@@ -1,0 +1,22 @@
+name: Votor Scenarios
+on:
+  pull_request:
+    paths:
+      - 'src/choreo/votor/**'
+      - 'config/extra/with-no-cert-verify.mk'
+      - '.github/workflows/votor_scenarios.yml'
+
+permissions: {}
+
+jobs:
+  votor-scenarios:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run votor scenarios
+        run: |
+          make -j CC=clang EXTRAS="asan ubsan no-cert-verify" test_ag_votor_scenarios
+          "$(make --silent objdir CC=clang EXTRAS="asan ubsan no-cert-verify")/unit-test/test_ag_votor_scenarios" 'src/choreo/votor/scenarios/*.json'
