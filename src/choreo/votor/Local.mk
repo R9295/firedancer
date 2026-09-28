@@ -16,10 +16,15 @@ $(call run-unit-test,test_ag_votor_base)
 $(call run-unit-test,test_ag_bls)
 $(call run-unit-test,test_ag_vote)
 $(call run-unit-test,test_ag_epoch_info)
+ifndef FD_AG_NO_CERT_VERIFY
 $(call run-unit-test,test_ag_cert)
+endif
 $(call run-unit-test,test_ag_pool)
 $(call run-unit-test,test_ag_slot_state)
 $(call run-unit-test,test_ag_finality_tracker)
 $(call run-unit-test,test_ag_parent_ready_tracker)
 $(call run-unit-test,test_ag_votor)
+ifdef FD_AG_NO_CERT_VERIFY
+$(call make-unit-test,test_ag_votor_scenarios,test_ag_votor_scenarios,fd_choreo fd_ballet fd_util)
+endif
 endif

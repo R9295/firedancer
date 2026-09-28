@@ -2,6 +2,10 @@
 
 #include "ag_vote_serde.h" /* ag_vote_signing_ser */
 
+#ifndef FD_AG_NO_CERT_VERIFY
+#define FD_AG_NO_CERT_VERIFY 0 /* EXTRAS=no-cert-verify skips signature checks */
+#endif
+
 static int
 is_signer( ag_cert_t const * self,
            ulong             rank ) {
@@ -130,7 +134,7 @@ check_sig( ag_cert_t const *       self,
 int
 ag_cert_verify( ag_cert_t const *       self,
                 ag_epoch_info_t const * epoch_info ) {
-  return check_threshold( self, epoch_info ) && check_sig( self, epoch_info );
+  return check_threshold( self, epoch_info ) && ( FD_AG_NO_CERT_VERIFY || check_sig( self, epoch_info ) );
 }
 
 char *
