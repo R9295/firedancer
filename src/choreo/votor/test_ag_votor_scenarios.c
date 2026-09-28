@@ -1,7 +1,10 @@
 /* test_ag_votor_scenarios drives a votor wired to a pool, as the votor
    tile does, through scenarios and checks its invariants.
 
-     test_ag_votor_scenarios [--jobs N] <file|dir>...
+     test_ag_votor_scenarios [--jobs N] <file|pattern>...
+
+   Quoted patterns are expanded with glob, which avoids the shell's
+   argument limit on large corpora.
 
    A scenario is a JSON list of actions on a block tree:
 
@@ -20,15 +23,12 @@
    Requires EXTRAS=no-cert-verify: every validator signs with one fake
    signature, so certificates only verify with the signature check off. */
 
-#define _GNU_SOURCE /* asprintf */
-
-#include <dirent.h>
 #include <execinfo.h>
+#include <glob.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
-#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -45,7 +45,6 @@
 #define SHRED_VERSION          ((ushort)0x5a5a)
 #define NS_PER_SLOT            (400000000L)
 #define NS_EVERY_TIMEOUT       (1000000000000L)
-#define SLOT_BLOCK_MAX         (AG_EQVOC_BLOCK_HASH_MAX-1UL) /* blocks a pool slot holds */
 
 enum { NOTARIZE_CERT, FINALIZE_CERT, NOTAR_FALLBACK_CERT, FAST_FINALIZE_CERT, SKIP_CERT,
        REPLAY_ARRIVES, REPLAY_COMPLETE, REPLAY_DEAD, CLOCK, ACTION_KIND_CNT };
@@ -74,28 +73,32 @@ typedef struct {
 typedef struct {
   label_t       label;
   label_t       parent;
-  uint          kinds;           /* bit per action kind */
+  uint          kinds;           /* bit per action kind, 0 if no action names the node */
   int           replayed;
   int           dead;
   ag_block_id_t replayed_parent;
 } node_t;
 
 typedef struct {
-  action_t *        actions;
-  ulong             action_cnt;
-  node_t *          nodes;           /* sorted by label */
-  ulong             node_cnt;
-  ulong             slot_cnt;        /* the root's slot to the deepest */
-  ag_block_id_t *   canonical;       /* by slot */
-  uchar *           canonical_kind;  /* by slot */
-  ulong             canonical_final; /* deepest directly finalized canonical slot */
+  int             canonical; /* CANONICAL_* */
+  ag_block_id_t   canonical_block;
+  int             voted_notar;
+  int             voted_skip;
+  int             voted_final;
+  ag_block_hash_t voted_notar_hash;
+} slot_t;
 
-  ulong             vote_slot_cnt;
-  uchar *           voted_notar;
-  ag_block_hash_t * voted_notar_hash;
-  uchar *           voted_skip;
-  uchar *           voted_final;
-  ulong             final_cert_slot; /* highest final cert slot the votor saw */
+typedef struct {
+  action_t * actions;
+  ulong      action_cnt;
+  node_t *   nodes;           /* by slot, then index */
+  ulong      node_cnt;
+  ulong      width;           /* highest index+1 */
+  ulong      slot_cnt;        /* the root's slot to the deepest */
+  ulong      vote_slot_cnt;
+  slot_t *   slots;           /* vote_slot_cnt of them */
+  ulong      canonical_final; /* deepest directly finalized canonical slot */
+  ulong      final_cert_slot; /* highest final cert slot the votor saw */
 } scenario_t;
 
 static ag_epoch_info_t epoch_info;
@@ -201,20 +204,12 @@ action_kind_parse( fd_jtok_str_t const * s ) {
   FD_LOG_ERR(( "unknown action" ));
 }
 
-static int
-label_cmp( void const * a,
-           void const * b ) {
-  label_t const * x = a;
-  label_t const * y = b;
-  if( x->slot !=y->slot  ) return x->slot <y->slot  ? -1 : 1;
-  if( x->index!=y->index ) return x->index<y->index ? -1 : 1;
-  return 0;
-}
-
 static node_t *
 node_find( scenario_t const * s,
            label_t            label ) {
-  return bsearch( &label, s->nodes, s->node_cnt, sizeof(node_t), label_cmp );
+  if( label.slot>=s->slot_cnt || label.index>=s->width ) return NULL;
+  node_t * n = &s->nodes[ label.slot*s->width+label.index ];
+  return n->kinds ? n : NULL;
 }
 
 static node_t *
@@ -265,30 +260,21 @@ actions_parse( scenario_t * s,
 
 static void
 nodes_build( scenario_t * s ) {
-  s->nodes = calloc( fd_ulong_max( s->action_cnt, 1UL ), sizeof(node_t) );
-  FD_TEST( s->nodes );
   for( ulong i=0UL; i<s->action_cnt; i++ ) {
-    if( s->actions[i].kind!=CLOCK ) s->nodes[ s->node_cnt++ ].label = s->actions[i].label;
+    if( s->actions[i].kind==CLOCK ) continue;
+    s->slot_cnt = fd_ulong_max( s->slot_cnt, s->actions[i].label.slot +1UL );
+    s->width    = fd_ulong_max( s->width,    s->actions[i].label.index+1UL );
   }
-  qsort( s->nodes, s->node_cnt, sizeof(node_t), label_cmp );
-  ulong cnt = 0UL;
-  for( ulong i=0UL; i<s->node_cnt; i++ ) {
-    if( !cnt || label_cmp( &s->nodes[ cnt-1UL ].label, &s->nodes[i].label ) ) s->nodes[ cnt++ ] = s->nodes[i];
-  }
-  s->node_cnt = cnt;
-
+  s->nodes = calloc( s->slot_cnt*s->width, sizeof(node_t) );
+  FD_TEST( s->nodes );
   for( ulong i=0UL; i<s->action_cnt; i++ ) {
     action_t const * a = &s->actions[i];
     if( a->kind==CLOCK ) continue;
-    node_t * n = node_find( s, a->label );
-    n->parent  = a->parent;
-    n->kinds  |= 1U<<a->kind;
-  }
-
-  s->slot_cnt = s->node_cnt ? s->nodes[ s->node_cnt-1UL ].label.slot+1UL : 1UL;
-  for( ulong i=0UL, run=0UL; i<s->node_cnt; i++ ) {
-    run = i && s->nodes[i].label.slot==s->nodes[i-1UL].label.slot ? run+1UL : 1UL;
-    if( run>SLOT_BLOCK_MAX ) FD_LOG_ERR(( "slot %lu has more than %lu blocks", s->nodes[i].label.slot, SLOT_BLOCK_MAX ));
+    node_t * n   = &s->nodes[ a->label.slot*s->width+a->label.index ];
+    s->node_cnt += !n->kinds;
+    n->label     = a->label;
+    n->parent    = a->parent;
+    n->kinds    |= 1U<<a->kind;
   }
 }
 
@@ -297,73 +283,67 @@ nodes_build( scenario_t * s ) {
 
 static void
 canonical_build( scenario_t * s ) {
-  s->canonical      = calloc( s->slot_cnt, sizeof(ag_block_id_t) );
-  s->canonical_kind = calloc( s->slot_cnt, sizeof(uchar) );
-  FD_TEST( s->canonical && s->canonical_kind );
-
   node_t const * n = NULL;
-  for( ulong i=0UL; i<s->node_cnt; i++ ) {
-    node_t const * c = &s->nodes[i];
-    if( c->kinds & (1U<<SKIP_CERT) ) continue;
-    if( !n || c->label.slot>n->label.slot ) n = c;
+  for( ulong slot=s->slot_cnt-1UL; slot && !n; slot-- ) {
+    for( ulong index=0UL; index<s->width && !n; index++ ) {
+      node_t const * c = node_find( s, (label_t){ .slot = slot, .index = index } );
+      if( c && !( c->kinds & (1U<<SKIP_CERT) ) ) n = c;
+    }
   }
 
   for( ; n; n = n->parent.slot ? node_find( s, n->parent ) : NULL ) {
     uint k      = n->kinds;
     int  direct = ( ( k & (1U<<NOTARIZE_CERT) ) && ( k & (1U<<FINALIZE_CERT) ) ) || ( k & (1U<<FAST_FINALIZE_CERT) );
-    s->canonical     [ n->label.slot ] = block_id( n->label );
-    s->canonical_kind[ n->label.slot ] = CANONICAL_BLOCK;
+    s->slots[ n->label.slot ].canonical       = CANONICAL_BLOCK;
+    s->slots[ n->label.slot ].canonical_block = block_id( n->label );
     if( !s->canonical_final && direct ) s->canonical_final = n->label.slot;
-    for( ulong slot=n->parent.slot+1UL; slot<n->label.slot; slot++ ) s->canonical_kind[ slot ] = CANONICAL_SKIP;
+    for( ulong slot=n->parent.slot+1UL; slot<n->label.slot; slot++ ) s->slots[ slot ].canonical = CANONICAL_SKIP;
     if( n->parent.slot && !node_find( s, n->parent ) ) FD_LOG_ERR(( "canonical block in slot %lu cites a parent with no actions", n->label.slot ));
   }
-  s->canonical_kind[ 0 ] = CANONICAL_BLOCK;
+  s->slots[ 0 ].canonical = CANONICAL_BLOCK;
 }
 
-/* A cert in the deepest slot, at a window's end, readies the next
-   window, so votes reach the end of that window. */
-
-static void
-votes_init( scenario_t * s ) {
-  s->vote_slot_cnt    = ( (s->slot_cnt-1UL)/AG_SLOTS_PER_WINDOW+2UL )*AG_SLOTS_PER_WINDOW;
-  s->voted_notar      = calloc( s->vote_slot_cnt, sizeof(uchar) );
-  s->voted_notar_hash = calloc( s->vote_slot_cnt, sizeof(ag_block_hash_t) );
-  s->voted_skip       = calloc( s->vote_slot_cnt, sizeof(uchar) );
-  s->voted_final      = calloc( s->vote_slot_cnt, sizeof(uchar) );
-  FD_TEST( s->voted_notar && s->voted_notar_hash && s->voted_skip && s->voted_final );
-  s->voted_notar[ 0 ] = 1; /* the root, as ag_votor_init */
+static uchar *
+file_read( char const * path,
+           ulong *      size ) {
+  FILE * f = fopen( path, "rb" );
+  if( !f ) FD_LOG_ERR(( "fopen(%s) failed", path ));
+  FD_TEST( !fseek( f, 0L, SEEK_END ) );
+  long sz = ftell( f );
+  FD_TEST( sz>=0L && !fseek( f, 0L, SEEK_SET ) );
+  uchar * data = malloc( (ulong)sz+1UL );
+  FD_TEST( data && fread( data, 1UL, (ulong)sz, f )==(ulong)sz );
+  fclose( f );
+  *size = (ulong)sz;
+  return data;
 }
 
 static void
 scenario_load( scenario_t * s,
                char const * path ) {
-  FILE * f = fopen( path, "rb" );
-  if( !f ) FD_LOG_ERR(( "fopen(%s) failed", path ));
-  FD_TEST( !fseek( f, 0L, SEEK_END ) );
-  long size = ftell( f );
-  FD_TEST( size>=0L && !fseek( f, 0L, SEEK_SET ) );
-  uchar * data = malloc( (ulong)size+1UL );
-  FD_TEST( data && fread( data, 1UL, (ulong)size, f )==(ulong)size );
-  fclose( f );
-
+  ulong   size;
+  uchar * data = file_read( path, &size );
   memset( s, 0, sizeof(scenario_t) );
-  actions_parse( s, data, (ulong)size );
+  s->slot_cnt = 1UL;
+  s->width    = 1UL;
+  actions_parse( s, data, size );
   free( data );
   nodes_build( s );
+
+  /* A cert in the deepest slot, at a window's end, readies the next
+     window, so votes reach the end of that window. */
+  s->vote_slot_cnt = ( (s->slot_cnt-1UL)/AG_SLOTS_PER_WINDOW+2UL )*AG_SLOTS_PER_WINDOW;
+  s->slots         = calloc( s->vote_slot_cnt, sizeof(slot_t) );
+  FD_TEST( s->slots );
+  s->slots[ 0 ].voted_notar = 1; /* the root, as ag_votor_init */
   canonical_build( s );
-  votes_init( s );
 }
 
 static void
 scenario_free( scenario_t * s ) {
   free( s->actions );
   free( s->nodes );
-  free( s->canonical );
-  free( s->canonical_kind );
-  free( s->voted_notar );
-  free( s->voted_notar_hash );
-  free( s->voted_skip );
-  free( s->voted_final );
+  free( s->slots );
 }
 
 /* Invariants */
@@ -374,27 +354,28 @@ check_vote( scenario_t *            s,
   ag_vote_t const * vote = &event->vote;
   ulong             slot = ag_vote_slot( vote );
   FD_TEST( slot<s->vote_slot_cnt );
+  slot_t * st = &s->slots[ slot ];
   switch( vote->kind ) {
   case AG_VOTE_KIND_NOTAR: {
-    if( s->voted_skip [ slot ] ) FD_LOG_CRIT(( "INVARIANT: voted notar and skip in slot %lu", slot ));
-    if( s->voted_notar[ slot ] ) FD_LOG_CRIT(( "INVARIANT: voted notar twice in slot %lu", slot ));
+    if( st->voted_skip  ) FD_LOG_CRIT(( "INVARIANT: voted notar and skip in slot %lu", slot ));
+    if( st->voted_notar ) FD_LOG_CRIT(( "INVARIANT: voted notar twice in slot %lu", slot ));
     node_t const * n = node_of_block( s, slot, vote->notar.block_hash );
     if( !n || !n->replayed || n->dead ) FD_LOG_CRIT(( "INVARIANT: voted notar in slot %lu for a block replay did not complete or found dead", slot ));
-    s->voted_notar[ slot ] = 1;
-    memcpy( s->voted_notar_hash[ slot ], vote->notar.block_hash, sizeof(ag_block_hash_t) );
+    st->voted_notar = 1;
+    memcpy( st->voted_notar_hash, vote->notar.block_hash, sizeof(ag_block_hash_t) );
     break;
   }
   case AG_VOTE_KIND_SKIP:
-    if( s->voted_notar[ slot ] ) FD_LOG_CRIT(( "INVARIANT: voted notar and skip in slot %lu", slot ));
-    if( s->voted_skip [ slot ] ) FD_LOG_CRIT(( "INVARIANT: voted skip twice in slot %lu", slot ));
-    s->voted_skip[ slot ] = 1;
+    if( st->voted_notar ) FD_LOG_CRIT(( "INVARIANT: voted notar and skip in slot %lu", slot ));
+    if( st->voted_skip  ) FD_LOG_CRIT(( "INVARIANT: voted skip twice in slot %lu", slot ));
+    st->voted_skip = 1;
     break;
   case AG_VOTE_KIND_FINAL:
-    if( slot>=s->slot_cnt || s->canonical_kind[ slot ]!=CANONICAL_BLOCK || !s->voted_notar[ slot ] ||
-        memcmp( s->voted_notar_hash[ slot ], s->canonical[ slot ].hash, sizeof(ag_block_hash_t) ) ) {
+    if( st->canonical!=CANONICAL_BLOCK || !st->voted_notar ||
+        memcmp( st->voted_notar_hash, st->canonical_block.hash, sizeof(ag_block_hash_t) ) ) {
       FD_LOG_CRIT(( "INVARIANT: voted final in slot %lu without voting notar for its canonical block", slot ));
     }
-    s->voted_final[ slot ] = 1;
+    st->voted_final = 1;
     break;
   default:
     break;
@@ -454,11 +435,11 @@ check_canonical( scenario_t const * s,
   ag_finality_tracker_t const * tracker = pool->finality_tracker;
   for( ulong slot=1UL; slot<s->slot_cnt; slot++ ) {
     ag_block_hash_t hash;
-    int             kind = s->canonical_kind[ slot ];
+    int             kind = s->slots[ slot ].canonical;
     switch( ag_finality_tracker_status( tracker, slot, hash ) ) {
     case AG_FINALIZATION_STATUS_FINALIZED:
     case AG_FINALIZATION_STATUS_IMPLICITLY_FINALIZED:
-      if( kind!=CANONICAL_BLOCK || memcmp( hash, s->canonical[ slot ].hash, sizeof(ag_block_hash_t) ) ) {
+      if( kind!=CANONICAL_BLOCK || memcmp( hash, s->slots[ slot ].canonical_block.hash, sizeof(ag_block_hash_t) ) ) {
         FD_LOG_CRIT(( "INVARIANT: finalized a block off the canonical chain in slot %lu", slot ));
       }
       break;
@@ -482,7 +463,7 @@ check_dead( scenario_t const * s,
   if( slot<=final_cert_slot || retired ) return;
   ulong start = ag_first_slot_in_window( slot );
   for( ulong w=start; w<start+AG_SLOTS_PER_WINDOW; w++ ) {
-    if( !s->voted_notar[ w ] && !s->voted_skip[ w ] ) FD_LOG_CRIT(( "INVARIANT: replay found a block in slot %lu dead, but slot %lu of its window has no vote", slot, w ));
+    if( !s->slots[ w ].voted_notar && !s->slots[ w ].voted_skip ) FD_LOG_CRIT(( "INVARIANT: replay found a block in slot %lu dead, but slot %lu of its window has no vote", slot, w ));
   }
 }
 
@@ -595,7 +576,7 @@ scenario_run( scenario_t * s ) {
     }
     case REPLAY_DEAD: {
       ulong            final_cert_slot = s->final_cert_slot;
-      int              retired         = s->voted_final[ a->label.slot ];
+      int              retired         = s->slots[ a->label.slot ].voted_final;
       ag_event_block_t invalid         = { .kind = AG_EVENT_BLOCK_INVALID_BLOCK, .slot = a->label.slot };
       node_find( s, a->label )->dead = 1;
       ag_votor_handle_block_event( votor, &invalid );
@@ -614,7 +595,7 @@ scenario_run( scenario_t * s ) {
   ulong         finalized_slot = ag_pool_finalized_slot( pool );
   uchar const * finalized_hash = ag_pool_finalized_block_hash( pool );
   if( finalized_slot!=s->canonical_final ||
-      ( finalized_slot && ( !finalized_hash || memcmp( finalized_hash, s->canonical[ finalized_slot ].hash, sizeof(ag_block_hash_t) ) ) ) ) {
+      ( finalized_slot && ( !finalized_hash || memcmp( finalized_hash, s->slots[ finalized_slot ].canonical_block.hash, sizeof(ag_block_hash_t) ) ) ) ) {
     FD_LOG_CRIT(( "INVARIANT: finalized slot %lu, not canonical slot %lu", finalized_slot, s->canonical_final ));
   }
 
@@ -622,81 +603,33 @@ scenario_run( scenario_t * s ) {
   ag_pool_delete ( ag_pool_leave ( pool  ) );
 }
 
-typedef struct {
-  char ** path;
-  ulong   cnt;
-  ulong   max;
-} paths_t;
-
-static void
-paths_add( paths_t * paths,
-           char *    path ) {
-  if( paths->cnt==paths->max ) {
-    paths->max  = fd_ulong_max( 64UL, 2UL*paths->max );
-    paths->path = realloc( paths->path, paths->max*sizeof(char *) );
-    FD_TEST( paths->path );
-  }
-  paths->path[ paths->cnt++ ] = path;
-}
-
-static void
-paths_collect( paths_t * paths,
-               char *    arg ) {
-  struct stat st;
-  if( stat( arg, &st ) ) FD_LOG_ERR(( "stat(%s) failed", arg ));
-  if( !S_ISDIR( st.st_mode ) ) { paths_add( paths, arg ); return; }
-  DIR * dir = opendir( arg );
-  if( !dir ) FD_LOG_ERR(( "opendir(%s) failed", arg ));
-  for( struct dirent * e; ( e = readdir( dir ) ); ) {
-    if( e->d_name[0]=='.' ) continue;
-    char * path;
-    FD_TEST( asprintf( &path, "%s/%s", arg, e->d_name )>0 );
-    paths_add( paths, path );
-  }
-  closedir( dir );
-}
-
 /* Workers.  FD_TEST exits without a backtrace, so a worker logs one on
-   exit mid-scenario.  FD_LOG_CRIT aborts, and fd_log logs its own. */
-
-static int running;
+   exit.  It never exits on success: _exit skips atexit.  FD_LOG_CRIT
+   aborts, and fd_log logs its own. */
 
 static void
 backtrace_on_exit( void ) {
-  if( !running ) return;
   void * frames[ 128 ];
   fd_backtrace_log( frames, (ulong)backtrace( frames, 128 ) );
 }
 
 static void
-worker( paths_t const * paths,
-        ulong           first,
-        ulong           stride,
-        ulong *         current ) {
+worker( char ** paths,
+        ulong   path_cnt,
+        ulong   first,
+        ulong   stride,
+        ulong * current ) {
   atexit( backtrace_on_exit );
   fd_log_level_logfile_set( 4 ); /* ERR and up, the votor warns a lot */
   fd_log_level_stderr_set ( 4 );
-  for( ulong i=first; i<paths->cnt; i+=stride ) {
+  for( ulong i=first; i<path_cnt; i+=stride ) {
     *current = i;
     scenario_t s;
-    running = 1;
-    scenario_load( &s, paths->path[i] );
+    scenario_load( &s, paths[i] );
     scenario_run( &s );
-    running = 0;
     scenario_free( &s );
   }
   _exit( 0 );
-}
-
-static void
-input_print( char const * path ) {
-  fprintf( stderr, "\nfailing input: %s\n", path );
-  FILE * f = fopen( path, "rb" );
-  if( !f ) return;
-  char buf[ 4096 ];
-  for( ulong n; ( n = fread( buf, 1UL, sizeof(buf), f ) ); ) fwrite( buf, 1UL, n, stderr );
-  fclose( f );
-  fputc( '\n', stderr );
 }
 
 int
@@ -705,10 +638,12 @@ main( int     argc,
   fd_boot( &argc, &argv );
   ulong jobs = fd_env_strip_cmdline_ulong( &argc, &argv, "--jobs", NULL, (ulong)sysconf( _SC_NPROCESSORS_ONLN ) );
 
-  paths_t paths = { 0 };
-  for( int i=1; i<argc; i++ ) paths_collect( &paths, argv[i] );
-  if( !paths.cnt ) FD_LOG_ERR(( "usage: %s [--jobs N] <file|dir>...", argv[0] ));
-  jobs = fd_ulong_max( fd_ulong_min( jobs, paths.cnt ), 1UL );
+  glob_t g = { 0 };
+  for( int i=1; i<argc; i++ ) {
+    if( glob( argv[i], i>1 ? GLOB_APPEND : 0, NULL, &g ) ) FD_LOG_ERR(( "no input matches %s", argv[i] ));
+  }
+  if( !g.gl_pathc ) FD_LOG_ERR(( "usage: %s [--jobs N] <file|pattern>...", argv[0] ));
+  jobs = fd_ulong_max( fd_ulong_min( jobs, g.gl_pathc ), 1UL );
 
   cluster_init();
 
@@ -718,7 +653,7 @@ main( int     argc,
   for( ulong w=0UL; w<jobs; w++ ) {
     pids[w] = fork();
     FD_TEST( pids[w]>=0 );
-    if( !pids[w] ) worker( &paths, w, jobs, &current[w] );
+    if( !pids[w] ) worker( g.gl_pathv, g.gl_pathc, w, jobs, &current[w] );
   }
 
   for( ulong left=jobs; left; left-- ) {
@@ -727,13 +662,15 @@ main( int     argc,
     FD_TEST( pid>0 );
     if( WIFEXITED( status ) && !WEXITSTATUS( status ) ) continue;
     for( ulong w=0UL; w<jobs; w++ ) {
-      if( pids[w]==pid ) input_print( paths.path[ current[w] ] );
-      else               kill( pids[w], SIGKILL );
+      if( pids[w]!=pid ) { kill( pids[w], SIGKILL ); continue; }
+      ulong   size;
+      uchar * data = file_read( g.gl_pathv[ current[w] ], &size );
+      fprintf( stderr, "\nfailing input: %s\n%.*s\n", g.gl_pathv[ current[w] ], (int)size, (char const *)data );
     }
     return 1;
   }
 
-  FD_LOG_NOTICE(( "pass: %lu scenarios", paths.cnt ));
+  FD_LOG_NOTICE(( "pass: %lu scenarios", g.gl_pathc ));
   fd_halt();
   return 0;
 }
