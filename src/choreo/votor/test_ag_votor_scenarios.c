@@ -656,21 +656,24 @@ main( int     argc,
     if( !pids[w] ) worker( g.gl_pathv, g.gl_pathc, w, jobs, &current[w] );
   }
 
-  for( ulong left=jobs; left; left-- ) {
+  int failed = 0;
+  for( ulong left=jobs; left && !failed; left-- ) {
     int   status;
     pid_t pid = wait( &status );
     FD_TEST( pid>0 );
-    if( WIFEXITED( status ) && !WEXITSTATUS( status ) ) continue;
-    for( ulong w=0UL; w<jobs; w++ ) {
+    failed = !WIFEXITED( status ) || WEXITSTATUS( status );
+    for( ulong w=0UL; failed && w<jobs; w++ ) {
       if( pids[w]!=pid ) { kill( pids[w], SIGKILL ); continue; }
       ulong   size;
       uchar * data = file_read( g.gl_pathv[ current[w] ], &size );
       fprintf( stderr, "\nfailing input: %s\n%.*s\n", g.gl_pathv[ current[w] ], (int)size, (char const *)data );
+      free( data );
     }
-    return 1;
   }
 
-  FD_LOG_NOTICE(( "pass: %lu scenarios", g.gl_pathc ));
+  if( !failed ) FD_LOG_NOTICE(( "pass: %lu scenarios", g.gl_pathc ));
+  free( pids );
+  globfree( &g );
   fd_halt();
-  return 0;
+  return failed;
 }
