@@ -142,6 +142,8 @@ cert( uint    kind,
   return c;
 }
 
+/* Keys and stakes the cluster, and builds one template per cert kind. */
+
 static void
 cluster_init( void ) {
   ag_validator_info_t info[ VALIDATOR_CNT ];
@@ -180,6 +182,8 @@ cluster_init( void ) {
 
 /* Parsing.  A malformed scenario is a failure. */
 
+/* Parses "0", or a slot then letters: a is index 0, z 25, aa 26. */
+
 static label_t
 label_parse( fd_jtok_t * j ) {
   char s[ 32 ];
@@ -212,6 +216,8 @@ node_find( scenario_t const * s,
   return n->kinds ? n : NULL;
 }
 
+/* The node a block hash names, as block_id encodes it, or NULL. */
+
 static node_t *
 node_of_block( scenario_t const * s,
                ulong              slot,
@@ -219,6 +225,8 @@ node_of_block( scenario_t const * s,
   if( FD_LOAD( ulong, hash )!=slot ) return NULL;
   return node_find( s, (label_t){ .slot = slot, .index = FD_LOAD( ulong, hash+8UL ) } );
 }
+
+/* Parses the JSON action list, failing on any malformed action. */
 
 static void
 actions_parse( scenario_t * s,
@@ -257,6 +265,8 @@ actions_parse( scenario_t * s,
   }
   if( fd_jtok_fini( j ) ) FD_LOG_ERR(( "malformed JSON" ));
 }
+
+/* Lays nodes out by slot then index, merging what each node's actions say. */
 
 static void
 nodes_build( scenario_t * s ) {
@@ -318,6 +328,8 @@ file_read( char const * path,
   return data;
 }
 
+/* Parses a scenario and derives its nodes, canonical chain and vote bounds. */
+
 static void
 scenario_load( scenario_t * s,
                char const * path ) {
@@ -347,6 +359,8 @@ scenario_free( scenario_t * s ) {
 }
 
 /* Invariants */
+
+/* Notar or skip at most once per slot, notar only for live replayed blocks, final only for the canonical one. */
 
 static void
 check_vote( scenario_t *            s,
@@ -403,6 +417,8 @@ finalized_descendant( scenario_t const *            s,
   return 0;
 }
 
+/* Finalized blocks have a notar and final cert or a fast final cert; implicitly finalized ones a finalized descendant. */
+
 static void
 check_finality( scenario_t const * s,
                 ag_pool_t const *  pool ) {
@@ -428,6 +444,8 @@ check_finality( scenario_t const * s,
     }
   }
 }
+
+/* Only canonical blocks are finalized, and only slots the canonical chain skips are skipped. */
 
 static void
 check_canonical( scenario_t const * s,
@@ -521,6 +539,8 @@ pump( scenario_t * s,
 static void * pool_mem;
 static void * votor_mem;
 static ulong  mem_slot_max;
+
+/* Runs the actions against a fresh pool and votor, then checks the finalized slot. */
 
 static void
 scenario_run( scenario_t * s ) {
@@ -631,6 +651,8 @@ worker( char ** paths,
   }
   _exit( 0 );
 }
+
+/* Forks --jobs workers over the inputs and prints the first failing input. */
 
 int
 main( int     argc,
