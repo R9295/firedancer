@@ -3,6 +3,7 @@ on:
   pull_request:
     paths:
       - 'src/choreo/votor/**'
+      - 'corpus/test_ag_votor_scenarios/**'
       - 'config/extra/with-no-cert-verify.mk'
       - '.github/workflows/votor_scenarios.yml'
 
@@ -19,4 +20,4 @@ jobs:
       - name: Run votor scenarios
         run: |
           make -j CC=clang EXTRAS="asan ubsan no-cert-verify" test_ag_votor_scenarios
-          "$(make --silent objdir CC=clang EXTRAS="asan ubsan no-cert-verify")/unit-test/test_ag_votor_scenarios" 'src/choreo/votor/scenarios/*.json'
+          "$(make --silent objdir CC=clang EXTRAS="asan ubsan no-cert-verify")/unit-test/test_ag_votor_scenarios" 'corpus/test_ag_votor_scenarios/*.json'
