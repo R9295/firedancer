@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -318,6 +319,9 @@ file_read( char const * path,
            ulong *      size ) {
   FILE * f = fopen( path, "rb" );
   if( !f ) FD_LOG_ERR(( "fopen(%s) failed", path ));
+  struct stat st;
+  FD_TEST( !fstat( fileno( f ), &st ) );
+  if( !S_ISREG( st.st_mode ) ) FD_LOG_ERR(( "%s is not a regular file", path ));
   FD_TEST( !fseek( f, 0L, SEEK_END ) );
   long sz = ftell( f );
   FD_TEST( sz>=0L && !fseek( f, 0L, SEEK_SET ) );
@@ -662,9 +666,17 @@ main( int     argc,
 
   glob_t g = { 0 };
   for( int i=1; i<argc; i++ ) {
-    if( glob( argv[i], i>1 ? GLOB_APPEND : 0, NULL, &g ) ) FD_LOG_ERR(( "no input matches %s", argv[i] ));
+    /* A directory runs every entry in it */
+    char         pattern[ PATH_MAX ];
+    char const * arg = argv[i];
+    struct stat  st;
+    if( !stat( arg, &st ) && S_ISDIR( st.st_mode ) ) {
+      FD_TEST( fd_cstr_printf_check( pattern, sizeof(pattern), NULL, "%s/*", arg ) );
+      arg = pattern;
+    }
+    if( glob( arg, i>1 ? GLOB_APPEND : 0, NULL, &g ) ) FD_LOG_ERR(( "no input matches %s", arg ));
   }
-  if( !g.gl_pathc ) FD_LOG_ERR(( "usage: %s [--jobs N] <file|pattern>...", argv[0] ));
+  if( !g.gl_pathc ) FD_LOG_ERR(( "usage: %s [--jobs N] <file|dir|pattern>...", argv[0] ));
   jobs = fd_ulong_max( fd_ulong_min( jobs, g.gl_pathc ), 1UL );
 
   cluster_init();
