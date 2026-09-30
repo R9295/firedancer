@@ -60,6 +60,7 @@ $(call add-objs,fd_bank,fd_flamenco)
 ifdef FD_HAS_HOSTED
 $(call make-unit-test,test_bank,test_bank,fd_flamenco fd_ballet fd_util)
 $(call run-unit-test,test_bank)
+$(call make-unit-test,test_bank_scenarios,test_bank_scenarios,fd_flamenco fd_ballet fd_util)
 endif
 
 ifdef FD_HAS_HOSTED
