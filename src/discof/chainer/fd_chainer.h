@@ -47,17 +47,11 @@
    re-requesting the shreds.  This case should be rare enough that the
    redundancy is worth the simplicity.
 
-   When that happens the turbine version is ABANDONED: arriving shreds
-   are still accepted and fill the FECs, but it never delivers to
-   replay, never finalizes a block_id, and is dropped from the repair
-   worklists.  Were it to keep delivering, and its block_id to finalize
-   to the same block a votor version is repairing, replay would
-   materialize two banks for the same {slot, block_id} (see
-   fd_rotor_tile.h).  An abandoned slotv is pruned with its slot at
-   publish.  Note that replay can handle two fully-delivered slots, so
-   whether we should maintain this abandon state is debatable.  But
-   logically we want to only deliver verified blocks to replay if
-   we have something verifiable available.
+   When that happens both versions remain active.  In particular, the
+   turbine version stays on its repair worklists and can still finalize
+   and deliver if block-id repair is unsupported or unanswered.  This
+   preserves positional repair as the fallback that prevents a votor
+   event from leaving the slot with no usable recovery path.
 
    *Parent Discovery*
 
@@ -128,12 +122,6 @@ struct fd_chainer_slotv {
   ulong           prev; /* reserved by map_chain */
 
   uchar           turbine;   /* 1 for the slotv created through turbine */
-  uchar           abandoned; /* 1 once a votor-driven version of the slot was
-                                created while this (turbine) version's block_id
-                                was still unknown: keeps accepting shred/FEC
-                                bookkeeping but never delivers, never finalizes
-                                a block_id, and stays off the repair worklists.
-                                See the header comment above. */
   fd_hash_t       block_id;
   uint            complete_idx;
   uint            buffered_idx;     /* idx of highest buffered shred */
@@ -455,8 +443,8 @@ fd_chainer_fec_evicted( fd_chainer_t * chainer,
                         fd_hash_t    * merkle_root );
 
 /* fd_chainer_verified_block_insert records {slot, block_id} as a
-   verified version, abandoning the slot's turbine version if its
-   block_id is still unknown.  Returns the new version, or NULL if it
+   verified version while keeping the slot's turbine version active as
+   a positional-repair fallback.  Returns the new version, or NULL if it
    already existed. */
 
 fd_chainer_slotv_t *
