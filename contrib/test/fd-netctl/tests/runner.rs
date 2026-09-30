@@ -123,6 +123,25 @@ fn launcher_forwards_configs_and_settings() {
 }
 
 #[test]
+fn launcher_discovers_every_default_config_in_version_order() {
+    let f = Fixture::new();
+    fs::write(f.0.join("node-10.toml"), "").unwrap();
+    fs::write(f.0.join("node-9.toml"), "").unwrap();
+    let output = success(
+        f.command(&["run"])
+            .env_remove("FD_CLUSTER_CONFIGS")
+            .env("C", &f.0)
+            .output()
+            .unwrap(),
+    );
+    let configs = [0, 1, 2, 9, 10]
+        .map(|id| f.0.join(format!("node-{id}.toml")))
+        .map(|path| path.display().to_string())
+        .join(":");
+    assert!(output.contains(&format!("configs={configs}\n")), "{output}");
+}
+
+#[test]
 fn control_shortcut_does_not_need_configs_or_build() {
     let f = Fixture::new();
     let output = success(

@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::Path;
 pub mod typesafe;
-use typesafe::{DropFault, Protocol, Snapshot};
+use typesafe::{PartitionFault, Protocol, Snapshot, MAX_PARTITION_NODES};
 
 pub const QUEUE: u16 = 0;
 // Absorb short validator bursts without making packet buffering unbounded.
@@ -108,7 +108,7 @@ pub struct Policy {
     links: Vec<Link>,
     instance: String,
     typesafe_session: Option<u64>,
-    active_drop: Option<DropFault>,
+    active_partition: Option<PartitionFault>,
     pub accepted: u64,
     pub dropped: u64,
     pub unclassified: u64,
@@ -161,7 +161,7 @@ impl Policy {
                     .as_nanos()
             ),
             typesafe_session: None,
-            active_drop: None,
+            active_partition: None,
             accepted: 0,
             dropped: 0,
             unclassified: 0,
@@ -216,7 +216,7 @@ impl Policy {
     pub fn is_blocked(&self, delivery: Delivery) -> bool {
         self.links[delivery.src * self.nodes.len() + delivery.dst].blocked
             || self
-                .active_drop
+                .active_partition
                 .is_some_and(|fault| fault.matches(delivery.src, delivery.dst, delivery.protocol))
     }
 
@@ -268,8 +268,10 @@ impl Policy {
             ["status"] => Ok(self.status()),
             ["typesafe-state"] => Ok(self.typesafe_state()),
             ["typesafe-start"] => {
-                if self.nodes.len() != 3 {
-                    return Err("TypeSafe's 24 choices require exactly three node configs".into());
+                if !(2..=MAX_PARTITION_NODES).contains(&self.nodes.len()) {
+                    return Err(format!(
+                        "TypeSafe partitions require between 2 and {MAX_PARTITION_NODES} node configs"
+                    ));
                 }
                 if self.typesafe_session.is_some() {
                     return Err("TypeSafe is already running; use heal to stop it first".into());
@@ -283,14 +285,14 @@ impl Policy {
                 self.heal();
                 Ok(format!("OK generation={}\n", self.generation))
             }
-            ["typesafe-drop", instance, session, generation, id] => {
+            ["typesafe-partition", instance, session, generation, id] => {
                 self.check_session(instance, session)?;
                 if generation.parse::<u64>().ok() != Some(self.generation) {
                     return Err("stale TypeSafe selection; policy changed".into());
                 }
-                let fault = DropFault::parse(id)?;
-                // One Option, never a list: replacement cannot stack faults.
-                self.active_drop = Some(fault);
+                let fault = PartitionFault::parse(id, self.nodes.len())?;
+                // One Option, never a list: replacement cannot stack partitions.
+                self.active_partition = Some(fault);
                 self.generation += 1;
                 Ok(format!("OK {}\n", self.fault_message(fault)))
             }
@@ -326,7 +328,7 @@ impl Policy {
 
     fn heal(&mut self) {
         self.links.fill(Link::default());
-        self.active_drop = None;
+        self.active_partition = None;
         self.typesafe_session = None;
         self.generation += 1;
     }
@@ -347,25 +349,20 @@ impl Policy {
             session: self.typesafe_session,
             generation: self.generation,
             node_count: self.nodes.len(),
-            active: self.active_drop,
+            active: self.active_partition,
             accepted: self.accepted,
             dropped: self.dropped,
         };
         format!("OK {}\n", serde_json::to_string(&snapshot).unwrap())
     }
 
-    fn fault_message(&self, fault: DropFault) -> String {
-        let ports: Vec<_> = self.nodes[fault.dst]
-            .ports
-            .iter()
-            .zip(PORT_FIELDS)
-            .filter_map(|(&port, (_, protocol))| fault.includes(*protocol).then_some(port))
+    fn fault_message(&self, fault: PartitionFault) -> String {
+        let connected: Vec<_> = (0..self.nodes.len())
+            .filter(|node| *node != fault.isolated)
             .collect();
         format!(
-            "FAULT applied: drop node {} -> node {} {} ports={ports:?} generation={}",
-            fault.src,
-            fault.dst,
-            fault.target.name(),
+            "FAULT applied: partition [{}] | {connected:?} protocols=[gossip,repair,shred,votor] generation={}",
+            fault.isolated,
             self.generation
         )
     }
@@ -396,9 +393,9 @@ impl Policy {
             writeln!(out, "node {id} {} {:?}", node.name, node.ports).unwrap();
         }
         if self.typesafe_session.is_some() {
-            writeln!(out, "typesafe automatic (one drop fault maximum)").unwrap();
+            writeln!(out, "typesafe automatic (one network partition maximum)").unwrap();
         }
-        if let Some(fault) = self.active_drop {
+        if let Some(fault) = self.active_partition {
             writeln!(
                 out,
                 "{}",
@@ -606,9 +603,9 @@ mod tests {
     }
 
     #[test]
-    fn typesafe_exhaustively_matches_only_one_direction_and_protocol() {
+    fn typesafe_partition_is_bidirectional_and_protocol_scoped() {
         let mut p = Policy::new(
-            (0..3)
+            (0..10)
                 .map(|id| Node {
                     name: format!("node-{id}"),
                     ports: (0..9).map(|offset| 8000 + id * 100 + offset).collect(),
@@ -621,20 +618,20 @@ mod tests {
         p.command("duplicate 1 2 1").unwrap();
         p.command("typesafe-start").unwrap();
         assert!(p.links.iter().all(|link| *link == Link::default()));
-        for fault in DropFault::all() {
+        for fault in PartitionFault::all(10) {
             let command = format!(
-                "typesafe-drop {} {} {} {}",
+                "typesafe-partition {} {} {} {}",
                 p.instance,
                 p.typesafe_session.unwrap(),
                 p.generation,
                 fault.id()
             );
             let response = p.command(&command).unwrap();
-            assert!(response.contains("FAULT applied: drop node"));
-            for src in 0..3 {
-                for dst in 0..3 {
+            assert!(response.contains("FAULT applied: partition"));
+            for src in 0..10 {
+                for dst in 0..10 {
                     // All source/destination port combinations, including both
-                    // client/server ports, reverse links, gossip and TPU.
+                    // directions, client/server ports, gossip and TPU.
                     for source_port in p.nodes[src].ports.clone() {
                         for (offset, (_, protocol)) in PORT_FIELDS.iter().enumerate() {
                             let packet = packet(source_port, p.nodes[dst].ports[offset]);
@@ -651,29 +648,33 @@ mod tests {
             assert_eq!(p.status().matches("\nactive:").count(), 1);
         }
         p.command("heal").unwrap();
-        assert!(p.active_drop.is_none());
+        assert!(p.active_partition.is_none());
         assert!(p.typesafe_session.is_none());
-        assert!(p.accept(&packet(8207, 8008)));
+        assert!(p.accept(&packet(8907, 8008)));
     }
 
     #[test]
     fn typesafe_rejects_stale_unknown_and_stacked_faults() {
-        for n in [1, 2, 4] {
-            assert!(policy(n).command("typesafe-start").is_err());
+        assert!(policy(1).command("typesafe-start").is_err());
+        for n in [2, 4, 10, 128] {
+            assert!(policy(n).command("typesafe-start").is_ok());
         }
         let mut p = policy(3);
         p.command("typesafe-start").unwrap();
         let prefix = format!(
-            "typesafe-drop {} {}",
+            "typesafe-partition {} {}",
             p.instance,
             p.typesafe_session.unwrap()
         );
-        let command = format!("{prefix} {} drop_0_1_repair", p.generation);
+        let command = format!("{prefix} {} partition_node_1", p.generation);
         for invalid in [
-            format!("{prefix} {} drop_0_3_repair", p.generation),
-            format!("{prefix} {} drop_0_1_gossip", p.generation),
-            format!("{prefix} 0 drop_0_1_repair"),
-            format!("typesafe-drop wrong 1 {} drop_0_1_repair", p.generation),
+            format!("{prefix} {} partition_node_3", p.generation),
+            format!("{prefix} {} partition_1", p.generation),
+            format!("{prefix} 0 partition_node_1"),
+            format!(
+                "typesafe-partition wrong 1 {} partition_node_1",
+                p.generation
+            ),
             "typesafe-start".into(),
             "block 1 0".into(),
             "allow 0 1".into(),

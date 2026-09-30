@@ -1,4 +1,4 @@
-//! TypeSafe chooses one of 24 local resilience-test cases. Rust owns execution.
+//! TypeSafe chooses one single-node network partition. Rust owns execution.
 //! The API client runs in the caller's network namespace, never the packet loop.
 
 use reqwest::blocking::Client;
@@ -18,7 +18,7 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const API_URL: &str = "https://api.typesafe.ai/v1/systemone";
 const MAX_RESPONSE: u64 = 64 * 1024;
 pub const DEFAULT_INTERVAL_SECS: u64 = 1;
-pub const DROP_FAULT_COUNT: usize = 24;
+pub const MAX_PARTITION_NODES: usize = 128;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -30,75 +30,27 @@ pub enum Protocol {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum DropTarget {
-    Repair,
-    Shred,
-    Votor,
-    All,
+pub struct PartitionFault {
+    pub isolated: usize,
 }
 
-impl DropTarget {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Repair => "repair",
-            Self::Shred => "shred",
-            Self::Votor => "votor",
-            Self::All => "all",
-        }
-    }
-
-    fn includes(self, protocol: Option<Protocol>) -> bool {
-        match self {
-            Self::Repair => protocol == Some(Protocol::Repair),
-            Self::Shred => protocol == Some(Protocol::Shred),
-            Self::Votor => protocol == Some(Protocol::Votor),
-            Self::All => matches!(
-                protocol,
-                Some(Protocol::Gossip | Protocol::Repair | Protocol::Shred | Protocol::Votor)
-            ),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub struct DropFault {
-    pub src: usize,
-    pub dst: usize,
-    pub target: DropTarget,
-}
-
-impl DropFault {
-    pub fn all() -> impl Iterator<Item = Self> {
-        [(0, 1), (1, 0), (1, 2), (2, 1), (0, 2), (2, 0)]
-            .into_iter()
-            .flat_map(|(src, dst)| {
-                [
-                    DropTarget::Repair,
-                    DropTarget::Shred,
-                    DropTarget::Votor,
-                    DropTarget::All,
-                ]
-                .map(move |target| Self { src, dst, target })
-            })
+impl PartitionFault {
+    pub fn all(node_count: usize) -> impl Iterator<Item = Self> {
+        (0..node_count).map(|isolated| Self { isolated })
     }
 
     pub fn id(self) -> String {
-        format!("drop_{}_{}_{}", self.src, self.dst, self.target.name())
+        format!("partition_node_{}", self.isolated)
     }
 
-    pub fn parse(id: &str) -> std::result::Result<Self, String> {
-        Self::all()
+    pub fn parse(id: &str, node_count: usize) -> std::result::Result<Self, String> {
+        Self::all(node_count)
             .find(|fault| fault.id() == id)
-            .ok_or_else(|| "unknown drop fault".into())
+            .ok_or_else(|| "unknown network partition".into())
     }
 
     pub fn matches(self, src: usize, dst: usize, protocol: Option<Protocol>) -> bool {
-        self.src == src && self.dst == dst && self.target.includes(protocol)
-    }
-
-    pub fn includes(self, protocol: Option<Protocol>) -> bool {
-        self.target.includes(protocol)
+        protocol.is_some() && src != dst && ((src == self.isolated) != (dst == self.isolated))
     }
 }
 
@@ -109,7 +61,7 @@ pub struct Snapshot {
     pub session: Option<u64>,
     pub generation: u64,
     pub node_count: usize,
-    pub active: Option<DropFault>,
+    pub active: Option<PartitionFault>,
     pub accepted: u64,
     pub dropped: u64,
 }
@@ -120,41 +72,30 @@ fn request(
     interval: Duration,
     model: &str,
 ) -> Value {
-    let criteria: BTreeMap<_, _> = DropFault::all()
+    let criteria: BTreeMap<_, _> = PartitionFault::all(snapshot.node_count)
         .map(|fault| {
-            let description = match fault.target {
-                DropTarget::All => format!(
-                    "Drop Gossip, Repair, Shred, and Votor UDP traffic from node {} to node {}; preserve the reverse direction and transaction traffic.",
-                    fault.src, fault.dst
-                ),
-                target => format!(
-                    "Drop only {} UDP traffic from node {} to node {}; preserve the reverse direction and other protocols.",
-                    target.name(), fault.src, fault.dst
-                ),
-            };
+            let description = format!(
+                "Isolate node {} from every other node. Drop Gossip, Repair, Shred, and Votor UDP traffic across the cut in both directions; preserve traffic among the other nodes and all transaction traffic.",
+                fault.isolated
+            );
             (fault.id(), description)
         })
         .collect();
     json!({
         "model": model,
         "state": {
-            "environment": "Owned, isolated, three-node loopback test cluster",
-            "purpose": "Exercise bounded network-loss resilience across directions and protocols",
+            "environment": format!("Owned, isolated, {}-node loopback test cluster", snapshot.node_count),
+            "purpose": "Exercise recovery from rotating single-node network partitions",
             "interval_seconds": interval.as_secs(),
-            "active_fault": snapshot.active,
+            "active_partition": snapshot.active,
             "applications_this_session": applications,
             "packets": { "accepted": snapshot.accepted, "dropped": snapshot.dropped },
-            "protocols": {
-                "gossip": "Gossip destination port; dropped only by an all-protocol fault",
-                "repair": "Repair client and repair server destination ports",
-                "shred": "Shred destination port",
-                "votor": "Votor QUIC client and server destination ports",
-                "all": "Gossip, Repair, Shred, and Votor together; transaction traffic remains available"
-            }
+            "partitioned_protocols": ["gossip", "repair", "shred", "votor"],
+            "preserved_protocols": ["transaction"]
         },
-        "questions": { "fault": {
+        "questions": { "partition": {
             "type": "choice",
-            "instructions": "Choose the next single drop case for this local resilience test. Use `applications_this_session` to prefer less-exercised directions and targets; avoid repeating `active_fault` when other cases are available. All 24 cases are valid test choices. Select exactly one; it replaces the previous fault. An `all` target is one combined fault covering Gossip, Repair, Shred, and Votor on its directed link. No additional faults or actions are permitted.",
+            "instructions": "Choose the next single-node network partition for this local resilience test. Use `applications_this_session` to prefer less-exercised nodes, where a missing count means zero. Avoid repeating `active_partition` when another choice is available. Select exactly one node; its bidirectional partition replaces the previous partition. No additional faults or actions are permitted.",
             "criteria": criteria
         }}
     })
@@ -166,7 +107,7 @@ struct Response {
 }
 #[derive(Deserialize)]
 struct Answers {
-    fault: Answer,
+    partition: Answer,
 }
 #[derive(Deserialize)]
 struct Answer {
@@ -177,15 +118,15 @@ struct Answer {
     probabilities: BTreeMap<String, f64>,
 }
 
-fn selection(body: &[u8]) -> Result<DropFault> {
+fn selection(body: &[u8], node_count: usize) -> Result<PartitionFault> {
     let response: Response =
         serde_json::from_slice(body).map_err(|_| "invalid TypeSafe response schema")?;
-    let answer = response.answers.fault;
-    let fault = DropFault::parse(&answer.choice)?;
+    let answer = response.answers.partition;
+    let fault = PartitionFault::parse(&answer.choice, node_count)?;
     if answer.kind != "choice"
         || !(0.0..=1.0).contains(&answer.confidence)
-        || answer.probabilities.len() != DROP_FAULT_COUNT
-        || DropFault::all().any(|f| {
+        || answer.probabilities.len() != node_count
+        || PartitionFault::all(node_count).any(|f| {
             !answer
                 .probabilities
                 .get(&f.id())
@@ -234,14 +175,15 @@ impl Api {
         snapshot: &Snapshot,
         applications: &BTreeMap<String, u64>,
         interval: Duration,
-    ) -> Result<DropFault> {
+    ) -> Result<PartitionFault> {
         self.post(
             API_URL,
             &request(snapshot, applications, interval, &self.model),
+            snapshot.node_count,
         )
     }
 
-    fn post(&self, url: &str, body: &Value) -> Result<DropFault> {
+    fn post(&self, url: &str, body: &Value, node_count: usize) -> Result<PartitionFault> {
         let response = self
             .client
             .post(url)
@@ -261,7 +203,7 @@ impl Api {
         if body.len() as u64 > MAX_RESPONSE {
             return Err("TypeSafe response too large".into());
         }
-        selection(&body)
+        selection(&body, node_count)
     }
 }
 
@@ -329,16 +271,22 @@ fn run_session(
     socket: &str,
     interval: Duration,
     stop: &AtomicBool,
-    mut choose: impl FnMut(&Snapshot, &BTreeMap<String, u64>) -> Result<DropFault>,
+    mut choose: impl FnMut(&Snapshot, &BTreeMap<String, u64>) -> Result<PartitionFault>,
 ) -> Result<()> {
     let snapshot: Snapshot = serde_json::from_str(&exchange(socket, "typesafe-start")?)?;
+    let node_count = snapshot.node_count;
     let session = Session {
         socket,
         instance: snapshot.instance,
         token: snapshot.session.ok_or("missing TypeSafe session")?,
     };
-    println!("TypeSafe: {DROP_FAULT_COUNT} drop choices, one active fault, interval={}s; Ctrl-C or netctl heal stops injection.", interval.as_secs());
-    let mut applications: BTreeMap<_, _> = DropFault::all().map(|f| (f.id(), 0)).collect();
+    if !(2..=MAX_PARTITION_NODES).contains(&node_count) {
+        return Err(format!("TypeSafe partitions require 2..={MAX_PARTITION_NODES} nodes").into());
+    }
+    println!("TypeSafe: {node_count} single-node partition choices, one active partition, interval={}s; Ctrl-C or netctl heal stops injection.", interval.as_secs());
+    let mut applications: BTreeMap<_, _> = PartitionFault::all(node_count)
+        .map(|fault| (fault.id(), 0))
+        .collect();
     let mut deadline = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         // Fixed cadence, one outstanding request, no catch-up bursts. Poll the
@@ -358,7 +306,7 @@ fn run_session(
                 let response = exchange(
                     socket,
                     &format!(
-                        "typesafe-drop {} {} {} {}",
+                        "typesafe-partition {} {} {} {}",
                         session.instance,
                         session.token,
                         snapshot.generation,
@@ -369,7 +317,9 @@ fn run_session(
                 print!("{response}"); // Controller acknowledgement, not a prediction.
             }
             Ok(_) => break,
-            Err(e) => eprintln!("TypeSafe: {e}; keeping current fault, retrying next interval"),
+            Err(e) => {
+                eprintln!("TypeSafe: {e}; keeping current partition, retrying next interval")
+            }
         }
         deadline += interval;
         while deadline <= Instant::now() {
@@ -393,29 +343,32 @@ mod tests {
             instance: "local-instance".into(),
             session: Some(1),
             generation: 1,
-            node_count: 3,
+            node_count: 10,
             active: None,
             accepted: 100,
             dropped: 0,
         }
     }
 
-    fn response(fault: DropFault) -> Value {
-        let probabilities: BTreeMap<_, _> = DropFault::all()
+    fn response(fault: PartitionFault, node_count: usize) -> Value {
+        let probabilities: BTreeMap<_, _> = PartitionFault::all(node_count)
             .map(|f| (f.id(), if f == fault { 1.0 } else { 0.0 }))
             .collect();
-        json!({ "answers": { "fault": { "type": "choice", "choice": fault.id(),
+        json!({ "answers": { "partition": { "type": "choice", "choice": fault.id(),
             "confidence": 1.0, "probabilities": probabilities }}})
     }
 
     #[test]
-    fn exactly_twenty_four_closed_choices_in_request() {
-        let faults: Vec<_> = DropFault::all().collect();
+    fn one_closed_partition_choice_per_node() {
+        let faults: Vec<_> = PartitionFault::all(10).collect();
         let ids: std::collections::HashSet<_> = faults.iter().map(|f| f.id()).collect();
-        assert_eq!(ids.len(), DROP_FAULT_COUNT);
-        assert_eq!(faults[0].id(), "drop_0_1_repair");
-        assert_eq!(faults[3].id(), "drop_0_1_all");
-        assert_eq!(faults[23].id(), "drop_2_0_all");
+        assert_eq!(ids.len(), 10);
+        assert_eq!(faults[0].id(), "partition_node_0");
+        assert_eq!(faults[9].id(), "partition_node_9");
+        assert!(faults[3].matches(3, 7, Some(Protocol::Votor)));
+        assert!(faults[3].matches(7, 3, Some(Protocol::Gossip)));
+        assert!(!faults[3].matches(7, 8, Some(Protocol::Repair)));
+        assert!(!faults[3].matches(3, 7, None));
         let body = request(
             &snapshot(),
             &BTreeMap::new(),
@@ -423,25 +376,27 @@ mod tests {
             "jev-latest",
         );
         assert_eq!(body["questions"].as_object().unwrap().len(), 1);
-        assert_eq!(body["questions"]["fault"]["type"], "choice");
+        assert_eq!(body["questions"]["partition"]["type"], "choice");
         assert_eq!(
-            body["questions"]["fault"]["criteria"]
+            body["questions"]["partition"]["criteria"]
                 .as_object()
                 .unwrap()
                 .len(),
-            DROP_FAULT_COUNT
+            10
         );
-        assert!(body["questions"]["fault"]["criteria"]["drop_0_1_all"]
-            .as_str()
-            .unwrap()
-            .contains("Gossip, Repair, Shred, and Votor"));
+        assert!(
+            body["questions"]["partition"]["criteria"]["partition_node_1"]
+                .as_str()
+                .unwrap()
+                .contains("both directions")
+        );
         assert!(!body.to_string().contains("local-instance"));
         for fault in faults {
-            assert!(body["questions"]["fault"]["criteria"]
+            assert!(body["questions"]["partition"]["criteria"]
                 .get(fault.id())
                 .is_some());
             assert_eq!(
-                selection(&serde_json::to_vec(&response(fault)).unwrap()).unwrap(),
+                selection(&serde_json::to_vec(&response(fault, 10)).unwrap(), 10).unwrap(),
                 fault
             );
         }
@@ -449,33 +404,33 @@ mod tests {
 
     #[test]
     fn rejects_invalid_responses_but_accepts_uncertain_valid_choices() {
-        let fault = DropFault::all().next().unwrap();
-        let valid = response(fault);
+        let fault = PartitionFault::all(10).next().unwrap();
+        let valid = response(fault, 10);
         for (key, value) in [
-            ("choice", json!("drop_0_3_repair")),
+            ("choice", json!("partition_node_10")),
             ("choice", json!([fault.id()])),
             ("type", json!("score")),
             ("confidence", json!(-1)),
             ("probabilities", json!({})),
         ] {
             let mut bad = valid.clone();
-            bad["answers"]["fault"][key] = value;
-            assert!(selection(&serde_json::to_vec(&bad).unwrap()).is_err());
+            bad["answers"]["partition"][key] = value;
+            assert!(selection(&serde_json::to_vec(&bad).unwrap(), 10).is_err());
         }
         for bad in [b"{}".as_slice(), b"not json", b"{\"answers\":{}}"] {
-            assert!(selection(bad).is_err());
+            assert!(selection(bad, 10).is_err());
         }
         let mut uniform = valid;
-        uniform["answers"]["fault"]["confidence"] = json!(0.0);
-        for probability in uniform["answers"]["fault"]["probabilities"]
+        uniform["answers"]["partition"]["confidence"] = json!(0.0);
+        for probability in uniform["answers"]["partition"]["probabilities"]
             .as_object_mut()
             .unwrap()
             .values_mut()
         {
-            *probability = json!(1.0 / DROP_FAULT_COUNT as f64);
+            *probability = json!(0.1);
         }
         assert_eq!(
-            selection(&serde_json::to_vec(&uniform).unwrap()).unwrap(),
+            selection(&serde_json::to_vec(&uniform).unwrap(), 10).unwrap(),
             fault
         );
     }
@@ -494,7 +449,7 @@ mod tests {
 
     #[test]
     fn http_contract_errors_redirects_and_response_limit() {
-        let fault = DropFault::all().next().unwrap();
+        let fault = PartitionFault::all(10).next().unwrap();
         let mut api = Api::new("test-key", "jev-latest".into()).unwrap();
         api.client = Client::builder()
             .no_proxy()
@@ -503,7 +458,7 @@ mod tests {
             .build()
             .unwrap();
         for (case, (status, body)) in [
-            (200, response(fault).to_string()),
+            (200, response(fault, 10).to_string()),
             (401, "test-key".into()),
             (429, "rate limited".into()),
             (302, "redirect".into()),
@@ -554,7 +509,7 @@ mod tests {
                 assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), sent);
                 write!(socket, "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nLocation: http://127.0.0.1:1/never-follow\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             });
-            let result = api.post(&url, &expected);
+            let result = api.post(&url, &expected, 10);
             worker.join().unwrap();
             assert_eq!(result.is_ok(), case == 0, "case {case}: {result:?}");
             if let Ok(selected) = result {
@@ -617,7 +572,7 @@ mod tests {
             }
         });
         let stop = AtomicBool::new(false);
-        let faults: Vec<_> = DropFault::all().collect();
+        let faults: Vec<_> = PartitionFault::all(3).collect();
         let mut ticks = Vec::new();
         let result = run_session(
             &socket,

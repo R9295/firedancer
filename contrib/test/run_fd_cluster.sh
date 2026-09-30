@@ -7,17 +7,18 @@ usage() {
     'Usage: run_fd_cluster.sh [COMMAND] [OPTIONS]' \
     '' \
     'Commands:' \
+    '  create   Create equal-stake keys, genesis, and node configs (default: 10)' \
     '  test     Build, configure the host, and run the test (default)' \
     '  build    Build firedancer-dev and test_firedancer_cluster' \
     '  init     Configure sysctl, huge pages, CPUs, and snapshot directories' \
     '  run      Run the test using an already prepared host' \
-    '  net      Run with the Rust network controller (host already prepared)' \
+    '  net      Build, prepare the host, and run with the Rust network controller' \
     '  netctl   Send a controller command: status | block N M | allow N M | heal | stop' \
     '           delay N M MS | duplicate N M 0|1 (one extra copy)' \
-    '           typesafe [SECONDS] (automatic single drop; default: 1s)' \
+    '           typesafe [SECONDS] (automatic single-node partition; default: 1s)' \
     '  mem      Show the memory reservation for each node' \
-    '  logs     Follow the three default node log files' \
-    '  fini     Remove the cluster CPU partitions and huge-page mounts' \
+    '  logs     Follow all default node log files' \
+    '  fini     Remove CPU partitions, huge-page mounts, and the HugePages pool' \
     '' \
     'Options:' \
     '  --root-slot N   Slot every node must root (default: 8; net: 256)' \
@@ -26,11 +27,12 @@ usage() {
     '  -h, --help      Show this help' \
     '' \
     'Environment: FD (repository), C (cluster directory),' \
-    '  FD_CLUSTER_ROOT_SLOT, FD_CLUSTER_TIMEOUT_S, FD_CLUSTER_BUILD_JOBS.' \
+    '  FD_CLUSTER_ROOT_SLOT, FD_CLUSTER_TIMEOUT_S, FD_CLUSTER_BUILD_JOBS,' \
+    '  FD_CLUSTER_NODES (create only; default: 10).' \
     '  FD_CLUSTER_CONFIGS: colon-separated absolute node config paths (1..128).' \
     '  FD_NETCTL_SOCKET: control socket (default: /run/fd-netctl/control.sock).' \
     'C defaults to the cluster directory alongside the repository.' \
-    'By default, uses C/node-{0,1,2}.toml. Existing keys and genesis are required.' \
+    'By default, uses every C/node-*.toml in version order.' \
     'Run as your normal user; privileged commands request sudo as needed.' \
     'The test stops its validators when it finishes. Use fini for host cleanup.'
 }
@@ -53,7 +55,7 @@ while (( $# )); do
       if (( $# )); then control_args=("$@"); fi
       break
       ;;
-    test|build|init|run|net|mem|logs|fini)
+    create|test|build|init|run|net|mem|logs|fini)
       (( !action_set )) || fail 'Specify only one command.'
       action=$1
       action_set=1
@@ -82,6 +84,11 @@ FD=$(cd -- "$FD" && pwd)
 C=${C:-$(dirname -- "$FD")/cluster}
 netctl_bin=$FD/contrib/test/fd-netctl/target/release/fd-netctl
 netctl_socket=${FD_NETCTL_SOCKET:-/run/fd-netctl/control.sock}
+
+if [[ $action == create ]]; then
+  FD="$FD" C="$C" "$FD/contrib/test/create_fd_cluster.sh"
+  exit 0
+fi
 
 as_root() {
   if (( EUID==0 )); then "$@"; else sudo -- "$@"; fi
@@ -120,7 +127,26 @@ init() {
   command -v python3 >/dev/null || fail 'python3 is required to plan the cluster huge-page pools.'
   printf 'Preparing the host for %s nodes.\n' "${#configs[@]}"
   as_root "$dev" --config "${configs[0]}" --alpenglow configure init sysctl
-  as_root python3 "$FD/contrib/test/reserve_fd_cluster_pages.py" --dev "$dev" "${configs[@]}"
+
+  # A rebuild can change a node's required min_size.  Release only stale
+  # mounts before planning the pool so their old reservations are counted as
+  # reusable capacity instead of as a new-cluster shortfall.  Valid mounts
+  # remain reserved and are omitted from the new demand below.
+  local stale_configs=()
+  local cfg
+  for cfg in "${configs[@]}"; do
+    if ! as_root "$dev" --config "$cfg" --alpenglow configure check hugetlbfs >/dev/null 2>&1; then
+      stale_configs+=("$cfg")
+    fi
+  done
+  if (( ${#stale_configs[@]} )); then
+    printf 'Refreshing huge-page mounts for %s nodes.\n' "${#stale_configs[@]}"
+    local i
+    for ((i=${#stale_configs[@]}-1; i>=0; i--)); do
+      as_root "$dev" --config "${stale_configs[i]}" --alpenglow configure fini hugetlbfs
+    done
+    as_root python3 "$FD/contrib/test/reserve_fd_cluster_pages.py" --dev "$dev" "${stale_configs[@]}"
+  fi
   for cfg in "${configs[@]}"; do
     # Startup opens the snapshot directory even when bootstrapping from genesis.
     as_root "$dev" --config "$cfg" --alpenglow configure init hugetlbfs cpuset snapshots
@@ -156,6 +182,8 @@ fini() {
   for ((i=${#configs[@]}-1; i>=0; i--)); do
     as_root "$dev" --config "${configs[i]}" --alpenglow configure fini cpuset hugetlbfs || status=1
   done
+  # fdctl unmounts hugetlbfs but leaves its host-wide 2 MiB page pool reserved.
+  as_root sysctl -w vm.nr_hugepages=0 || status=1
   return "$status"
 }
 
@@ -171,11 +199,6 @@ if [[ $action == netctl ]]; then
   fi
   exit 0
 fi
-if [[ $action == logs ]]; then
-  [[ -d $C ]] || fail "Cluster directory not found: $C"
-  C=$(cd -- "$C" && pwd)
-  exec tail -n 50 -F "$C/node-0/firedancer.log" "$C/node-1/firedancer.log" "$C/node-2/firedancer.log"
-fi
 if [[ ${FD_CLUSTER_CONFIGS+x} ]]; then
   [[ -n $FD_CLUSTER_CONFIGS && $FD_CLUSTER_CONFIGS != :* && $FD_CLUSTER_CONFIGS != *: && $FD_CLUSTER_CONFIGS != *::* && $FD_CLUSTER_CONFIGS != *$'\n'* ]] \
     || fail 'FD_CLUSTER_CONFIGS must contain nonempty colon-separated config paths.'
@@ -184,7 +207,11 @@ else
   [[ -d $C ]] || fail "Cluster directory not found: $C"
   C=$(cd -- "$C" && pwd)
   [[ $C != *:* ]] || fail 'Cluster directory must not contain a colon.'
-  configs=("$C/node-0.toml" "$C/node-1.toml" "$C/node-2.toml")
+  shopt -s nullglob
+  configs=("$C"/node-*.toml)
+  shopt -u nullglob
+  (( ${#configs[@]} )) || fail "No node-*.toml configs found in $C."
+  mapfile -t configs < <(printf '%s\n' "${configs[@]}" | sort -V)
 fi
 (( ${#configs[@]}>=1 && ${#configs[@]}<=128 )) || fail 'Provide between 1 and 128 node configs.'
 for cfg in "${configs[@]}"; do
@@ -192,13 +219,19 @@ for cfg in "${configs[@]}"; do
   [[ -r $cfg ]] || fail "Node configuration not readable: $cfg"
 done
 
-if [[ $action == test ]]; then build; fi
+if [[ $action == logs ]]; then
+  logs=()
+  for ((i=0; i<${#configs[@]}; i++)); do logs+=("$C/node-$i/firedancer.log"); done
+  exec tail -n 50 -F "${logs[@]}"
+fi
+
+if [[ $action == test || $action == net ]]; then build; fi
 locate_binaries
 case "$action" in
   test) init; run ;;
   init) init ;;
   run)  run ;;
-  net)  net ;;
+  net)  init; net ;;
   fini) fini ;;
   mem)
     for cfg in "${configs[@]}"; do

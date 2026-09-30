@@ -541,7 +541,7 @@ fn udp_helper() {
 }
 
 fn typesafe_udp_checks(socket: &Path, gossip: &[UdpSocket]) {
-    use fd_netctl::typesafe::{DropFault, Protocol, Snapshot};
+    use fd_netctl::typesafe::{PartitionFault, Protocol, Snapshot};
     let protocols = [
         Protocol::Shred,
         Protocol::Repair,
@@ -563,11 +563,11 @@ fn typesafe_udp_checks(socket: &Path, gossip: &[UdpSocket]) {
                 .collect()
         })
         .collect();
-    for fault in DropFault::all() {
+    for fault in PartitionFault::all(3) {
         let raw = ctl(socket, "typesafe-state").unwrap();
         let state: Snapshot = serde_json::from_str(raw.strip_prefix("OK ").unwrap()).unwrap();
         let command = format!(
-            "typesafe-drop {} {} {} {}",
+            "typesafe-partition {} {} {} {}",
             state.instance,
             state.session.unwrap(),
             state.generation,
@@ -587,13 +587,13 @@ fn typesafe_udp_checks(socket: &Path, gossip: &[UdpSocket]) {
                         !fault.matches(src, dst, Some(*protocol)),
                     );
                 }
+                exchange(
+                    &gossip[src],
+                    &gossip[dst],
+                    !fault.matches(src, dst, Some(Protocol::Gossip)),
+                );
             }
         }
-        exchange(
-            &gossip[fault.src],
-            &gossip[fault.dst],
-            !fault.matches(fault.src, fault.dst, Some(Protocol::Gossip)),
-        );
         assert!(ctl(socket, "block 0 1").unwrap().starts_with("ERR "));
     }
     assert!(ctl(socket, "heal").unwrap().starts_with("OK "));

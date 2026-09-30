@@ -38,8 +38,8 @@ run creates the network setup, launches PROGRAM inside it, and stops with it.
 Ctrl-C or ctl stop ends the managed run. serve instead waits for manual launches.
 Only configured loopback UDP port pairs enter the controller.
 Delay is 0..5000ms; duplicate=1 sends one extra copy. heal resets all faults.
-typesafe selects one of 24 directed drops every SECONDS (default 1).
-Requires exactly three nodes and TYPESAFE_API_KEY. Ctrl-C or heal stops injection.
+typesafe selects one single-node network partition every SECONDS (default 1).
+Requires 2..128 nodes and TYPESAFE_API_KEY. Ctrl-C or heal stops injection.
 No payload editing, TLS termination, or validator restarts are performed.";
 
 fn tool(name: &str) -> Result<PathBuf> {
@@ -341,7 +341,7 @@ fn serve(socket: &str, configs: &[String], command: Option<&[String]>) -> Result
                                             | "block"
                                             | "typesafe-start"
                                             | "typesafe-end"
-                                            | "typesafe-drop"
+                                            | "typesafe-partition"
                                     ) {
                                         deliveries.policy_changed(
                                             matches!(
@@ -352,7 +352,7 @@ fn serve(socket: &str, configs: &[String], command: Option<&[String]>) -> Result
                                             &mut policy,
                                         )?;
                                     }
-                                    if action == "typesafe-drop" {
+                                    if action == "typesafe-partition" {
                                         print!("{}", response.trim_start_matches("OK "));
                                         io::stdout().flush()?;
                                     }
