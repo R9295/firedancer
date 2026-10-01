@@ -32,6 +32,8 @@
    produced by Firedancer. */
 
 #define FD_BACKUP_ZSTD_LEVEL 1
+/* levels 4-15 are compiled out of libfd_zstd (third_party/zstd/Local.mk) */
+FD_STATIC_ASSERT( FD_BACKUP_ZSTD_LEVEL<=3 || FD_BACKUP_ZSTD_LEVEL>=16, zstd_level );
 
 /* FD_SNAP_MAX bounds the number of managed snapshot files
    (max_full_snapshots_to_keep+max_incremental_snapshots_to_keep, plus
@@ -67,6 +69,7 @@ typedef struct fd_backup_inode fd_backup_inode_t;
 
 struct fd_backup_start_msg {
   ulong  slot;      /* slot number */
+  ulong  slot_lo;   /* lowest appendvec slot this archive may use */
   uint   snap_idx;  /* identifies file descriptor */
   ushort fork_id;   /* accdb fork ID */
 };

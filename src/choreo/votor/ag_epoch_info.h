@@ -3,16 +3,16 @@
 
 #include "ag_votor_base.h"
 #include "../../ballet/bls/fd_bls.h"
-#include "../../flamenco/stakes/fd_stake_weight.h"
 
 FD_STATIC_ASSERT( FD_BLS_SET_MAX==AG_VAT_MAX, fd_bls_set_max );
+FD_STATIC_ASSERT( sizeof(ag_bls_key_t)==FD_BLS_PUB_COMPRESSED_SZ, ag_bls_key_sz );
 
 struct ag_validator_info {
   ulong         id;
   ulong         stake;
   ag_id_key_t   id_key;
   ag_vote_key_t vote_key;
-  fd_bls_pub_t  bls_key;
+  ag_bls_key_t  bls_key;
 };
 typedef struct ag_validator_info ag_validator_info_t;
 
@@ -26,15 +26,14 @@ typedef struct ag_epoch_info ag_epoch_info_t;
 
 FD_PROTOTYPES_BEGIN
 
-void
-ag_epoch_info( ag_epoch_info_t *           self,
-               ag_validator_info_t const * validators,
-               ulong                       validator_cnt );
+/* EpochInfo::validators */
 
 FD_FN_CONST static inline ag_validator_info_t const *
 ag_epoch_info_validators( ag_epoch_info_t const * self ) {
   return self->validators;
 }
+
+/* EpochInfo::validator */
 
 FD_FN_PURE static inline ag_validator_info_t const *
 ag_epoch_info_validator( ag_epoch_info_t const * self,
@@ -42,6 +41,17 @@ ag_epoch_info_validator( ag_epoch_info_t const * self,
   FD_TEST( rank<self->validator_cnt );
   return ag_epoch_info_validators( self ) + rank;
 }
+
+/* Deserialized ag_epoch_info_validator( self, rank )->bls_key */
+
+FD_FN_PURE static inline fd_bls_pub_t const *
+ag_epoch_info_pubkey( ag_epoch_info_t const * self,
+                      ulong                   rank ) {
+  FD_TEST( rank<self->validator_cnt );
+  return self->pubkeys + rank;
+}
+
+/* EpochInfo::leader */
 
 FD_FN_PURE static inline ag_validator_info_t const *
 ag_epoch_info_leader( ag_epoch_info_t const * self,
@@ -51,18 +61,17 @@ ag_epoch_info_leader( ag_epoch_info_t const * self,
   return ag_epoch_info_validator( self, leader_id );
 }
 
+/* EpochInfo::total_stake */
+
 FD_FN_PURE static inline ulong
 ag_epoch_info_total_stake( ag_epoch_info_t const * self ) { return self->total_stake; }
+
+/* Definition 13. EpochInfo::is_weakest_quorum, is_weak_quorum, is_quorum, is_strong_quorum */
 
 FD_FN_PURE int ag_epoch_info_is_weakest_quorum( ag_epoch_info_t const * self, ulong stake );
 FD_FN_PURE int ag_epoch_info_is_weak_quorum   ( ag_epoch_info_t const * self, ulong stake );
 FD_FN_PURE int ag_epoch_info_is_quorum        ( ag_epoch_info_t const * self, ulong stake );
 FD_FN_PURE int ag_epoch_info_is_strong_quorum ( ag_epoch_info_t const * self, ulong stake );
-
-ag_epoch_info_t *
-ag_epoch_info_rank( ag_epoch_info_t              * epoch_info_mem,
-                    fd_vote_stake_weight_t const * stakes,
-                    ulong                          stake_cnt );
 
 FD_PROTOTYPES_END
 

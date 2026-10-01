@@ -6,18 +6,18 @@ $(OBJDIR)/obj/discoh/guih/fd_guih_tile.o: book/public/fire.svg
 endif
 
 src/discoh/guih/dist_cmp/%.zst: src/discoh/guih/dist/% src/ballet/zstd/fd_zstd_pack.c | $(OBJDIR)/bin/fd_zstd_pack
-	@echo -e "ZSTD\t$(notdir $@)"
+	@printf 'ZSTD\t%s\n' $(notdir $@)
 	$(Q)$(MKDIR) $(@D) && \
 $(OBJDIR)/bin/fd_zstd_pack 19 $< $@ && \
 $(TOUCH) $@
 
 src/discoh/guih/dist_cmp/%.gz: src/discoh/guih/dist/% src/ballet/zstd/fd_gzip_pack.c | $(OBJDIR)/bin/fd_gzip_pack
-	@echo -e "GZIP\t$(notdir $@)"
+	@printf 'GZIP\t%s\n' $(notdir $@)
 	$(Q)$(MKDIR) $(@D) && \
 $(OBJDIR)/bin/fd_gzip_pack 9 $< $@ && \
 $(TOUCH) $@
 
-FD_GUIH_FRONTEND_FILES := $(shell $(FIND) src/discoh/guih/dist -type f)
+FD_GUIH_FRONTEND_FILES := $(call rfiles,src/discoh/guih/dist/)
 FD_GUIH_FRONTEND_GZ_FILES := $(patsubst src/discoh/guih/dist/%, src/discoh/guih/dist_cmp/%.gz, $(FD_GUIH_FRONTEND_FILES))
 FD_GUIH_FRONTEND_ZST_FILES := $(patsubst src/discoh/guih/dist/%, src/discoh/guih/dist_cmp/%.zst, $(FD_GUIH_FRONTEND_FILES))
 

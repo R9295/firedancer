@@ -16,9 +16,10 @@
      - failed_inserts_dlist:  Entries that failed to upsert.     Expire in 60s.
      - no_contact_info_dlist: Entries dropped for missing CI.    Expire in ~2 days.
 
-   All three lists share a single pool and treap (keyed by the first
-   8 bytes of the value hash) so they can be iterated together when
-   building pull-request bloom filters. */
+   All three lists share a single pool, a map keyed by the first 8
+   bytes of the value hash (so a hash is recorded once) and an hset of
+   the hashes so they can be iterated together when building
+   pull-request bloom filters. */
 
 struct fd_gossip_purged_metrics {
   ulong purged_cnt;
@@ -37,13 +38,9 @@ struct fd_crds_purged {
 
   struct {
     ulong hash_prefix;
-    uint  parent;
-    uint  left;
-    uint  right;
     uint  next;
     uint  prev;
-    uint  prio;
-  } treap;
+  } map;
 
   /* We keep a linked list of purged values sorted by insertion time.
      The time used here is our node's wallclock.
@@ -70,75 +67,16 @@ struct fd_crds_purged {
 
 typedef struct fd_crds_purged fd_crds_purged_t;
 
-FD_STATIC_ASSERT( sizeof(fd_crds_purged_t)==128UL, purged_entry_footprint );
-
-#define POOL_NAME purged_pool
-#define POOL_T    fd_crds_purged_t
-#define POOL_IDX_T uint
-#define POOL_NEXT pool.next
-#include "../../util/tmpl/fd_pool.c"
-
-#define TREAP_NAME      purged_treap
-#define TREAP_T         fd_crds_purged_t
-#define TREAP_QUERY_T   ulong
-#define TREAP_CMP(q,e)  ((q>e->treap.hash_prefix)-(q<e->treap.hash_prefix))
-#define TREAP_IDX_T     uint
-#define TREAP_OPTIMIZE_ITERATION 1
-#define TREAP_NEXT      treap.next
-#define TREAP_PREV      treap.prev
-#define TREAP_LT(e0,e1) ((e0)->treap.hash_prefix<(e1)->treap.hash_prefix)
-#define TREAP_PARENT    treap.parent
-#define TREAP_LEFT      treap.left
-#define TREAP_RIGHT     treap.right
-#define TREAP_PRIO      treap.prio
-#include "../../util/tmpl/fd_treap.c"
-
-#define DLIST_NAME  failed_inserts_dlist
-#define DLIST_ELE_T fd_crds_purged_t
-#define DLIST_IDX_T uint
-#define DLIST_PREV  expire.prev
-#define DLIST_NEXT  expire.next
-#include "../../util/tmpl/fd_dlist.c"
-
-#define DLIST_NAME  replaced_dlist
-#define DLIST_ELE_T fd_crds_purged_t
-#define DLIST_IDX_T uint
-#define DLIST_PREV  expire.prev
-#define DLIST_NEXT  expire.next
-#include "../../util/tmpl/fd_dlist.c"
-
-#define DLIST_NAME  no_contact_info_dlist
-#define DLIST_ELE_T fd_crds_purged_t
-#define DLIST_IDX_T uint
-#define DLIST_PREV  expire.prev
-#define DLIST_NEXT  expire.next
-#include "../../util/tmpl/fd_dlist.c"
-
-#define MAP_NAME               nci_origin_map
-#define MAP_KEY                origin
-#define MAP_ELE_T              fd_crds_purged_t
-#define MAP_KEY_T              fd_pubkey_t
-#define MAP_IDX_T              uint
-#define MAP_PREV               nci_map.prev
-#define MAP_NEXT               nci_map.next
-#define MAP_KEY_EQ(k0,k1)      fd_pubkey_eq( k0, k1 )
-#define MAP_KEY_HASH(key,seed) fd_hash32( (key)->uc, (seed) )
-#define MAP_MULTI              1
-#define MAP_OPTIMIZE_RANDOM_ACCESS_REMOVAL 1
-#include "../../util/tmpl/fd_map_chain.c"
+FD_STATIC_ASSERT( sizeof(fd_crds_purged_t)==112UL, purged_entry_footprint );
 
 struct fd_gossip_purged_private;
 typedef struct fd_gossip_purged_private fd_gossip_purged_t;
 
+struct fd_gossip_hset_private;
+typedef struct fd_gossip_hset_private fd_gossip_hset_t;
+
 #define FD_GOSSIP_PURGED_ALIGN 128UL
 #define FD_GOSSIP_PURGED_MAGIC (0xf17eda2c39070ed0UL) /* firedancer purged v0 */
-
-struct fd_gossip_purged_mask_iter_private {
-  ulong idx;
-  ulong end_hash;
-};
-
-typedef struct fd_gossip_purged_mask_iter_private fd_gossip_purged_mask_iter_t;
 
 static inline void
 fd_gossip_purged_generate_masks( ulong   mask,
@@ -178,6 +116,12 @@ fd_gossip_purged_metrics( fd_gossip_purged_t const * purged );
 ulong
 fd_gossip_purged_len( fd_gossip_purged_t const * purged );
 
+/* fd_gossip_purged_hset returns the dense index of the hashes of all
+   tracked entries, see fd_gossip_hset.h. */
+
+fd_gossip_hset_t const *
+fd_gossip_purged_hset( fd_gossip_purged_t const * purged );
+
 /* fd_gossip_purged_insert_replaced records a hash that was purged
    because a newer CRDS value replaced it. */
 
@@ -196,9 +140,9 @@ fd_gossip_purged_insert_failed_insert( fd_gossip_purged_t * purged,
 
 /* fd_gossip_purged_insert_no_contact_info records a hash that was
    dropped because the origin pubkey has no known contact info.  The
-   hash is inserted into the shared purged treap (so it appears in
-   bloom filters) and into a per-pubkey chain so all entries for a
-   given origin can be drained when we learn their contact info. */
+   hash is indexed like any other purged entry (so it appears in bloom
+   filters) and chained per pubkey so all entries for a given origin
+   can be drained when we learn their contact info. */
 
 void
 fd_gossip_purged_insert_no_contact_info( fd_gossip_purged_t * purged,
@@ -208,7 +152,7 @@ fd_gossip_purged_insert_no_contact_info( fd_gossip_purged_t * purged,
 
 /* fd_gossip_purged_drain_no_contact_info removes all no_contact_info
    entries associated with the given origin pubkey from the purged
-   treap, no_contact_info dlist, and per-pubkey chain.  This causes
+   table, no_contact_info dlist, and per-pubkey chain.  This causes
    those hashes to disappear from bloom filters, so peers will re-send
    the corresponding CRDS values in future pull responses. */
 
@@ -222,29 +166,6 @@ fd_gossip_purged_drain_no_contact_info( fd_gossip_purged_t * purged,
 void
 fd_gossip_purged_expire( fd_gossip_purged_t * purged,
                          long                 now );
-
-/* fd_gossip_purged_mask_iter_{init,next,done,hash} iterate over purged
-   entries whose hash prefix falls within the range defined by mask and
-   mask_bits.  This is used when building bloom filters for pull
-   requests. */
-
-fd_gossip_purged_mask_iter_t *
-fd_gossip_purged_mask_iter_init( fd_gossip_purged_t const * purged,
-                                 ulong                      mask,
-                                 uint                       mask_bits,
-                                 uchar                      iter_mem[ static 16UL ] );
-
-fd_gossip_purged_mask_iter_t *
-fd_gossip_purged_mask_iter_next( fd_gossip_purged_mask_iter_t * it,
-                                 fd_gossip_purged_t const *     purged );
-
-int
-fd_gossip_purged_mask_iter_done( fd_gossip_purged_mask_iter_t * it,
-                                 fd_gossip_purged_t const *     purged );
-
-uchar const *
-fd_gossip_purged_mask_iter_hash( fd_gossip_purged_mask_iter_t * it,
-                                 fd_gossip_purged_t const *     purged );
 
 FD_PROTOTYPES_END
 

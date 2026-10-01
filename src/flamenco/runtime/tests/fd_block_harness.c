@@ -5,7 +5,7 @@
 #include "../fd_runtime.h"
 #include "../fd_runtime_helpers.h"
 #include "../fd_system_ids.h"
-#include "../fd_runtime_stack.h"
+#include "../fd_runtime_stack_tmpl.h"
 #include "../../stakes/fd_stake_types.h"
 #include "../sysvar/fd_sysvar_epoch_schedule.h"
 #include "../../progcache/fd_progcache_admin.h"
@@ -26,6 +26,11 @@ typedef struct {
 #define SORT_KEY_T       pk_with_pos_t
 #define SORT_BEFORE(a,b) (memcmp(&(a).pk, &(b).pk, sizeof(fd_pubkey_t))<0)
 #include "../../../util/tmpl/fd_sort.c"  /* generates templatized sort_pkpos_*() APIs */
+
+#define SORT_NAME        sort_stake_delegation
+#define SORT_KEY_T       fd_exec_test_stake_delegation_t
+#define SORT_BEFORE(a,b) (memcmp((a).stake_account, (b).stake_account, sizeof(fd_pubkey_t))<0)
+#include "../../../util/tmpl/fd_sort.c"
 
 /* Fixed leader schedule hash seed (consistent with solfuzz-agave) */
 #define LEADER_SCHEDULE_HASH_SEED 0xDEADFACEUL
@@ -131,8 +136,7 @@ fd_solfuzz_block_register_stake_delegation( fd_accdb_t *             accdb,
       stake_state->stake.stake.delegation.deactivation_epoch,
       stake_state->stake.stake.credits_observed,
       acc.lamports,
-      (uint)acc.data_len,
-      FD_STAKE_DELEGATIONS_WARMUP_COOLDOWN_RATE_ENUM_025 );
+      (uint)acc.data_len );
   fd_accdb_unread_one( accdb, &acc );
 }
 
@@ -266,7 +270,7 @@ fd_solfuzz_pb_block_ctx_create( fd_solfuzz_runner_t *                runner,
   fd_stake_delegations_t * stake_delegations = fd_banks_stake_delegations_root_query( banks );
   fd_stake_delegations_reset( stake_delegations );
 
-  bank->stake_delegations_fork_id = fd_stake_delegations_new_fork( stake_delegations );
+  bank->stake_delegations_fork_id = fd_stake_delegations_new_fork( stake_delegations, USHORT_MAX );
 
   FD_TEST( block_bank->vote_accounts_t_1_count<=FD_RUNTIME_MAX_VAT_VOTE_ACCOUNTS );
   FD_TEST( block_bank->vote_accounts_t_2_count<=FD_RUNTIME_MAX_VAT_VOTE_ACCOUNTS );
@@ -325,7 +329,7 @@ fd_solfuzz_pb_block_ctx_create( fd_solfuzz_runner_t *                runner,
   if( FD_UNLIKELY( !fd_sysvar_cache_stake_history_view( &bank->f.sysvar_cache, stake_history ) ) ) {
     FD_LOG_ERR(( "StakeHistory sysvar missing or invalid" ));
   }
-  fd_stake_delegations_refresh( stake_delegations, bank->f.epoch, stake_history, &bank->f.warmup_cooldown_rate_epoch, FD_FEATURE_ACTIVE_BANK( bank, upgrade_bpf_stake_program_to_v5_1 ), FD_FEATURE_ACTIVE_BANK( bank, remove_inactive_stakes ), accdb, fork_id );
+  fd_stake_delegations_refresh( stake_delegations, bank->f.epoch, stake_history, &bank->f.warmup_cooldown_rate_epoch, FD_FEATURE_ACTIVE_BANK( bank, upgrade_bpf_stake_program_to_v5_1 ), FD_FEATURE_ACTIVE_BANK( bank, remove_inactive_stakes ) );
 
   ulong chain_cnt = fd_vote_rewards_map_chain_cnt_est( runtime_stack->max_vote_accounts );
   FD_TEST( fd_vote_rewards_map_join( fd_vote_rewards_map_new( runtime_stack->stakes.vote_map, chain_cnt, 999 ) ) );
@@ -436,7 +440,7 @@ fd_solfuzz_block_ctx_exec( fd_solfuzz_runner_t * runner,
       fd_solcap_writer_init( capture_ctx->capture, solcap_fd );
     }
 
-    fd_rewards_recalculate_partitioned_rewards( runner->banks, runner->bank, runner->accdb, runner->runtime_stack, capture_ctx );
+    fd_rewards_recalculate_partitioned_rewards( runner->bank, runner->accdb, runner->runtime_stack, capture_ctx );
 
     /* Process new epoch may push a new spad frame onto the runtime spad. We should make sure this frame gets
        cleared (if it was allocated) before executing the block. */
@@ -590,6 +594,49 @@ fd_solfuzz_pb_build_leader_schedule_effects( fd_solfuzz_runner_t *          runn
   );
 }
 
+static ulong
+fd_solfuzz_pb_collect_stake_delegations( fd_solfuzz_runner_t *             runner,
+                                         fd_exec_test_stake_delegation_t * out,
+                                         ulong                             out_max ) {
+  fd_bank_t * bank = runner->bank;
+
+  fd_stake_history_t   stake_history_[1];
+  fd_stake_history_t * stake_history = fd_sysvar_cache_stake_history_view( &bank->f.sysvar_cache, stake_history_ );
+  ulong * warmup_cooldown_rate_epoch = &bank->f.warmup_cooldown_rate_epoch;
+  int     use_fixed_point            = FD_FEATURE_ACTIVE_BANK( bank, upgrade_bpf_stake_program_to_v5_1 );
+
+  fd_stake_delegations_t * stake_delegations = fd_bank_stake_delegations_modify( bank );
+  fd_stake_delegations_view_begin( stake_delegations,
+                                   bank->f.epoch,
+                                   stake_history,
+                                   warmup_cooldown_rate_epoch,
+                                   use_fixed_point,
+                                   bank->stake_delegations_fork_id );
+
+  ulong cnt = 0UL;
+  fd_stake_delegations_iter_t iter_[1];
+  for( fd_stake_delegations_iter_t * iter = fd_stake_delegations_iter_init( iter_, stake_delegations );
+       !fd_stake_delegations_iter_done( iter );
+       fd_stake_delegations_iter_next( iter ) ) {
+    if( FD_UNLIKELY( cnt>=out_max ) ) abort();
+    fd_stake_delegation_t const *     d = fd_stake_delegations_iter_ele( iter );
+    fd_exec_test_stake_delegation_t * o = &out[ cnt++ ];
+    fd_memcpy( o->stake_account, d->stake_account.uc, sizeof(fd_pubkey_t) );
+    fd_memcpy( o->vote_account,  d->vote_account.uc,  sizeof(fd_pubkey_t) );
+    o->stake              = d->stake;
+    o->activation_epoch   = d->activation_epoch  ==USHORT_MAX ? ULONG_MAX : (ulong)d->activation_epoch;
+    o->deactivation_epoch = d->deactivation_epoch==USHORT_MAX ? ULONG_MAX : (ulong)d->deactivation_epoch;
+    o->credits_observed   = d->credits_observed;
+    o->lamports           = d->lamports;
+    o->data_len           = d->acc_dlen;
+  }
+
+  fd_stake_delegations_view_end( stake_delegations, stake_history, warmup_cooldown_rate_epoch, use_fixed_point );
+
+  sort_stake_delegation_inplace( out, cnt );
+  return cnt;
+}
+
 ulong
 fd_solfuzz_pb_block_run( fd_solfuzz_runner_t * runner,
                           void const *         input_,
@@ -642,6 +689,14 @@ fd_solfuzz_pb_block_run( fd_solfuzz_runner_t * runner,
 
     /* Effects: build T-epoch (bank epoch), T-stakes ephemeral leaders and report */
     fd_solfuzz_pb_build_leader_schedule_effects( runner, effects );
+
+    if( !effects->has_error ) {
+      fd_exec_test_stake_delegation_t * out = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_exec_test_stake_delegation_t), 0UL );
+      ulong cnt = fd_solfuzz_pb_collect_stake_delegations( runner, out, (output_end-_l)/sizeof(fd_exec_test_stake_delegation_t) );
+      FD_SCRATCH_ALLOC_APPEND( l, 1UL, cnt*sizeof(fd_exec_test_stake_delegation_t) );
+      effects->stake_delegations       = out;
+      effects->stake_delegations_count = (pb_size_t)cnt;
+    }
 
     ulong actual_end = FD_SCRATCH_ALLOC_FINI( l, 1UL );
     fd_solfuzz_pb_block_ctx_destroy( runner );

@@ -120,6 +120,7 @@ src/flamenco/runtime/tests/run_ledger_backtest.sh -l disable_sbpf_v0_v1_v2_deplo
 src/flamenco/runtime/tests/run_ledger_backtest.sh -l define_ltds_fee_only_semantics-v4.2.0-beta.1-vat -m 1000 -e 330
 src/flamenco/runtime/tests/run_ledger_backtest.sh -l loader_v3_minimum_extend_program_size-v4.2.0-beta.1-vat -m 1000 -e 590
 src/flamenco/runtime/tests/run_ledger_backtest.sh -l enable_sha512_syscall-v4.2.0-beta.1-vat -m 1000 -e 611
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l loader_v3_set_program_data_to_elf_length -m 1000 -e 363
 
 # Delay-commission epoch-boundary scenarios (local cluster, agave-cluster generated).
 # delay_commission_updates + validator_admission_ticket (VAT) + bls_pubkey_management ALL ON.
@@ -149,10 +150,10 @@ src/flamenco/runtime/tests/run_ledger_backtest.sh -l reduce_slot_time_to_300ms-o
 src/flamenco/runtime/tests/run_ledger_backtest.sh -l rent_relax_only-v4.2.0-beta.1-vat_rekey -m 2000000 -e 325
 src/flamenco/runtime/tests/run_ledger_backtest.sh -l rent_lamports_per_byte_6333-v4.2.0-beta.1-vat_rekey -m 2000000 -e 325
 src/flamenco/runtime/tests/run_ledger_backtest.sh -l rent_lamports_per_byte_5080-v4.2.0-beta.1-vat_rekey -m 2000000 -e 325
-src/flamenco/runtime/tests/run_ledger_backtest.sh -l rent_lamports_per_byte_2575-v4.2.0-beta.1-vat_rekey -m 2000000 -e 325
-src/flamenco/runtime/tests/run_ledger_backtest.sh -l rent_lamports_per_byte_1322-v4.2.0-beta.1-vat_rekey -m 2000000 -e 325
-src/flamenco/runtime/tests/run_ledger_backtest.sh -l rent_lamports_per_byte_696-v4.2.0-beta.1-vat_rekey -m 2000000 -e 325
-src/flamenco/runtime/tests/run_ledger_backtest.sh -l rent_lamports_per_byte_6960-v4.2.0-beta.1-vat_rekey -m 2000000 -e 325
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l rent_lamports_per_byte_2575-v4.3.0-rc.1_rekey -m 2000000 -e 325
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l rent_lamports_per_byte_1322-v4.3.0-rc.1_rekey -m 2000000 -e 325
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l rent_lamports_per_byte_696-v4.3.0-rc.1_rekey -m 2000000 -e 325
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l rent_lamports_per_byte_6960-v4.3.0-rc.1_rekey -m 2000000 -e 325
 src/flamenco/runtime/tests/run_ledger_backtest.sh -l enable_tx_v1 -m 2000000 -e 637
 src/flamenco/runtime/tests/run_ledger_backtest.sh -l programdata-closeslot -m 10000 -e 330
 src/flamenco/runtime/tests/run_ledger_backtest.sh -l programdata-poison -m 10000 -e 562
@@ -162,7 +163,11 @@ src/flamenco/runtime/tests/run_ledger_backtest.sh -l relax_fee_payer_constraint 
 src/flamenco/runtime/tests/run_ledger_backtest.sh -l snapshot-hard-fork -m 2000000 -e 162
 
 # Alpenglow
-src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-legacy-vote-ixs --alpenglow --shred-version 40081 -m 2000000 -e 126
-src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-deactivated-stake --alpenglow --shred-version 14972 -m 2000000 -e 810
-src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-leader-credits --alpenglow --shred-version 49885 -m 2000000 -e 3915
-src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-alpenclock-lamports --alpenglow --shred-version 27708 -m 2000000 -e 280
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-legacy-vote-ixs --alpenglow -m 2000000 -e 126
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-deactivated-stake --alpenglow -m 2000000 -e 810
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-leader-credits --alpenglow -m 2000000 -e 3915
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-alpenclock-lamports --alpenglow -m 2000000 -e 280
+
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l sd-disk-spill -m 10000000 -e 17400 --genesis-max-file-size-mib 1024
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l sd-disk-spill-post -m 10000000 -e 17400 --genesis-max-file-size-mib 1024
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l sd-disk-spill-midwin -m 10000000 -e 17400 --genesis-max-file-size-mib 1024

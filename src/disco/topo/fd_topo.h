@@ -9,7 +9,8 @@
 #include "../../flamenco/fd_flamenco_base.h"
 #include "../../util/net/fd_net_headers.h"
 #include "../../util/net/fd_ip6.h"
-#include "../pack/fd_pack.h" /* for FD_PACK_ACCT_BLOCKLIST_MAX */
+#include "../pack/fd_pack_acct_blocklist.h"
+#include "../keyguard/fd_keyguard.h"
 
 /* Maximum number of workspaces that may be present in a topology. */
 #define FD_TOPO_MAX_WKSPS         (256UL)
@@ -26,6 +27,10 @@
 #define FD_TOPO_MAX_TILE_OUT_LINKS ( 32UL)
 /* Maximum number of objects that a tile can use. */
 #define FD_TOPO_MAX_TILE_OBJS      ( 256UL)
+
+FD_STATIC_ASSERT( FD_SLEEP_LINK_MAX==FD_TOPO_MAX_LINKS,          sleep_limits );
+FD_STATIC_ASSERT( FD_SLEEP_IN_MAX  ==FD_TOPO_MAX_TILE_IN_LINKS,  sleep_limits );
+FD_STATIC_ASSERT( FD_SLEEP_OUT_MAX ==FD_TOPO_MAX_TILE_OUT_LINKS, sleep_limits );
 
 /* Maximum number of additional ip addresses */
 #define FD_NET_MAX_SRC_ADDR 4
@@ -140,6 +145,7 @@ struct fd_topo_tile {
 
   ulong cpu_idx;                /* The CPU index to pin the tile on.  A value of ULONG_MAX or more indicates the tile should be floating and not pinned to a core. */
   int   floats;                 /* Scheduled by the kernel over the CPUs of the floating tiles on its NUMA node, never a pinned tile's CPU, instead of pinned to cpu_idx (efficient mode).  cpu_idx still places memory and isolation, and is the fallback when no such CPU remains. */
+  int   sleep_eventfd;          /* Parks in epoll on its own fds and is woken through the eventfd FD_SLEEP_EVENTFD( id ), not FUTEX_WAKE (efficient mode only) */
 
   ulong waker_client_idx;       /* Client slot in the fixed inherited fd range (inner epoll fd FD_WAKER_INNER_FD( idx )), or ULONG_MAX if not a waker client */
   ulong waker_fseq_obj_id;      /* fseq object holding the tile's waker readiness word or ULONG_MAX */
@@ -229,8 +235,10 @@ struct fd_topo_tile {
     struct {
       fd_topo_net_tile_t net;
       /* sock specific options */
-      int so_sndbuf;
-      int so_rcvbuf;
+      int   so_sndbuf;
+      int   so_rcvbuf;
+      int   only_recv_lo;
+      ulong net_tile_id;
     } sock;
 
     struct {
@@ -413,7 +421,7 @@ struct fd_topo_tile {
     struct {
       char  identity_key_path[ PATH_MAX ];
       ulong authorized_voter_paths_cnt;
-      char  authorized_voter_paths[ 16 ][ PATH_MAX ];
+      char  authorized_voter_paths[ FD_KEYGUARD_AUTH_VOTERS_MAX ][ PATH_MAX ];
       struct {
         uchar tip_payment_program_addr[ 32 ];
         uchar tip_distribution_program_addr[ 32 ];
@@ -435,7 +443,6 @@ struct fd_topo_tile {
 
       ulong  max_http_connections;
       ulong  max_websocket_connections;
-      ulong  max_http_request_length;
       ulong  send_buffer_size_mb;
       ulong  db_size_gib;
       int    schedule_strategy;
@@ -458,7 +465,6 @@ struct fd_topo_tile {
       ulong max_http_connections;
       ulong max_websocket_connections;
       ulong send_buffer_size_mb;
-      ulong max_http_request_length;
 
       ulong max_live_slots;
       ulong genesis_max_message_size;
@@ -468,6 +474,7 @@ struct fd_topo_tile {
 
       char identity_key_path[ PATH_MAX ];
       int  delay_startup;
+      int  alpenglow;
 
       int    snapshot_server_enabled;
       char   snapshot_server_host[ FD_FQDN_BUF_MAX ];
@@ -508,6 +515,7 @@ struct fd_topo_tile {
       ulong heap_size_gib;
       ulong sched_depth;
       ulong max_live_slots;
+      ulong genesis_max_message_size;
       ulong full_snapshot_interval_blocks;
       ulong incremental_snapshot_interval_blocks;
 
@@ -606,6 +614,7 @@ struct fd_topo_tile {
       char   identity_key_path[ PATH_MAX ];
       ulong  ping_cache_entries;
       ulong  max_shreds_per_block;
+      ulong  blockdb_max; /* 0 disables the block metadata db */
     } rserve;
 
     struct {
@@ -641,7 +650,7 @@ struct fd_topo_tile {
       ulong accdb_obj_id;
 
       ulong authorized_voter_paths_cnt;
-      char  authorized_voter_paths[ 16 ][ PATH_MAX ];
+      char  authorized_voter_paths[ FD_KEYGUARD_AUTH_VOTERS_MAX ][ PATH_MAX ];
       int   hard_fork_fatal;
       int   wait_for_supermajority;
       ulong max_live_slots;
@@ -653,6 +662,7 @@ struct fd_topo_tile {
 
     struct {
       char   identity_key_path[ PATH_MAX ];
+      ulong  authorized_voter_paths_cnt;
       ushort quic_client_listen_port;
       ushort quic_server_listen_port;
       uint   ip_addr;
@@ -723,12 +733,9 @@ struct fd_topo_tile {
       ulong accdb_obj_id;
       ulong txncache_obj_id;
       ulong banks_obj_id;
+      ulong shmem_obj_id; /* shared parallel snapin state */
       ulong max_txn_per_slot;
     } snapin;
-
-    struct {
-      ulong partition_sz;
-    } snapwr;
 
     struct {
 
@@ -1023,6 +1030,21 @@ fd_topo_find_link_producer( fd_topo_t const *      topo,
 
     for( ulong j=0; j<tile->out_cnt; j++ ) {
       if( FD_UNLIKELY( tile->out_link_id[ j ] == link->id ) ) return i;
+    }
+  }
+  return ULONG_MAX;
+}
+
+/* Find the id of the tile which is a consumer of the given link.  If
+   no tile is a consumer of the link, returns ULONG_MAX. */
+FD_FN_PURE static inline ulong
+fd_topo_find_link_consumer( fd_topo_t const *      topo,
+                            fd_topo_link_t const * link ) {
+  for( ulong i=0; i<topo->tile_cnt; i++ ) {
+    fd_topo_tile_t const * tile = &topo->tiles[ i ];
+
+    for( ulong j=0; j<tile->in_cnt; j++ ) {
+      if( FD_UNLIKELY( tile->in_link_id[ j ] == link->id ) ) return i;
     }
   }
   return ULONG_MAX;

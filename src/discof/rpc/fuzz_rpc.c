@@ -18,7 +18,6 @@
 
 #include "../../util/fd_util.h"
 #include "../../disco/topo/fd_topob.h"
-#include "../../third_party/cjson/cJSON_alloc.h"
 #include "../../util/sanitize/fd_fuzz.h"
 #include "../../flamenco/accdb/fd_accdb.h"
 #include "../../flamenco/accdb/fd_accdb_shmem.h"
@@ -101,11 +100,11 @@ setup_accdb( void ) {
                           0, 42UL, joiner_cnt, 0UL ) );
   FD_TEST( shmem );
 
-  ulong accdb_fp = fd_accdb_footprint( max_live_slots );
+  ulong accdb_fp = fd_accdb_footprint( max_live_slots, 0 );
   FD_TEST( accdb_fp );
   void * accdb_mem = aligned_alloc( fd_accdb_align(), accdb_fp );
   FD_TEST( accdb_mem );
-  fd_accdb_t * accdb = fd_accdb_join( fd_accdb_new( accdb_mem, shmem, fd, 0UL, NULL ) );
+  fd_accdb_t * accdb = fd_accdb_join( fd_accdb_new( accdb_mem, shmem, fd, 0UL, NULL, NULL, 0UL, 0 ) );
   FD_TEST( accdb );
 
   fd_accdb_fork_id_t sentinel  = { .val = USHORT_MAX };
@@ -169,11 +168,6 @@ LLVMFuzzerInitialize( int  *   argc,
   FD_TEST( zstd_wksp );
   fuzz_zstd_cctx = ZSTD_initStaticCCtx( zstd_wksp, zstd_wksp_sz );
   FD_TEST( fuzz_zstd_cctx );
-
-  void * shalloc = fd_wksp_alloc_laddr( wksp, fd_alloc_align(), fd_alloc_footprint(), 2UL );
-  fd_alloc_t * alloc = fd_alloc_join( fd_alloc_new( shalloc, 1UL ), 1UL );
-  FD_TEST( alloc );
-  cJSON_alloc_install( alloc );
 
   return 0;
 }

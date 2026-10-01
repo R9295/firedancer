@@ -8,12 +8,12 @@ $(OBJDIR)/lib/libfd_zlib.a: $(OBJDIR)/lib/libfd_zlib.a.mlist
 
 lib: $(OBJDIR)/lib/libfd_zlib.a
 
-ZLIB_CFLAGS_NOWARN:=$(filter-out -W%,$(filter-out -Werror,$(CPPFLAGS) $(CFLAGS))) -DZ_SOLO
+ZLIB_DEFS:=-DZ_SOLO
+ZLIB_CFLAGS_NOWARN:=$(filter-out -W%,$(filter-out -Werror,$(CPPFLAGS) $(CFLAGS))) $(ZLIB_DEFS)
 
 $(OBJDIR)/obj/third_party/zlib/%.o : src/third_party/zlib/%.c $(OBJDIR)/.flags src/third_party/zlib/Local.mk
-	@echo -e "CC\t$(notdir $@)"
-	$(Q)$(MKDIR) $(dir $@) && \
-$(CC) $(ZLIB_CFLAGS_NOWARN) $(DEPFLAGS) -c $< -o $@ && $(DEPFIX)
+	@$(info CC$(TAB)$(notdir $@))
+	$(Q)$(CC) $(ZLIB_CFLAGS_NOWARN) $(DEPFLAGS) -c $< -o $@ && $(DEPFIX)
 
 THIRDPARTY_DEPFILES+=$(patsubst %,$(OBJDIR)/obj/third_party/zlib/%.d,$(ZLIB_OBJS))
 endif

@@ -103,14 +103,20 @@
 #define FD_GOSSIP_CONTACT_INFO_SOCKET_ALPENGLOW         (13)
 #define FD_GOSSIP_CONTACT_INFO_SOCKET_CNT               (14)
 
-#define FD_GOSSIP_CONTACT_INFO_CLIENT_SOLANA_LABS   (0)
-#define FD_GOSSIP_CONTACT_INFO_CLIENT_JITO_LABS     (1)
-#define FD_GOSSIP_CONTACT_INFO_CLIENT_FRANKENDANCER (2)
-#define FD_GOSSIP_CONTACT_INFO_CLIENT_AGAVE         (3)
-#define FD_GOSSIP_CONTACT_INFO_CLIENT_AGAVE_PALADIN (4)
-#define FD_GOSSIP_CONTACT_INFO_CLIENT_FIREDANCER    (5)
-#define FD_GOSSIP_CONTACT_INFO_CLIENT_AGAVE_BAM     (6)
-#define FD_GOSSIP_CONTACT_INFO_CLIENT_SIG           (7)
+#define FD_GOSSIP_CONTACT_INFO_CLIENT_SOLANA_LABS             (0)
+#define FD_GOSSIP_CONTACT_INFO_CLIENT_JITO_LABS               (1)
+#define FD_GOSSIP_CONTACT_INFO_CLIENT_FRANKENDANCER           (2)
+#define FD_GOSSIP_CONTACT_INFO_CLIENT_AGAVE                   (3)
+#define FD_GOSSIP_CONTACT_INFO_CLIENT_AGAVE_PALADIN           (4)
+#define FD_GOSSIP_CONTACT_INFO_CLIENT_FIREDANCER              (5)
+#define FD_GOSSIP_CONTACT_INFO_CLIENT_AGAVE_BAM               (6)
+#define FD_GOSSIP_CONTACT_INFO_CLIENT_SIG                     (7)
+#define FD_GOSSIP_CONTACT_INFO_CLIENT_RAKURAI                 (8)
+#define FD_GOSSIP_CONTACT_INFO_CLIENT_HARMONIC_FIREDANCER     (9)
+#define FD_GOSSIP_CONTACT_INFO_CLIENT_HARMONIC_AGAVE         (10)
+#define FD_GOSSIP_CONTACT_INFO_CLIENT_HARMONIC_FRANKENDANCER (11)
+#define FD_GOSSIP_CONTACT_INFO_CLIENT_FIRE_BAM               (12)
+#define FD_GOSSIP_CONTACT_INFO_CLIENT_RAIKU                  (13)
 
 #define FD_GOSSIP_MESSAGE_PULL_REQUEST  (0)
 #define FD_GOSSIP_MESSAGE_PULL_RESPONSE (1)
@@ -393,6 +399,19 @@ struct fd_gossip_message {
 };
 
 typedef struct fd_gossip_message fd_gossip_message_t;
+
+static inline ulong
+fd_gossip_message_used_sz( fd_gossip_message_t const * message ) {
+  switch( message->tag ) {
+  case FD_GOSSIP_MESSAGE_PULL_RESPONSE: return (ulong)((uchar const *)message->pull_response->values-(uchar const *)message)+message->pull_response->values_len*sizeof(fd_gossip_value_t);
+  case FD_GOSSIP_MESSAGE_PUSH:          return (ulong)((uchar const *)message->push->values         -(uchar const *)message)+message->push->values_len         *sizeof(fd_gossip_value_t);
+  case FD_GOSSIP_MESSAGE_PULL_REQUEST:  return (ulong)((uchar const *)(message->pull_request+1)-(uchar const *)message);
+  case FD_GOSSIP_MESSAGE_PRUNE:         return (ulong)((uchar const *)(message->prune+1)       -(uchar const *)message);
+  case FD_GOSSIP_MESSAGE_PING:          return (ulong)((uchar const *)(message->ping+1)        -(uchar const *)message);
+  case FD_GOSSIP_MESSAGE_PONG:          return (ulong)((uchar const *)(message->pong+1)        -(uchar const *)message);
+  default:                              return sizeof(fd_gossip_message_t);
+  }
+}
 
 int
 fd_gossip_message_deserialize( fd_gossip_message_t * message,

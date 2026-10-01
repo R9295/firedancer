@@ -12,9 +12,14 @@
 
 #define AG_VOTE_CSTR_MAX (256UL)
 
+/* public_key is the canonical compressed BLS key selector.  payload is
+   the exact consensus preimage; the signer must not include public_key
+   in the signed bytes. */
+
 typedef void
 (* fd_bls_sign_fn)( void *         ctx,
                     fd_bls_sig_t * sig,
+                    uchar const *  public_key,
                     uchar const *  payload,
                     ulong          payload_sz );
 struct ag_vote_notar {
@@ -61,7 +66,6 @@ typedef struct ag_vote_skip_fallback ag_vote_skip_fallback_t;
 
 struct ag_vote {
   uint   kind;
-  ushort shred_version;
   union {
     ag_vote_notar_t          notar;
     ag_vote_final_t          final;
@@ -74,36 +78,59 @@ typedef struct ag_vote ag_vote_t;
 
 FD_PROTOTYPES_BEGIN
 
+/* Definition 11. Vote::slot */
+
 FD_FN_PURE static inline ulong
 ag_vote_slot( ag_vote_t const * self ) {
   switch( self->kind ) {
   case AG_VOTE_KIND_NOTAR:          return self->notar.slot;
+  case AG_VOTE_KIND_FINAL:          return self->final.slot;
   case AG_VOTE_KIND_SKIP:           return self->skip.slot;
   case AG_VOTE_KIND_NOTAR_FALLBACK: return self->notar_fallback.slot;
   case AG_VOTE_KIND_SKIP_FALLBACK:  return self->skip_fallback.slot;
-  default:                          return self->final.slot;
+  default:                          FD_LOG_CRIT(( "unreachable" ));
   }
 }
+
+/* Definition 11. Vote::block_hash */
+
+FD_FN_PURE static inline uchar const *
+ag_vote_block_hash( ag_vote_t const * self ) {
+  switch( self->kind ) {
+  case AG_VOTE_KIND_NOTAR:          return self->notar.block_hash;
+  case AG_VOTE_KIND_FINAL:          return NULL;
+  case AG_VOTE_KIND_SKIP:           return NULL;
+  case AG_VOTE_KIND_NOTAR_FALLBACK: return self->notar_fallback.block_hash;
+  case AG_VOTE_KIND_SKIP_FALLBACK:  return NULL;
+  default:                          FD_LOG_CRIT(( "unreachable" ));
+  }
+}
+
+/* Definition 11. SignedVote::sig */
 
 FD_FN_PURE static inline fd_bls_sig_t const *
 ag_vote_sig( ag_vote_t const * self ) {
   switch( self->kind ) {
   case AG_VOTE_KIND_NOTAR:          return &self->notar.sig;
+  case AG_VOTE_KIND_FINAL:          return &self->final.sig;
   case AG_VOTE_KIND_SKIP:           return &self->skip.sig;
   case AG_VOTE_KIND_NOTAR_FALLBACK: return &self->notar_fallback.sig;
   case AG_VOTE_KIND_SKIP_FALLBACK:  return &self->skip_fallback.sig;
-  default:                          return &self->final.sig;
+  default:                          FD_LOG_CRIT(( "unreachable" ));
   }
 }
+
+/* Definition 11. Vote::signer; assigned by the tile from the peer, not carried on the wire */
 
 FD_FN_PURE static inline ushort
 ag_vote_rank( ag_vote_t const * self ) {
   switch( self->kind ) {
   case AG_VOTE_KIND_NOTAR:          return self->notar.rank;
+  case AG_VOTE_KIND_FINAL:          return self->final.rank;
   case AG_VOTE_KIND_SKIP:           return self->skip.rank;
   case AG_VOTE_KIND_NOTAR_FALLBACK: return self->notar_fallback.rank;
   case AG_VOTE_KIND_SKIP_FALLBACK:  return self->skip_fallback.rank;
-  default:                          return self->final.rank;
+  default:                          FD_LOG_CRIT(( "unreachable" ));
   }
 }
 
@@ -111,67 +138,62 @@ FD_FN_PURE static inline ushort
 ag_vote_shred_version( ag_vote_t const * self ) {
   switch( self->kind ) {
   case AG_VOTE_KIND_NOTAR:          return self->notar.shred_version;
+  case AG_VOTE_KIND_FINAL:          return self->final.shred_version;
   case AG_VOTE_KIND_SKIP:           return self->skip.shred_version;
   case AG_VOTE_KIND_NOTAR_FALLBACK: return self->notar_fallback.shred_version;
   case AG_VOTE_KIND_SKIP_FALLBACK:  return self->skip_fallback.shred_version;
-  default:                          return self->final.shred_version;
+  default:                          FD_LOG_CRIT(( "unreachable" ));
   }
 }
 
-FD_FN_PURE static inline uchar const *
-ag_vote_block_hash( ag_vote_t const * self ) {
-  switch( self->kind ) {
-  case AG_VOTE_KIND_NOTAR:          return self->notar.block_hash;
-  case AG_VOTE_KIND_NOTAR_FALLBACK: return self->notar_fallback.block_hash;
-  default:                          return NULL;
-  }
-}
-
-static inline void
-ag_vote_set_rank( ag_vote_t * self,
-                  ushort      rank ) {
-  switch( self->kind ) {
-  case AG_VOTE_KIND_NOTAR:          self->notar.rank          = rank; break;
-  case AG_VOTE_KIND_SKIP:           self->skip.rank           = rank; break;
-  case AG_VOTE_KIND_NOTAR_FALLBACK: self->notar_fallback.rank = rank; break;
-  case AG_VOTE_KIND_SKIP_FALLBACK:  self->skip_fallback.rank  = rank; break;
-  default:                          self->final.rank          = rank; break;
-  }
-}
+/* Definition 11. Vote::new_notar */
 
 ag_vote_t
 ag_vote_construct_notar( fd_bls_sign_fn        sign_fn,
                          void *                sign_ctx,
+                         uchar const *         public_key,
                          ulong                 slot,
                          ag_block_hash_t const hash,
                          ushort                rank,
                          ushort                shred_version );
 
+/* Definition 11. Vote::new_final */
+
 ag_vote_t
 ag_vote_construct_final( fd_bls_sign_fn sign_fn,
                          void *         sign_ctx,
+                         uchar const *  public_key,
                          ulong          slot,
                          ushort         rank,
                          ushort         shred_version );
 
+/* Definition 11. Vote::new_skip */
+
 ag_vote_t
 ag_vote_construct_skip( fd_bls_sign_fn sign_fn,
                         void *         sign_ctx,
+                        uchar const *  public_key,
                         ulong          slot,
                         ushort         rank,
                         ushort         shred_version );
 
+/* Definition 11. Vote::new_notar_fallback */
+
 ag_vote_t
 ag_vote_construct_notar_fallback( fd_bls_sign_fn        sign_fn,
                                   void *                sign_ctx,
+                                  uchar const *         public_key,
                                   ulong                 slot,
                                   ag_block_hash_t const hash,
                                   ushort                rank,
                                   ushort                shred_version );
 
+/* Definition 11. Vote::new_skip_fallback */
+
 ag_vote_t
 ag_vote_construct_skip_fallback( fd_bls_sign_fn sign_fn,
                                  void *         sign_ctx,
+                                 uchar const *  public_key,
                                  ulong          slot,
                                  ushort         rank,
                                  ushort         shred_version );

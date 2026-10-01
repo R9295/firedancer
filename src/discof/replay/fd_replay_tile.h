@@ -185,6 +185,7 @@ struct fd_replay_slot_completed {
 
   int    voted;           /* our vote was in the reward cert this block carried */
   ushort voted_rank;      /* our rank in the reward slot's epoch, USHORT_MAX if we are not a voter */
+  ushort vote_count;      /* distinct reward cert signers for slot-FD_NUM_SLOTS_FOR_REWARD, USHORT_MAX if unknown */
   ulong  vote_balance;    /* ULONG_MAX if not sampled */
   ushort vote_commission; /* USHORT_MAX if not sampled */
 
@@ -195,13 +196,22 @@ struct fd_replay_slot_completed {
     ulong account_cost_limit;
     ulong pool_idx;
   } cost_tracker;
+
+  fd_block_footer_t footer;
 };
 
 typedef struct fd_replay_slot_completed fd_replay_slot_completed_t;
 
 struct fd_replay_slot_dead {
-  ulong     slot;
-  fd_hash_t block_id;
+  ulong             slot;
+  fd_hash_t         block_id;
+
+  /* Agave can finalize off the certs in a dead block's footer.
+
+     TODO dead blocks short-circuit from parsing out the footer unless
+     it's a BHM.  Always read the footer? */
+
+  fd_block_footer_t footer;
 };
 typedef struct fd_replay_slot_dead fd_replay_slot_dead_t;
 
@@ -275,9 +285,10 @@ typedef struct fd_replay_drop_bank_ref fd_replay_drop_bank_ref_t;
    (REPLAY_SIG_SNAP_START) just before starting snapshot creation. */
 
 struct fd_replay_snap_start {
-  ulong bank_idx;
-  ulong base_slot;
-  ulong slot; /* ==base_slot implies full snapshot, else incremental */
+  ulong       bank_idx;
+  ulong       base_slot;
+  ulong       slot;   /* ==base_slot implies full snapshot, else incremental */
+  fd_pubkey_t leader; /* leader of slot, written to the manifest for Agave */
 };
 typedef struct fd_replay_snap_start fd_replay_snap_start_t;
 

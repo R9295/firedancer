@@ -10,11 +10,8 @@
 #define AG_NOTAR_FALLBACK_VOTE_MAX (3UL)    /* Definition 12 */
 #define AG_NOTAR_FALLBACK_CERT_MAX (4UL)    /* Lemma 48 */
 
-#define AG_DELTA_NS             (250000000L)       /* 250 ms 0.5-RTT, partial-synchrony */
-#define AG_DELTA_BLOCK_NS       (200000000L)       /* 200 ms slots */
-#define AG_DELTA_FIRST_SLICE_NS (10000000L)        /* TODO */
-#define AG_DELTA_TIMEOUT_NS     (3L * AG_DELTA_NS) /* skip timeout  */
-#define AG_DELTA_STANDSTILL_NS  (10000000000L)     /* 10s since last finalize */
+#define AG_DELTA_TIMEOUT_NS    (400000000L)   /* skip timeout */
+#define AG_DELTA_STANDSTILL_NS (10000000000L) /* 10s since last finalize */
 
 #define AG_WEAKEST_QUORUM_THRESHOLD_NUMER (1UL) /* 20%, safe-to-notar + 40% skip */
 #define AG_WEAK_QUORUM_THRESHOLD_NUMER    (2UL) /* 40%, safe-to-notar / safe-to-skip */
@@ -22,9 +19,18 @@
 #define AG_STRONG_QUORUM_THRESHOLD_NUMER  (4UL) /* 80%, fast-finalize */
 #define AG_QUORUM_THRESHOLD_DENOM         (5UL) /* 100% */
 
-typedef uchar ag_block_hash_t[ 32 ]; /* double merkle root of the block */
 typedef uchar ag_vote_key_t  [ 32 ]; /* vote account address */
 typedef uchar ag_id_key_t    [ 32 ]; /* identity public key */
+typedef uchar ag_bls_key_t   [ 48 ]; /* compressed BLS public key */
+
+typedef uchar ag_block_hash_t[ 32 ]; /* double merkle root of the block */
+static const ag_block_hash_t ag_block_hash_null = { 0 };
+
+struct ag_block_hash_key { /* ag_block_hash_t as an assignable fd_map key */
+  ag_block_hash_t block_hash;
+};
+typedef struct ag_block_hash_key ag_block_hash_key_t;
+static const ag_block_hash_key_t ag_block_hash_key_null = { 0 };
 
 struct ag_block_id {
   ulong           slot;
@@ -53,15 +59,21 @@ typedef struct ag_standstill ag_standstill_t;
 
 FD_PROTOTYPES_BEGIN
 
+/* Algorithm 2, line 1. Slot::first_slot_in_window */
+
 FD_FN_CONST static inline ulong
 ag_first_slot_in_window( ulong slot ) {
   return ( slot / AG_SLOTS_PER_WINDOW ) * AG_SLOTS_PER_WINDOW;
 }
 
+/* Algorithm 2, line 1. Slot::is_start_of_window */
+
 FD_FN_CONST static inline int
 ag_is_start_of_window( ulong slot ) {
   return ( slot % AG_SLOTS_PER_WINDOW )==0UL;
 }
+
+/* Definition 4. BlockId, the (Slot, BlockHash) tuple */
 
 static inline ag_block_id_t
 ag_block_id( ulong                 slot,
@@ -70,6 +82,8 @@ ag_block_id( ulong                 slot,
   memcpy( id.hash, hash, sizeof(ag_block_hash_t) );
   return id;
 }
+
+/* Definition 4. BlockId == */
 
 FD_FN_PURE static inline int
 ag_block_id_eq( ag_block_id_t const * a,

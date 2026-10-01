@@ -192,15 +192,13 @@ fd_ed25519_point_frombytes_2x( fd_ed25519_point_t * r1,
                                fd_ed25519_point_t * r2,
                                uchar const          buf2[ 32 ] );
 
-/* fd_ed25519_point_validate checks if buf represents a valid compressed point,
-   by attempting to decompress it.
-   Use fd_ed25519_point_frombytes if the decompressed point is needed.
-   It returns 1 if buf represents a valid point, 0 if not. */
-FD_25519_INLINE int
-fd_ed25519_point_validate(uchar const buf[ 32 ] ) {
-  fd_ed25519_point_t t[1];
-  return !!fd_ed25519_point_frombytes( t, buf );
-}
+/* fd_ed25519_point_validate checks if buf represents a valid compressed
+   point, i.e. if fd_ed25519_point_frombytes would succeed, without
+   decompressing it.  Use fd_ed25519_point_frombytes if the decompressed
+   point is needed.  It returns 1 if buf represents a valid point, 0 if
+   not.  Variable time, do not use with secret data. */
+int
+fd_ed25519_point_validate( uchar const buf[ 32 ] );
 
 /* fd_ed25519_point_tobytes serializes a point a into
    a 32-byte buffer out, and returns out.
@@ -209,6 +207,15 @@ fd_ed25519_point_validate(uchar const buf[ 32 ] ) {
 uchar *
 fd_ed25519_point_tobytes( uchar                      out[ 32 ],
                           fd_ed25519_point_t const * a );
+
+/* fd_ed25519_point_tobytes_batch8 serializes n points pt[0..n), n in
+   [1,8], into out (32 bytes each, point i at out+32*i), sharing one
+   field inversion across the n points.  n is asserted to be in
+   [1,8].  Returns out. */
+uchar *
+fd_ed25519_point_tobytes_batch8( uchar                      out[],  /* 32*n */
+                                 fd_ed25519_point_t const * pt,     /* n */
+                                 ulong                      n );
 
 /* fd_ed25519_affine_tobytes serializes a point a into
    a 32-byte buffer out, and returns out.

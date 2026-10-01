@@ -37,12 +37,17 @@ readonly -a S2N_FILES=(
   x86/curve25519/curve25519_x25519_alt.S
   x86/curve25519/curve25519_x25519base.S
   x86/curve25519/curve25519_x25519base_alt.S
+  x86/curve25519/edwards25519_scalarmuldouble.S
+  x86/curve25519/edwards25519_scalarmuldouble_alt.S
+  x86/curve25519/edwards25519_scalarmulbase.S
+  x86/curve25519/edwards25519_scalarmulbase_alt.S
   x86/fastmul/bignum_mul_4_8.S
   x86/fastmul/bignum_mul_4_8_alt.S
   x86/fastmul/bignum_mul_6_12.S
   x86/fastmul/bignum_mul_6_12_alt.S
   x86/generic/bignum_demont.S
   x86/generic/bignum_modinv.S
+  x86/generic/bignum_montifier.S
   x86/generic/bignum_montmul.S
   x86/generic/bignum_sub.S
   x86/p256/bignum_add_p256.S
@@ -104,10 +109,13 @@ readonly -a S2N_FILES=(
   x86/sha3/sha3_keccak_f1600.S
   arm/curve25519/curve25519_x25519_byte_alt.S
   arm/curve25519/curve25519_x25519base_byte_alt.S
+  arm/curve25519/edwards25519_scalarmuldouble_alt.S
+  arm/curve25519/edwards25519_scalarmulbase_alt.S
   arm/fastmul/bignum_mul_4_8_alt.S
   arm/fastmul/bignum_mul_6_12_alt.S
   arm/generic/bignum_demont.S
   arm/generic/bignum_modinv.S
+  arm/generic/bignum_montifier.S
   arm/generic/bignum_montmul.S
   arm/generic/bignum_sub.S
   arm/p256/bignum_add_p256.S

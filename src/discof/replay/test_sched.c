@@ -7,6 +7,7 @@
 #include "../../ballet/sha256/fd_sha256.h"
 #include "../../flamenco/txn/fd_txn_generate.h"
 #include "../../flamenco/alpenglow/fd_block_marker_serde.h"
+#include "../../flamenco/runtime/fd_runtime_const.h"
 
 #define TEST_EXEC_CNT         4UL
 #define TEST_ROOT_SLOT        1000UL
@@ -16,10 +17,10 @@ static void
 test_sched_footprint( void ) {
   /* Retain the savings from compact shred lengths and 4992-byte
      transactions under the default scheduler sizing. */
-  FD_TEST( fd_sched_footprint( 65536UL, 2048UL, FD_SHRED_BLK_MAX, FD_MAX_TXN_PER_SLOT )==1117355392UL );
+  FD_TEST( fd_sched_footprint( 65536UL, 2048UL, FD_SHRED_BLK_MAX, FD_MAX_TXN_PER_SLOT )==1117355264UL );
   /* Only the shred length array scales with the shred limit. */
-  FD_TEST( fd_sched_footprint( 65536UL, 2048UL, 4UL*FD_SHRED_BLK_MAX, FD_MAX_TXN_PER_SLOT )==1117355392UL+2048UL*3UL*FD_SHRED_BLK_MAX*sizeof(ushort) );
-  FD_TEST( fd_sched_footprint( 65536UL, 2048UL, FD_SHRED_BLK_MAX, 5UL*FD_MAX_TXN_PER_SLOT )==1117355392UL );
+  FD_TEST( fd_sched_footprint( 65536UL, 2048UL, 4UL*FD_SHRED_BLK_MAX, FD_MAX_TXN_PER_SLOT )==1117355264UL+2048UL*3UL*FD_SHRED_BLK_MAX*sizeof(ushort) );
+  FD_TEST( fd_sched_footprint( 65536UL, 2048UL, FD_SHRED_BLK_MAX, 5UL*FD_MAX_TXN_PER_SLOT )==1117355264UL );
   FD_TEST( !fd_sched_footprint( 65536UL, 2048UL, 0UL, FD_MAX_TXN_PER_SLOT ) );
   FD_TEST( !fd_sched_footprint( 65536UL, 2048UL, FD_SHRED_BLK_MAX, 0UL ) );
 }
@@ -157,8 +158,9 @@ run_interleaved_fec_residual_case( void ) {
   for( ulong i=0UL; i<2UL; i++ ) {
     fd_store_fec_t store_fec[ 1 ] __attribute__((aligned(alignof(fd_store_fec_t))));
     fd_memset( store_fec, 0, sizeof(fd_store_fec_t) );
-    store_fec->data_sz         = split_off[ i ];
-    store_fec->shred_offs[ 0 ] = (uint)split_off[ i ];
+    FD_TEST( split_off[ i ]<=USHORT_MAX );
+    store_fec->data_sz       = (uint)split_off[ i ];
+    store_fec->shred_sz[ 0 ] = (ushort)split_off[ i ];
     fd_sched_fec_t fec[ 1 ] = {{
       .bank_idx          = 2UL+i,
       .parent_bank_idx   = 1UL,
@@ -177,14 +179,18 @@ run_interleaved_fec_residual_case( void ) {
   for( ulong i=0UL; i<2UL; i++ ) {
     fd_store_fec_t store_fec[ 1 ] __attribute__((aligned(alignof(fd_store_fec_t))));
     fd_memset( store_fec, 0, sizeof(fd_store_fec_t) );
-    store_fec->data_sz         = encoded_sz[ i ]-split_off[ i ];
+    store_fec->data_sz = (uint)(encoded_sz[ i ]-split_off[ i ]);
     ulong txn_rem = txn_sz-txn_sz/2UL;
     if( !i ) {
-      store_fec->shred_offs[ 0 ] = (uint)(txn_rem/2UL);
-      store_fec->shred_offs[ 1 ] = (uint)txn_rem;
-      store_fec->shred_offs[ 2 ] = (uint)store_fec->data_sz;
+      FD_TEST( txn_rem<=USHORT_MAX );
+      FD_TEST( store_fec->data_sz>=txn_rem );
+      FD_TEST( store_fec->data_sz-(uint)txn_rem<=USHORT_MAX );
+      store_fec->shred_sz[ 0 ] = (ushort)(txn_rem/2UL);
+      store_fec->shred_sz[ 1 ] = (ushort)(txn_rem-txn_rem/2UL);
+      store_fec->shred_sz[ 2 ] = (ushort)(store_fec->data_sz-(uint)txn_rem);
     } else {
-      store_fec->shred_offs[ 0 ] = (uint)store_fec->data_sz;
+      FD_TEST( store_fec->data_sz<=USHORT_MAX );
+      store_fec->shred_sz[ 0 ] = (ushort)store_fec->data_sz;
     }
     fd_sched_fec_t fec[ 1 ] = {{
       .bank_idx         = 2UL+i,
@@ -279,8 +285,9 @@ run_bad_tick_case( fd_hash_t const * start_poh,
 
   fd_store_fec_t store_fec[ 1 ] __attribute__((aligned(alignof(fd_store_fec_t))));
   fd_memset( store_fec, 0, sizeof(fd_store_fec_t) );
-  store_fec->data_sz       = encoded_sz;
-  store_fec->shred_offs[0] = (uint)encoded_sz;
+  FD_TEST( encoded_sz<=USHORT_MAX );
+  store_fec->data_sz       = (uint)encoded_sz;
+  store_fec->shred_sz[ 0 ] = (ushort)encoded_sz;
 
   fd_sched_fec_t fec[ 1 ] = {{
     .bank_idx          = 2UL,
@@ -358,6 +365,10 @@ run_bad_tick_case( fd_hash_t const * start_poh,
 #define AG_COMP_TICK_0HASH    (4) /* tick declaring zero hashes: invalid under Alpenglow */
 #define AG_COMP_TICK_2HASH    (5) /* tick declaring two hashes: invalid under Alpenglow */
 
+/* AG_SPLIT( comp, cut ) is comp delivered as two FEC sets of the same
+   batch, the first holding the leading cut bytes. */
+#define AG_SPLIT( comp, cut ) ((comp) | (int)((cut)<<8))
+
 static ulong
 encode_ag_component( uchar *     out,
                      int         comp,
@@ -429,35 +440,42 @@ run_ag_structure_case( fd_hash_t const * start_poh,
   fd_sched_block_add_done( sched, 1UL, ULONG_MAX, TEST_ROOT_SLOT );
 
   static uchar          encoded  [ 8 ][ FD_BLOCK_MARKER_SER_MAX ] __attribute__((aligned(64)));
-  static fd_store_fec_t store_fec[ 8 ] __attribute__((aligned(alignof(fd_store_fec_t))));
+  static fd_store_fec_t store_fec[ 16 ] __attribute__((aligned(alignof(fd_store_fec_t))));
   FD_TEST( comp_cnt<=8UL );
 
   fd_hash_t prev_hash[ 1 ];
   fd_memcpy( prev_hash, start_poh, sizeof(fd_hash_t) );
 
-  int ingest_ok = 1;
-  for( ulong i=0UL; i<comp_cnt; i++ ) {
-    ulong sz = encode_ag_component( encoded[ i ], comps[ i ], prev_hash );
-    FD_TEST( sz );
-    fd_memset( &store_fec[ i ], 0, sizeof(fd_store_fec_t) );
-    store_fec[ i ].data_sz       = sz;
-    store_fec[ i ].shred_offs[0] = (uint)sz;
-    fd_sched_fec_t fec[ 1 ] = {{
-      .bank_idx          = 2UL,
-      .parent_bank_idx   = 1UL,
-      .slot              = TEST_ROOT_SLOT + 1UL,
-      .parent_slot       = TEST_ROOT_SLOT,
-      .fec               = &store_fec[ i ],
-      .data              = encoded[ i ],
-      .shred_cnt         = 1U,
-      .is_last_in_batch  = 1U,
-      .is_last_in_block  = i==comp_cnt-1UL,
-      .is_first_in_block = i==0UL,
-    }};
-    FD_TEST( fd_sched_fec_can_ingest( sched, fec ) );
-    if( FD_UNLIKELY( !fd_sched_fec_ingest( sched, fec ) ) ) { ingest_ok = 0; break; }
-    if( FD_UNLIKELY( i==0UL ) ) {
-      fd_sched_set_poh_params( sched, 2UL, TEST_ROOT_TICK_HEIGHT, TEST_ROOT_TICK_HEIGHT+1UL, 1UL, start_poh );
+  int   ingest_ok = 1;
+  ulong fec_cnt   = 0UL;
+  for( ulong i=0UL; i<comp_cnt && ingest_ok; i++ ) {
+    ulong sz  = encode_ag_component( encoded[ i ], comps[ i ]&0xff, prev_hash );
+    ulong cut = (ulong)comps[ i ]>>8;
+    FD_TEST( sz && sz<=USHORT_MAX );
+    for( ulong off=0UL, n; off<sz && ingest_ok; off+=n ) {
+      n = (cut && cut<sz && !off) ? cut : sz-off;
+      int last = off+n==sz;
+      fd_store_fec_t * sf = store_fec+fec_cnt++;
+      fd_memset( sf, 0, sizeof(fd_store_fec_t) );
+      sf->data_sz     = (uint)n;
+      sf->shred_sz[0] = (ushort)n;
+      fd_sched_fec_t fec[ 1 ] = {{
+        .bank_idx          = 2UL,
+        .parent_bank_idx   = 1UL,
+        .slot              = TEST_ROOT_SLOT + 1UL,
+        .parent_slot       = TEST_ROOT_SLOT,
+        .fec               = sf,
+        .data              = encoded[ i ]+off,
+        .shred_cnt         = 1U,
+        .is_last_in_batch  = !!last,
+        .is_last_in_block  = last && i==comp_cnt-1UL,
+        .is_first_in_block = !i && !off,
+      }};
+      FD_TEST( fd_sched_fec_can_ingest( sched, fec ) );
+      ingest_ok = !!fd_sched_fec_ingest( sched, fec );
+      if( FD_LIKELY( ingest_ok && !i && !off ) ) {
+        fd_sched_set_poh_params( sched, 2UL, TEST_ROOT_TICK_HEIGHT, TEST_ROOT_TICK_HEIGHT+1UL, 1UL, start_poh );
+      }
     }
   }
   FD_TEST( ingest_ok==expect_ingest_ok );
@@ -506,6 +524,15 @@ run_ag_structure_cases( void ) {
   { int c[] = { AG_COMP_HEADER, AG_COMP_FOOTER, AG_COMP_TICK };
     run_ag_structure_case( start_poh, c, 3UL, 1, FD_SCHED_DEAD_REASON_NONE ); }
 
+  /* A footer split across FEC sets parses like an unsplit one, at every
+     cut. */
+  { uchar buf[ FD_BLOCK_MARKER_SER_MAX ] __attribute__((aligned(64)));
+    ulong footer_sz = encode_ag_component( buf, AG_COMP_FOOTER, NULL );
+    for( ulong cut=1UL; cut<footer_sz; cut++ ) {
+      int c[] = { AG_COMP_HEADER, AG_SPLIT( AG_COMP_FOOTER, cut ), AG_COMP_TICK };
+      run_ag_structure_case( start_poh, c, 3UL, 1, FD_SCHED_DEAD_REASON_NONE );
+    } }
+
   /* Every Alpenglow entry advances exactly one hash.  A zero-hash
      alpentick would verify trivially against the parent's PoH and hand
      the leader control of the blockhash; agave rejects it, so must we,
@@ -546,6 +573,133 @@ run_ag_structure_cases( void ) {
     run_ag_structure_case( start_poh, c, 3UL, 0, FD_SCHED_DEAD_REASON_SPURIOUS_UPDATE_PARENT ); }
   { int c[] = { AG_COMP_HEADER, AG_COMP_FOOTER, AG_COMP_UPDATE_PARENT, AG_COMP_TICK };
     run_ag_structure_case( start_poh, c, 4UL, 0, FD_SCHED_DEAD_REASON_SPURIOUS_UPDATE_PARENT ); }
+}
+
+/* Regression: the per-tick hash bound at ingest (TICK_HASHES_OVERFLOW_
+   INGEST) must apply to vanilla blocks but not to Alpenglow blocks.
+   agave's verify_ticks returns early for Alpenglow, and every
+   Alpenglow entry is pinned to exactly one hash, so the cumulative
+   hash count between ticks is just the entry count and grows past
+   FD_RUNTIME_MAX_HASHES_PER_TICK in a valid block.
+
+   Ingests a batch of entry_cnt single-transaction microblocks, each
+   declaring hash_cnt 1, except that microblock bad_idx (if not
+   ULONG_MAX) declares bad_hash_cnt.  Transactions keep the microblocks
+   from being ticks, which would reset the cumulative count. */
+static void
+run_many_entries_case( int   alpenglow,
+                       ulong entry_cnt,
+                       ulong bad_idx,
+                       ulong bad_hash_cnt,
+                       int   expect_ingest_ok,
+                       int   expect_dead_reason ) {
+  ulong depth         = 1UL<<17;
+  ulong block_cnt_max = 4UL;
+  ulong footprint     = fd_sched_footprint( depth, block_cnt_max, FD_SHRED_BLK_MAX, FD_MAX_TXN_PER_SLOT );
+  void * mem          = aligned_alloc( fd_sched_align(), footprint );
+  FD_TEST( mem );
+
+  fd_rng_t rng[1]; fd_rng_join( fd_rng_new( rng, 0U, 0UL ) );
+  fd_sched_t * sched = fd_sched_join( fd_sched_new( mem, rng, depth, block_cnt_max, FD_SHRED_BLK_MAX, FD_MAX_TXN_PER_SLOT, TEST_EXEC_CNT, alpenglow ) );
+  FD_TEST( sched );
+  fd_sched_set_bypass_poh_verify( sched, 1 );
+  fd_sched_block_add_done( sched, 1UL, ULONG_MAX, TEST_ROOT_SLOT );
+
+  uchar txn_payload[ FD_TXN_MTU ];
+  ulong txn_sz = build_shred_test_txn( txn_payload );
+
+  ulong  stream_sz = sizeof(ulong)+entry_cnt*(sizeof(fd_microblock_hdr_t)+txn_sz);
+  uchar * stream   = malloc( stream_sz );
+  FD_TEST( stream );
+  FD_STORE( ulong, stream, entry_cnt );
+  ulong cursor = sizeof(ulong);
+  for( ulong i=0UL; i<entry_cnt; i++ ) {
+    fd_microblock_hdr_t hdr = { .hash_cnt = i==bad_idx ? bad_hash_cnt : 1UL, .txn_cnt = 1UL };
+    fd_memcpy( stream+cursor, &hdr, sizeof(hdr) );  cursor += sizeof(hdr);
+    fd_memcpy( stream+cursor, txn_payload, txn_sz ); cursor += txn_sz;
+  }
+  FD_TEST( cursor==stream_sz );
+
+  static uchar          marker_buf[ FD_BLOCK_MARKER_SER_MAX ] __attribute__((aligned(64)));
+  static fd_store_fec_t store_fec[ 1 ] __attribute__((aligned(alignof(fd_store_fec_t))));
+  fd_hash_t prev_hash[ 1 ]; hash_from_seed( prev_hash, 0x5eedUL );
+
+  int   ingest_ok = 1;
+  uint  first     = 1U;
+  ulong off       = 0UL;
+
+  if( alpenglow ) {
+    ulong sz = encode_ag_component( marker_buf, AG_COMP_HEADER, prev_hash );
+    fd_memset( store_fec, 0, sizeof(fd_store_fec_t) );
+    store_fec->data_sz     = (uint)sz;
+    store_fec->shred_sz[0] = (ushort)sz;
+    fd_sched_fec_t fec[ 1 ] = {{
+      .bank_idx = 2UL, .parent_bank_idx = 1UL,
+      .slot = TEST_ROOT_SLOT+1UL, .parent_slot = TEST_ROOT_SLOT,
+      .fec = store_fec, .data = marker_buf, .shred_cnt = 1U,
+      .is_last_in_batch = 1U, .is_first_in_block = 1U,
+    }};
+    FD_TEST( fd_sched_fec_can_ingest( sched, fec ) );
+    FD_TEST( fd_sched_fec_ingest( sched, fec ) );
+    first = 0U;
+  }
+
+  /* Feed the batch in max sized FEC sets so residual handling across
+     FEC boundaries gets exercised too. */
+  while( off<stream_sz ) {
+    ulong sz = fd_ulong_min( stream_sz-off, 63985UL );
+    fd_memset( store_fec, 0, sizeof(fd_store_fec_t) );
+    store_fec->data_sz     = (uint)sz;
+    store_fec->shred_sz[0] = (ushort)sz;
+    fd_sched_fec_t fec[ 1 ] = {{
+      .bank_idx = 2UL, .parent_bank_idx = 1UL,
+      .slot = TEST_ROOT_SLOT+1UL, .parent_slot = TEST_ROOT_SLOT,
+      .fec = store_fec, .data = stream+off, .shred_cnt = 1U,
+      .is_last_in_batch = off+sz==stream_sz,
+      .is_first_in_block = !!first,
+    }};
+    FD_TEST( fd_sched_fec_can_ingest( sched, fec ) );
+    int ok = !!fd_sched_fec_ingest( sched, fec );
+    if( FD_LIKELY( first ) ) {
+      fd_sched_set_poh_params( sched, 2UL, TEST_ROOT_TICK_HEIGHT, TEST_ROOT_TICK_HEIGHT+1UL, alpenglow ? 1UL : 2UL, prev_hash );
+    }
+    first = 0U;
+    off  += sz;
+    if( FD_UNLIKELY( !ok ) ) { ingest_ok = 0; break; }
+  }
+  if( ingest_ok!=expect_ingest_ok ) FD_LOG_ERR(( "ag %d cnt %lu bad_idx %lu: ingest_ok %d dead %d", alpenglow, entry_cnt, bad_idx, ingest_ok, fd_sched_get_dead_reason( sched, 2UL ) ));
+  FD_TEST( fd_sched_get_dead_reason( sched, 2UL )==expect_dead_reason );
+
+  while( fd_sched_pruned_block_next( sched )!=ULONG_MAX ) {}
+  fd_sched_delete( fd_sched_leave( sched ) );
+  free( mem );
+  free( stream );
+}
+
+static void
+run_many_entries_cases( void ) {
+  ulong lim = FD_RUNTIME_MAX_HASHES_PER_TICK;
+  FD_TEST( FD_SCHED_MAX_MBLK_PER_SLOT>lim+1000UL );
+  FD_TEST( FD_MAX_TXN_PER_SLOT>90000UL );
+
+  /* Vanilla: exactly the limit is fine, one more is rejected at
+     ingest.  This is the boundary the Alpenglow exemption must not
+     move. */
+  run_many_entries_case( 0, lim,     ULONG_MAX, 0UL, 1, FD_SCHED_DEAD_REASON_NONE );
+  run_many_entries_case( 0, lim+1UL, ULONG_MAX, 0UL, 0, FD_SCHED_DEAD_REASON_TICK_HASHES_OVERFLOW_INGEST );
+
+  /* Alpenglow: the same entry counts are valid, well past the limit. */
+  run_many_entries_case( 1, lim,      ULONG_MAX, 0UL, 1, FD_SCHED_DEAD_REASON_NONE );
+  run_many_entries_case( 1, lim+1UL,  ULONG_MAX, 0UL, 1, FD_SCHED_DEAD_REASON_NONE );
+  run_many_entries_case( 1, 90000UL,  ULONG_MAX, 0UL, 1, FD_SCHED_DEAD_REASON_NONE );
+
+  /* Alpenglow still pins every entry to one hash, deep into a long
+     batch: this is what bounds PoH work now that the cumulative check
+     is gone.  Neither a huge nor a zero hash count gets through. */
+  run_many_entries_case( 1, lim+100UL, lim+50UL, 2UL,       0, FD_SCHED_DEAD_REASON_ALPENGLOW_HASH_CNT );
+  run_many_entries_case( 1, lim+100UL, lim+50UL, ULONG_MAX, 0, FD_SCHED_DEAD_REASON_ALPENGLOW_HASH_CNT );
+  run_many_entries_case( 1, lim+100UL, lim+50UL, 0UL,       0, FD_SCHED_DEAD_REASON_ALPENGLOW_HASH_CNT );
+  run_many_entries_case( 1, 10UL,      0UL,      lim+1UL,   0, FD_SCHED_DEAD_REASON_ALPENGLOW_HASH_CNT );
 }
 
 static void
@@ -596,8 +750,9 @@ run_poh_spread_case( ulong tick_cnt,
 
   fd_store_fec_t store_fec[ 1 ] __attribute__((aligned(alignof(fd_store_fec_t))));
   fd_memset( store_fec, 0, sizeof(fd_store_fec_t) );
-  store_fec->data_sz       = encoded_sz;
-  store_fec->shred_offs[0] = (uint)encoded_sz;
+  FD_TEST( encoded_sz<=USHORT_MAX );
+  store_fec->data_sz       = (uint)encoded_sz;
+  store_fec->shred_sz[ 0 ] = (ushort)encoded_sz;
 
   fd_sched_fec_t fec[ 1 ] = {{
     .bank_idx          = 2UL,
@@ -1041,8 +1196,8 @@ run_zero_hashcnt_mblk_case( void ) {
 
   fd_store_fec_t store_fec0[ 1 ] __attribute__((aligned(alignof(fd_store_fec_t))));
   fd_memset( store_fec0, 0, sizeof(fd_store_fec_t) );
-  store_fec0->data_sz         = fec0_sz;
-  store_fec0->shred_offs[ 0 ] = (uint)fec0_sz;
+  store_fec0->data_sz         = (uint)fec0_sz;
+  store_fec0->shred_sz[ 0 ]   = (ushort)fec0_sz;
   fd_sched_fec_t fec[ 1 ] = {{
     .bank_idx          = 2UL,
     .parent_bank_idx   = 1UL,
@@ -1104,8 +1259,8 @@ run_zero_hashcnt_mblk_case( void ) {
 
   fd_store_fec_t store_fec1[ 1 ] __attribute__((aligned(alignof(fd_store_fec_t))));
   fd_memset( store_fec1, 0, sizeof(fd_store_fec_t) );
-  store_fec1->data_sz         = fec1_sz;
-  store_fec1->shred_offs[ 0 ] = (uint)fec1_sz;
+  store_fec1->data_sz         = (uint)fec1_sz;
+  store_fec1->shred_sz[ 0 ]   = (ushort)fec1_sz;
   fec->fec               = store_fec1;
   fec->data              = fec1;
   fec->is_first_in_block = 0U;
@@ -1138,8 +1293,8 @@ run_zero_hashcnt_mblk_case( void ) {
 
   fd_store_fec_t store_fec2[ 1 ] __attribute__((aligned(alignof(fd_store_fec_t))));
   fd_memset( store_fec2, 0, sizeof(fd_store_fec_t) );
-  store_fec2->data_sz         = fec2_sz;
-  store_fec2->shred_offs[ 0 ] = (uint)fec2_sz;
+  store_fec2->data_sz         = (uint)fec2_sz;
+  store_fec2->shred_sz[ 0 ]   = (ushort)fec2_sz;
   fec->fec  = store_fec2;
   fec->data = fec2;
   FD_TEST( fd_sched_fec_can_ingest( sched, fec ) );
@@ -1215,8 +1370,9 @@ run_runtime_limit_case( void ) {
 
     fd_store_fec_t store_fec[ 1 ] __attribute__((aligned(alignof(fd_store_fec_t))));
     fd_memset( store_fec, 0, sizeof(fd_store_fec_t) );
-    store_fec->data_sz         = sizeof(encoded);
-    store_fec->shred_offs[ 0 ] = (uint)sizeof(encoded);
+    FD_TEST( sizeof(encoded)<=USHORT_MAX );
+    store_fec->data_sz       = (uint)sizeof(encoded);
+    store_fec->shred_sz[ 0 ] = (ushort)sizeof(encoded);
     fd_sched_fec_t fec[ 1 ] = {{
       .bank_idx          = 2UL,
       .parent_bank_idx   = 1UL,
@@ -1251,8 +1407,9 @@ run_runtime_limit_case( void ) {
 
     fd_store_fec_t store_fec[ 1 ] __attribute__((aligned(alignof(fd_store_fec_t))));
     fd_memset( store_fec, 0, sizeof(fd_store_fec_t) );
-    store_fec->data_sz         = sizeof(encoded);
-    store_fec->shred_offs[ 0 ] = (uint)sizeof(encoded);
+    FD_TEST( sizeof(encoded)<=USHORT_MAX );
+    store_fec->data_sz       = (uint)sizeof(encoded);
+    store_fec->shred_sz[ 0 ] = (ushort)sizeof(encoded);
     fd_sched_fec_t fec[ 1 ] = {{
       .bank_idx          = 2UL,
       .parent_bank_idx   = 1UL,
@@ -1282,6 +1439,7 @@ main( int     argc,
   run_lane_policy_case();
   run_bad_tick_cases();
   run_ag_structure_cases();
+  run_many_entries_cases();
   run_poh_spread_cases();
   run_interleaved_fec_residual_case();
   run_abandon_flavor_case();

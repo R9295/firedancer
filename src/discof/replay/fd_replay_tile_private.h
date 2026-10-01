@@ -3,7 +3,6 @@
 
 #include "fd_vote_tracker.h"
 #include "../../disco/fd_clock_tile.h"
-#include "../../disco/topo/fd_wksp_mon.h"
 #include "../../disco/store/fd_store.h"
 #include "../../disco/bundle/fd_bundle_crank.h"
 #include "../../disco/keyguard/fd_keyswitch.h"
@@ -11,6 +10,7 @@
 #include "../../discof/poh/fd_poh.h"
 #include "../../discof/reasm/fd_reasm.h"
 #include "../../discof/repair/fd_repair_tile.h"
+#include "../../discof/rotor/fd_rotor_tile.h"
 #include "../../discof/replay/fd_sched.h"
 #include "../../discof/votor/fd_votor_tile.h"
 #include "../../flamenco/capture/fd_capture_ctx.h"
@@ -70,10 +70,18 @@ struct fd_block_id_ele {
 };
 typedef struct fd_block_id_ele fd_block_id_ele_t;
 
+/* Tower keys by slot (slot % reception_stats_cnt).  Alpenglow keys by
+   bank idx.  There is no reasm; rotor stamps the snapshot onto every
+   FEC it delivers and replay records it in process_rotor_fec. */
 struct fd_reception_stats {
-  ulong                     slot;
+  ulong                     bank_seq; /* alpenglow guard: valid iff ==bank->bank_seq */
+  ulong                     slot;     /* tower guard */
   uint                      fec_set_idx;
-  fd_fec_complete_metrics_t metrics;
+
+  union {
+    fd_fec_complete_metrics_t repair; /* tower/repair */
+    fd_rotor_fec_metrics_t    rotor;  /* ag */
+  } metrics;
 };
 typedef struct fd_reception_stats fd_reception_stats_t;
 
@@ -160,6 +168,14 @@ struct fd_replay_tile {
      set.  This parallels the Agave 'has_new_vote_been_rooted'. */
   int identity_vote_rooted;
   int wait_for_vote_to_start_leader;
+
+  /* vote_account_staked is 1 if stake was delegated to our vote
+     account at boot.  vote_account_inadmissible is 1 while our staked
+     vote account fails the admission ticket filter, or passes it but
+     has not yet been admitted at an epoch boundary. */
+  int vote_account_staked;
+  int vote_account_inadmissible;
+
   int alpenglow;
 
   /* wfs_enabled is 1 if the validator is booted in
@@ -201,7 +217,7 @@ struct fd_replay_tile {
 
   char         genesis_path[ PATH_MAX ];
   fd_hash_t    genesis_hash[1];
-  fd_genesis_t genesis[1];
+  fd_genesis_t * genesis;
   ulong        cluster_type;
   ulong        genesis_timestamp;
   ulong        expected_genesis_timestamp;
@@ -351,13 +367,20 @@ struct fd_replay_tile {
      node, that is chaining off of the rooted fork, because the
      consensus root is always an ancestor of the actively replaying tip.
      */
-  fd_hash_t consensus_root;          /* The most recent block to have reached max lockout in the tower. */
+  fd_hash_t consensus_root;          /* The most recent block to have reached max lockout in the tower, or been finalized and replayed under Alpenglow. */
   ulong     consensus_root_slot;     /* slot number of the above. */
   fd_hash_t notified_root;           /* The most recent consensus root sent to sched, RPC, and resolv. */
   ulong     notified_root_slot;      /* slot number of the above. */
   fd_bank_t * notified_root_bank;    /* bank held by sched, RPC, and resolv for the notified root. */
   ulong     published_root_slot;     /* slot number of the published root. */
   ulong     published_root_bank_idx; /* bank index of the published root. */
+
+  /* ALPENGLOW-ONLY.  Watermarks marking the finalized but unreplayed
+     slots.  lo is the oldest and held until replay reaches it.  hi is
+     the newest and continuously updated.  If the gap between hi and lo
+     exceeds max_live_slots, Firedancer halts. */
+  ag_block_id_t finalized_block_id_lo;
+  ag_block_id_t finalized_block_id_hi;
 
   /* Randomly generated block id for the initial genesis/snapshot slot.
      Used as a fallback when the snapshot manifest does not contain a
@@ -443,17 +466,25 @@ struct fd_replay_tile {
   fd_block_footer_t leader_footer[ 1 ];
 
   fd_votor_certed_t votor_final[ 1 ];                                                /* ALPENGLOW-ONLY: highest finalization, fast over slow at the same slot */
+  fd_votor_leader_t votor_leader[ 1 ];                                               /* ALPENGLOW-ONLY: ParentReady trigger behind next_leader_slot     */
   fd_votor_reward_t votor_reward[ FD_NUM_SLOTS_FOR_REWARD+AG_SLOTS_PER_WINDOW+1UL ];
 
   ulong       next_leader_slot;
   long        next_leader_tickcount;
+
+
+  ulong next_leader_query_start;
+  ulong next_leader_query_slot;
+
   double      tick_per_ns;
   ulong       highwater_leader_slot;
   ulong       reset_slot;
 
   /* Caught up to the cluster: replay has completed a slot within a few
-     slots of the highest FEC set slot seen from repair (which tracks
-     the turbine tip). */
+     slots of the cluster tip.  Under tower the tip is the highest FEC
+     set slot repair forwarded; under alpenglow rotor tracks it and
+     ships it on each delivered FEC, because rotor delivers only
+     replayable FECs in order and their slots track replay itself. */
   int         caught_up;
   ulong       catch_up_max_fec_slot;
   ulong       catch_up_tip_advance_cnt;
@@ -489,16 +520,20 @@ struct fd_replay_tile {
   fd_node_info_box_t * node_info; /* shared */
 
   fd_keyswitch_t * keyswitch;
-  int              halt_leader;
+  int              halt_replay;
 
   ulong  resolv_tile_cnt;
 
   int in_kind[ 128 ];
   fd_replay_in_link_t in[ 128 ];
 
-  fd_replay_out_link_t exec_out[ 1 ];
+  ulong                exec_cnt;
+  fd_replay_out_link_t exec_out[ FD_SCHED_MAX_EXEC_TILE_CNT ];
 
   fd_replay_out_link_t replay_out[1];
+  ulong const *        replay_out_seq;
+  fd_replay_out_link_t slot_out[1];
+  ulong const *        slot_out_seq;
   fd_replay_out_link_t snapmk_out[1];
   ulong admin_out_idx;
 
@@ -551,6 +586,7 @@ struct fd_replay_tile {
     ulong reasm_empty;
     ulong leader_bid_wait;
     ulong banks_full;
+    ulong parent_unavailable;
     ulong storage_root_behind;
 
     ulong voted_slot; /* monotone, ULONG_MAX if none */

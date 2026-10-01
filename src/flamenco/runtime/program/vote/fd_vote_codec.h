@@ -41,6 +41,15 @@
 /* https://github.com/anza-xyz/solana-sdk/blob/vote-interface%40v5.0.0/vote-interface/src/state/mod.rs#L36 */
 #define FD_BLS_PROOF_OF_POSSESSION_COMPRESSED_SZ (96UL)
 
+/* Default block revenue commission (100%)
+   https://github.com/anza-xyz/agave/blob/v4.4.0-alpha.5/vote/src/vote_state_view.rs#L117 */
+#define FD_VOTE_DEFAULT_BLOCK_REVENUE_COMMISSION_BPS (10000U)
+
+/* Serialized size of each vote state version */
+#define FD_VOTE_STATE_V2_SZ (3731UL)
+#define FD_VOTE_STATE_V3_SZ (3762UL)
+#define FD_VOTE_STATE_V4_SZ (3762UL)
+
 /**********************************************************************/
 /* Constants -- vote instruction footprints                           */
 /**********************************************************************/
@@ -260,59 +269,7 @@ FD_STATIC_ASSERT( sizeof(fd_vote_epoch_credits_t)==24UL, vote_epoch_credits_layo
 FD_STATIC_ASSERT( sizeof(fd_vote_block_timestamp_t)==16UL, vote_block_timestamp_layout );
 FD_STATIC_ASSERT( sizeof(fd_vote_init_t)==97UL, vote_init_layout );
 
-/**********************************************************************/
-/* Deque templates -- instruction sub-types                           */
-/**********************************************************************/
-
-#define DEQUE_NAME deq_ulong
-#define DEQUE_T ulong
-#include "../../../../util/tmpl/fd_deque_dynamic.c"
-#undef DEQUE_NAME
-#undef DEQUE_T
-#undef DEQUE_MAX
-
-#define DEQUE_NAME deq_fd_vote_lockout_t
-#define DEQUE_T fd_vote_lockout_t
-#include "../../../../util/tmpl/fd_deque_dynamic.c"
-#undef DEQUE_NAME
-#undef DEQUE_T
-#undef DEQUE_MAX
-
-/**********************************************************************/
-/* Deque templates -- vote account state                              */
-/**********************************************************************/
-
-#define DEQUE_NAME deq_fd_vote_epoch_credits_t
-#define DEQUE_T fd_vote_epoch_credits_t
-#define DEQUE_MAX MAX_EPOCH_CREDITS_HISTORY_CAPACITY
-#include "../../../../util/tmpl/fd_deque.c"
-#undef DEQUE_NAME
-#undef DEQUE_T
-#undef DEQUE_MAX
-
-#define DEQUE_NAME deq_fd_landed_vote_t
-#define DEQUE_T fd_landed_vote_t
-#include "../../../../util/tmpl/fd_deque_dynamic.c"
-#undef DEQUE_NAME
-#undef DEQUE_T
-#undef DEQUE_MAX
-
-/**********************************************************************/
-/* Treap / pool for authorized voters                                 */
-/**********************************************************************/
-
-#define POOL_NAME fd_vote_authorized_voters_pool
-#define POOL_T fd_vote_authorized_voter_t
-#define POOL_IDX_T uchar
-#define POOL_NEXT parent
-#include "../../../../util/tmpl/fd_pool.c"
-#define TREAP_NAME fd_vote_authorized_voters_treap
-#define TREAP_T fd_vote_authorized_voter_t
-#define TREAP_IDX_T uchar
-#define TREAP_QUERY_T ulong
-#define TREAP_CMP(q,e) ( (q == (e)->epoch) ? 0 : ( (q < (e)->epoch) ? -1 : 1 ) )
-#define TREAP_LT(e0,e1) ((e0)->epoch<(e1)->epoch)
-#include "../../../../util/tmpl/fd_treap.c"
+typedef struct fd_vote_authorized_voters_treap_private fd_vote_authorized_voters_treap_t;
 
 struct fd_vote_authorized_voters {
   fd_vote_authorized_voter_t *        pool;
@@ -688,6 +645,50 @@ fd_vote_account_collectors( uchar const *       data,
                             fd_pubkey_t const * node_pubkey,
                             fd_pubkey_t *       inflation_rewards_collector_out,
                             fd_pubkey_t *       block_revenue_collector_out );
+
+/* Reads the authorized voter for epoch directly from raw
+   bincode-encoded vote account data.  Returns 0 on success, 1 on error
+   or if no entry qualifies. */
+int
+fd_vote_account_authorized_voter( uchar const * data,
+                                  ulong         data_sz,
+                                  ulong         epoch,
+                                  fd_pubkey_t * out );
+
+/* Reads the SIMD-0123 block revenue commission in basis points
+   directly from raw bincode-encoded vote account data.
+   The stored value is returned as is, not rounded.
+   Returns 0 on success, 1 on error. */
+int
+fd_vote_account_block_revenue_commission_bps( uchar const * data,
+                                              ulong         data_sz,
+                                              ushort *      out );
+
+/* Reads the SIMD-0123 pending delegator rewards directly from raw
+   bincode-encoded vote account data.
+   Returns 0 on success, 1 on error. */
+int
+fd_vote_account_pending_delegator_rewards( uchar const * data,
+                                           ulong         data_sz,
+                                           ulong *       out );
+
+/* fd_vote_account_add_pending_delegator_rewards adds lamports to the
+   pending delegator rewards field in place.
+   Returns 0 on success, 1 if the data is not an initialized v4 state,
+   2 on overflow. */
+int
+fd_vote_account_add_pending_delegator_rewards( uchar * data,
+                                               ulong   data_sz,
+                                               ulong   lamports );
+
+/* fd_vote_account_reset_pending_delegator_rewards zeroes the pending
+   delegator rewards field in place and stores the value it held in *old_out.
+   Returns 0 on success, 1 if the data is not an initialized v4 state.
+   https://github.com/anza-xyz/agave/blob/v4.4.0-alpha.5/vote/src/vote_state_view_mut.rs#L58-L71 */
+int
+fd_vote_account_reset_pending_delegator_rewards( uchar * data,
+                                                 ulong   data_sz,
+                                                 ulong * old_out );
 
 /* Reads the last_timestamp directly from raw bincode-encoded vote
    account data.  Returns 0 on success, 1 on error. */

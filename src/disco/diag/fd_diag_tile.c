@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "fd_diag_tile.h"
+#include "../fd_clock_tile.h"
 
 #include "../bundle/fd_bundle_tile.h"
 #include "../metrics/fd_metrics.h"
@@ -15,21 +16,33 @@
 #include <stdlib.h>
 #include <sys/types.h> /* SEEK_SET */
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/vfs.h>
+#include <linux/futex.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "fd_proc_interrupts.h"
 #include "generated/fd_diag_tile_seccomp.h"
 
+/* Each procfs source is read at the rate its consumers need: the CPU
+   regime split every report (100 ms), /proc/<tid>/sched (only feeds
+   cumulative counters, ~10 us a read) once a second, /proc/interrupts
+   (~5 ms on 96 CPUs) every five. */
+
 #define REPORT_INTERVAL_MILLIS (100L)
+#define SCHED_REPORT_INTERVAL_NANOS (1000000000L)
+#define IRQ_REPORT_INTERVAL_NANOS (5000000000L)
 #define SYSTEM_REPORT_INTERVAL_NANOS (30000000000L)
 
 #define DIAG_WKSP_TILE_IDX_SHARED (ULONG_MAX)
 
 
 struct fd_diag_tile {
+  fd_clock_tile_t clock[1];
   long next_report_nanos;
+  long next_sched_report_nanos;
+  long next_irq_report_nanos;
 
   ulong tile_cnt;
   int is_voting;
@@ -49,6 +62,7 @@ struct fd_diag_tile {
 
   int stat_fds[ FD_TILE_MAX ];
   int sched_fds[ FD_TILE_MAX ];
+  int schedstat_fds[ FD_TILE_MAX ];
 
   ulong       irq_cnt[ FD_METRICS_ENUM_SOFTIRQ_CNT ][ FD_TILE_MAX ];
   fd_cpuset_t cpu_has_tile[ fd_cpuset_word_cnt ];
@@ -140,6 +154,16 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
   return sizeof(fd_diag_tile_t);
 }
 
+static void
+during_housekeeping( fd_diag_tile_t * ctx ) {
+  if( FD_UNLIKELY( fd_clock_tile_recal_due( ctx->clock ) ) ) fd_clock_tile_recal( ctx->clock );
+}
+
+static inline long
+next_deadline( fd_diag_tile_t * ctx ) {
+  return fd_clock_tile_wallclock_to_tickcount( ctx->clock, ctx->next_report_nanos );
+}
+
 static int
 read_stat_file( int              fd,
                 ulong            ns_per_tick,
@@ -204,6 +228,38 @@ read_stat_file( int              fd,
   return 0;
 }
 
+/* read_schedstat_file reads /proc/<pid>/task/<tid>/schedstat: run_delay
+   is the counter /proc/<tid>/sched prints as wait_sum, in nanoseconds. */
+
+static int
+read_schedstat_file( int              fd,
+                     volatile ulong * metrics ) {
+  if( FD_UNLIKELY( -1==lseek( fd, 0, SEEK_SET ) ) ) FD_LOG_ERR(( "lseek failed (%i-%s)", errno, strerror( errno ) ));
+
+  char contents[ 128 ] = {0};
+  ulong contents_len = 0UL;
+
+  while( 1 ) {
+    if( FD_UNLIKELY( contents_len>=sizeof( contents ) ) ) FD_LOG_ERR(( "schedstat contents overflow" ));
+    long n = read( fd, contents + contents_len, sizeof( contents ) - contents_len );
+    if( FD_UNLIKELY( -1==n ) ) {
+      if( FD_UNLIKELY( errno==EINTR ) ) continue;
+      if( FD_UNLIKELY( errno==ESRCH ) ) return 1;
+      FD_LOG_ERR(( "read failed (%i-%s)", errno, strerror( errno ) ));
+    }
+    if( FD_LIKELY( 0==n ) ) break;
+    contents_len += (ulong)n;
+  }
+
+  char * endptr;
+  ulong run_time  = strtoul( contents, &endptr, 10 );
+  if( FD_UNLIKELY( ' '!=*endptr || run_time==ULONG_MAX ) ) FD_LOG_ERR(( "failed to parse schedstat sum_exec_runtime" ));
+  ulong run_delay = strtoul( endptr+1, &endptr, 10 );
+  if( FD_UNLIKELY( ' '!=*endptr || run_delay==ULONG_MAX ) ) FD_LOG_ERR(( "failed to parse schedstat run_delay" ));
+  metrics[ FD_METRICS_COUNTER_TILE_CPU_DURATION_NANOS_WAIT_OFF ] = run_delay;
+  return 0;
+}
+
 static int
 read_sched_file( int              fd,
                  volatile ulong * metrics ) {
@@ -223,7 +279,6 @@ read_sched_file( int              fd,
     contents_len += (ulong)n;
   }
 
-  int found_wait_sum = 0;
   int found_voluntary = 0;
   int found_involuntary = 0;
 
@@ -233,25 +288,7 @@ read_sched_file( int              fd,
     if( FD_UNLIKELY( NULL==next_line ) ) break;
     *next_line = '\0';
 
-    if( FD_UNLIKELY( !strncmp( line, "wait_sum", 8UL ) ) ) {
-      char * colon = strchr( line, ':' );
-      if( FD_LIKELY( colon ) ) {
-        char * value = colon + 1;
-        while( ' '==*value || '\t'==*value ) value++;
-        /* wait_sum is displayed as seconds.microseconds (e.g., "123.456789").
-           Parse both components as integers and convert to nanoseconds. */
-        char * endptr;
-        ulong seconds = strtoul( value, &endptr, 10 );
-        if( FD_UNLIKELY( '.'!=*endptr ) ) FD_LOG_ERR(( "expected '.' after seconds in wait_sum" ));
-        if( FD_UNLIKELY( seconds==ULONG_MAX ) ) FD_LOG_ERR(( "strtoul overflow for wait_sum seconds" ));
-        ulong microseconds = strtoul( endptr + 1, &endptr, 10 );
-        if( FD_UNLIKELY( '\0'!=*endptr ) ) FD_LOG_ERR(( "unexpected char after microseconds in wait_sum" ));
-        if( FD_UNLIKELY( microseconds==ULONG_MAX ) ) FD_LOG_ERR(( "strtoul overflow for wait_sum microseconds" ));
-        ulong wait_sum_ns = seconds*1000000000UL + microseconds*1000UL;
-        metrics[ FD_METRICS_COUNTER_TILE_CPU_DURATION_NANOS_WAIT_OFF ] = wait_sum_ns;
-        found_wait_sum = 1;
-      }
-    } else if( FD_UNLIKELY( !strncmp( line, "nr_voluntary_switches", 21UL ) ) ) {
+    if( FD_UNLIKELY( !strncmp( line, "nr_voluntary_switches", 21UL ) ) ) {
       char * colon = strchr( line, ':' );
       if( FD_LIKELY( colon ) ) {
         char * value = colon + 1;
@@ -280,13 +317,16 @@ read_sched_file( int              fd,
     line = next_line + 1;
   }
 
-  // wait_sum not present on kernels compiled without CONFIG_SCHEDSTATS=y
-  // if( FD_UNLIKELY( !found_wait_sum ) ) FD_LOG_ERR(( "wait_sum not found in sched file" ));
-  (void)found_wait_sum;
   if( FD_UNLIKELY( !found_voluntary ) ) FD_LOG_ERR(( "nr_voluntary_switches not found in sched file" ));
   if( FD_UNLIKELY( !found_involuntary ) ) FD_LOG_ERR(( "nr_involuntary_switches not found in sched file" ));
 
   return 0;
+}
+
+static ulong
+check_builder_status( fd_diag_tile_t * ctx ) {
+  (void)ctx;
+  return FD_DIAG_BUILDER_STATUS_DISABLED;
 }
 
 static void
@@ -359,6 +399,13 @@ check_engine_metric( fd_diag_tile_t * ctx, long now ) {
                                    FD_DIAG_VOTE_STATUS_VOTING );
       }
     }
+  }
+
+  /* Votes land but earn nothing: the stake is not admitted. */
+  if( FD_UNLIKELY( vote_status==FD_DIAG_VOTE_STATUS_VOTING &&
+                   ctx->tiles.replay_idx!=ULONG_MAX &&
+                   ctx->metrics[ ctx->tiles.replay_idx ][ FD_METRICS_GAUGE_REPLAY_VOTE_ACCOUNT_INADMISSIBLE_OFF ] ) ) {
+    vote_status = FD_DIAG_VOTE_STATUS_INADMISSIBLE;
   }
 
   ulong replay_idx     = ctx->tiles.replay_idx;
@@ -435,6 +482,7 @@ check_engine_metric( fd_diag_tile_t * ctx, long now ) {
   FD_MGAUGE_SET( DIAG, VOTE_STATUS,    vote_status    );
   FD_MGAUGE_SET( DIAG, REPLAY_STATUS,  replay_status  );
   FD_MGAUGE_SET( DIAG, TURBINE_STATUS, turbine_status );
+  FD_MGAUGE_SET( DIAG, BUILDER_STATUS, check_builder_status( ctx ) );
 }
 
 static void
@@ -599,7 +647,7 @@ sample_disk( fd_diag_tile_t * ctx ) {
     if( ctx->files[ i ].metric ) file->bytes = *ctx->files[ i ].metric;
     else if( ctx->files[ i ].data_fd>=0 ) {
       struct stat st;
-      if( FD_UNLIKELY( fstat( ctx->files[ i ].data_fd, &st ) ) ) FD_LOG_ERR(( "fstat failed (%i-%s)", errno, strerror( errno ) ));
+      if( FD_UNLIKELY( syscall( SYS_fstat, ctx->files[ i ].data_fd, &st ) ) ) FD_LOG_ERR(( "fstat failed (%i-%s)", errno, strerror( errno ) ));
       file->bytes = (ulong)st.st_size;
     }
   }
@@ -675,17 +723,8 @@ before_credit( fd_diag_tile_t *    ctx,
                int *               charge_busy ) {
   (void)stem;
 
-  long now = fd_log_wallclock();
-  if( now<ctx->next_report_nanos ) {
-    long diff = ctx->next_report_nanos - now;
-    diff = fd_long_min( diff, 2e6 /* 2ms */ );
-    struct timespec const ts = {
-      .tv_sec  = diff / (long)1e9,
-      .tv_nsec = diff % (long)1e9
-    };
-    clock_nanosleep( CLOCK_REALTIME, 0, &ts, NULL );
-    return;
-  }
+  long now = fd_clock_tile_now( ctx->clock );
+  if( FD_UNLIKELY( now<ctx->next_report_nanos ) ) return;
   ctx->next_report_nanos += REPORT_INTERVAL_MILLIS*1000L*1000L;
 
   *charge_busy = 1;
@@ -697,14 +736,18 @@ before_credit( fd_diag_tile_t *    ctx,
 
   interrupt_metrics( ctx ); /* before idle computation below, which subtracts it */
 
+  int sched_due = now>=ctx->next_sched_report_nanos;
+  if( FD_UNLIKELY( sched_due ) ) ctx->next_sched_report_nanos = now + SCHED_REPORT_INTERVAL_NANOS;
+
   for( ulong i=0UL; i<ctx->tile_cnt; i++ ) {
     if( FD_UNLIKELY( -1==ctx->stat_fds[ i ] ) ) continue;
 
     /* CLK_TCK is typically 100, so 1 tick = 10ms = 10,000,000 ns */
     int process_died1 = read_stat_file( ctx->stat_fds[ i ], 10000000UL, ctx->metrics[ i ] );
-    int process_died2 = read_sched_file( ctx->sched_fds[ i ], ctx->metrics[ i ] );
+    int process_died2 = -1!=ctx->schedstat_fds[ i ] && read_schedstat_file( ctx->schedstat_fds[ i ], ctx->metrics[ i ] );
+    int process_died3 = sched_due && read_sched_file( ctx->sched_fds[ i ], ctx->metrics[ i ] );
 
-    if( FD_UNLIKELY( process_died1 || process_died2 ) ) {
+    if( FD_UNLIKELY( process_died1 || process_died2 || process_died3 ) ) {
       ctx->stat_fds[ i ] = -1;
       continue;
     }
@@ -744,7 +787,10 @@ before_credit( fd_diag_tile_t *    ctx,
   }
 
   check_engine_metric( ctx, now );
-  irq_metrics( ctx );
+  if( FD_UNLIKELY( now>=ctx->next_irq_report_nanos ) ) {
+    ctx->next_irq_report_nanos = now + IRQ_REPORT_INTERVAL_NANOS;
+    irq_metrics( ctx );
+  }
 }
 
 /* Disk mount discovery ************************************************/
@@ -1110,8 +1156,9 @@ privileged_init( fd_topo_t const *      topo,
   ctx->mount_cnt = 0UL;
   ctx->file_cnt = 0UL;
   for( ulong i=0UL; i<FD_TILE_MAX; i++ ) {
-    ctx->stat_fds[ i ]  = -1;
-    ctx->sched_fds[ i ] = -1;
+    ctx->stat_fds[ i ]      = -1;
+    ctx->sched_fds[ i ]     = -1;
+    ctx->schedstat_fds[ i ] = -1;
   }
   for( ulong i=0UL; i<FD_DIAG_SYSTEM_NUMA_MAX; i++ ) ctx->numa.node[ i ].meminfo_fd = -1;
 
@@ -1151,6 +1198,16 @@ privileged_init( fd_topo_t const *      topo,
       if( FD_UNLIKELY( -1==ctx->sched_fds[ i ] ) ) {
         if( FD_LIKELY( 2UL!=ctx->metrics[ i ][ FD_METRICS_GAUGE_TILE_STATUS_OFF ] ) ) FD_LOG_ERR(( "open sched failed (%i-%s)", errno, strerror( errno ) ));
         ctx->stat_fds[ i ] = -1;
+        break;
+      }
+
+      /* Absent on kernels without CONFIG_SCHED_INFO: wait then reads 0,
+         as it did without CONFIG_SCHEDSTATS. */
+      FD_TEST( fd_cstr_printf_check( path, sizeof( path ), NULL, "/proc/%lu/task/%lu/schedstat", pid, tid ) );
+      ctx->schedstat_fds[ i ] = open( path, O_RDONLY );
+      if( FD_UNLIKELY( -1==ctx->schedstat_fds[ i ] && errno!=ENOENT ) ) {
+        if( FD_LIKELY( 2UL!=ctx->metrics[ i ][ FD_METRICS_GAUGE_TILE_STATUS_OFF ] ) ) FD_LOG_ERR(( "open schedstat failed (%i-%s)", errno, strerror( errno ) ));
+        ctx->stat_fds[ i ] = -1;
       }
       break;
     }
@@ -1175,11 +1232,7 @@ privileged_init( fd_topo_t const *      topo,
   fd_topo_cpus_init( cpus );
   ctx->system_resources.cpu_cnt = (uint)fd_ulong_min( cpus->cpu_cnt, FD_DIAG_SYSTEM_CPU_MAX );
   for( ulong i=0UL; i<ctx->system_resources.cpu_cnt; i++ ) {
-    fd_diag_system_cpu_t * cpu = &ctx->system_resources.cpu[ i ];
-    cpu->cpu_idx     = (ushort)i;
-    cpu->numa_idx    = (ushort)cpus->cpu[ i ].numa_node;
-    cpu->sibling_idx = cpus->cpu[ i ].sibling==ULONG_MAX ? USHORT_MAX : (ushort)cpus->cpu[ i ].sibling;
-    cpu->online      = (uchar)cpus->cpu[ i ].online;
+    fd_diag_system_cpu_init( &ctx->system_resources.cpu[ i ], &cpus->cpu[ i ] );
   }
 
   for( ulong numa_idx=0UL; numa_idx<cpus->numa_node_cnt && ctx->numa.cnt<FD_DIAG_SYSTEM_NUMA_MAX; numa_idx++ ) {
@@ -1285,7 +1338,10 @@ unprivileged_init( fd_topo_t const *      topo,
   fd_diag_tile_t * ctx = fd_topo_obj_laddr( topo, tile->tile_obj_id );
 
   memset( ctx->first_seen_died, 0, sizeof( ctx->first_seen_died ) );
-  ctx->next_report_nanos = fd_log_wallclock();
+  fd_clock_tile_init( ctx->clock );
+  ctx->next_report_nanos       = fd_clock_tile_now( ctx->clock );
+  ctx->next_sched_report_nanos = ctx->next_report_nanos;
+  ctx->next_irq_report_nanos   = ctx->next_report_nanos;
   ctx->next_system_report_nanos = ctx->next_report_nanos;
   if( FD_UNLIKELY( ctx->gui_enabled ) ) {
     ulong out_idx = fd_topo_find_tile_out_link( topo, tile, "diag_gui", 0UL );
@@ -1353,12 +1409,11 @@ unprivileged_init( fd_topo_t const *      topo,
     ctx->cpu_to_tile[ cpu_idx ] = (ushort)i;
   }
 
-  long now = fd_log_wallclock();
   ctx->is_voting = tile->diag.is_voting;
-  ctx->check_engine.vote_slot_changed_ns = now;
-  ctx->check_engine.reset_slot_changed_ns = now;
-  ctx->check_engine.turbine_slot_changed_ns = now;
-  ctx->check_engine.byte_snapshot_ns = now;
+  ctx->check_engine.vote_slot_changed_ns    = ctx->next_report_nanos;
+  ctx->check_engine.reset_slot_changed_ns   = ctx->next_report_nanos;
+  ctx->check_engine.turbine_slot_changed_ns = ctx->next_report_nanos;
+  ctx->check_engine.byte_snapshot_ns        = ctx->next_report_nanos;
 }
 
 static ulong
@@ -1381,7 +1436,7 @@ populate_allowed_fds( fd_topo_t const *      topo,
   fd_diag_tile_t * ctx = fd_topo_obj_laddr( topo, tile->tile_obj_id );
 
   int logfile_fd = fd_log_private_logfile_fd();
-  ulong required_fds = 5UL+2UL*ctx->tile_cnt+ctx->numa.cnt+ctx->mount_cnt+(ulong)(-1!=logfile_fd);
+  ulong required_fds = 5UL+3UL*ctx->tile_cnt+ctx->numa.cnt+ctx->mount_cnt+(ulong)(-1!=logfile_fd);
   for( ulong i=0UL; i<ctx->file_cnt; i++ )
     required_fds += (ulong)( ctx->files[ i ].data_fd>=0 && ctx->files[ i ].data_fd!=logfile_fd );
   if( FD_UNLIKELY( out_fds_cnt<required_fds ) ) FD_LOG_ERR(( "out_fds_cnt %lu", out_fds_cnt ));
@@ -1395,8 +1450,9 @@ populate_allowed_fds( fd_topo_t const *      topo,
   out_fds[ out_cnt++ ] = ctx->proc_stat_fd;       /* /proc/stat */
   out_fds[ out_cnt++ ] = ctx->proc_meminfo_fd;    /* /proc/meminfo */
   for( ulong i=0UL; i<ctx->tile_cnt; i++ ) {
-    if( -1!=ctx->stat_fds[ i ] )  out_fds[ out_cnt++ ] = ctx->stat_fds[ i ];  /* /proc/<pid>/task/<tid>/stat */
-    if( -1!=ctx->sched_fds[ i ] ) out_fds[ out_cnt++ ] = ctx->sched_fds[ i ]; /* /proc/<pid>/task/<tid>/sched */
+    if( -1!=ctx->stat_fds[ i ] )      out_fds[ out_cnt++ ] = ctx->stat_fds[ i ];      /* /proc/<pid>/task/<tid>/stat */
+    if( -1!=ctx->sched_fds[ i ] )     out_fds[ out_cnt++ ] = ctx->sched_fds[ i ];     /* /proc/<pid>/task/<tid>/sched */
+    if( -1!=ctx->schedstat_fds[ i ] ) out_fds[ out_cnt++ ] = ctx->schedstat_fds[ i ]; /* /proc/<pid>/task/<tid>/schedstat */
   }
   for( ulong i=0UL; i<ctx->numa.cnt; i++ )
     if( ctx->numa.node[ i ].meminfo_fd>=0 ) out_fds[ out_cnt++ ] = ctx->numa.node[ i ].meminfo_fd;
@@ -1409,11 +1465,14 @@ populate_allowed_fds( fd_topo_t const *      topo,
 
 #define STEM_BURST (1UL)
 #define STEM_LAZY  ((long)10e6) /* 10ms */
+#define STEM_ALWAYS_PARK 1
 
 #define STEM_CALLBACK_CONTEXT_TYPE  fd_diag_tile_t
 #define STEM_CALLBACK_CONTEXT_ALIGN alignof(fd_diag_tile_t)
 
-#define STEM_CALLBACK_BEFORE_CREDIT before_credit
+#define STEM_CALLBACK_NEXT_DEADLINE       next_deadline
+#define STEM_CALLBACK_DURING_HOUSEKEEPING during_housekeeping
+#define STEM_CALLBACK_BEFORE_CREDIT       before_credit
 
 #include "../../disco/stem/fd_stem.c"
 

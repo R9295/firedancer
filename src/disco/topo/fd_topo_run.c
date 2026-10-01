@@ -2,6 +2,7 @@
 #include "fd_topo.h"
 
 #include "../waker/fd_waker.h"
+#include "../sleep/fd_sleep.h"
 #include "../metrics/fd_metrics.h"
 #include "../events/fd_event_report.h"
 #include "../../util/tile/fd_tile_private.h"
@@ -60,6 +61,12 @@ fd_topo_run_tile( fd_topo_t *          topo,
   char thread_name[ 20 ];
   FD_TEST( fd_cstr_printf_check( thread_name, sizeof( thread_name ), NULL, "%s:%lu", tile->name, tile->kind_id ) );
   if( FD_UNLIKELY( prctl( PR_SET_NAME, thread_name, 0, 0, 0 ) ) ) FD_LOG_ERR(( "prctl(PR_SET_NAME) failed (%i-%s)", errno, fd_io_strerror( errno ) ));
+
+  if( FD_UNLIKELY( topo->sleep_obj_id!=ULONG_MAX ) ) {
+    if( FD_UNLIKELY( -1==prctl( PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL ) ) ) FD_LOG_ERR(( "prctl(PR_SET_TIMERSLACK) failed (%i-%s)", errno, fd_io_strerror( errno ) ));
+  }
+
+  fd_tile_rseq_unregister();
 
   ulong pid = fd_sandbox_getpid(); /* Need to read /proc again.. we got a new PID from clone */
   ulong tid = fd_sandbox_gettid(); /* Need to read /proc again.. we got a new TID from clone */
@@ -275,11 +282,13 @@ run_tile_thread( fd_topo_t *         topo,
       ulong numa_idx = fd_shmem_numa_idx( tile->cpu_idx );
       for( ulong cpu=0UL; cpu<FD_TILE_MAX; cpu++ )
         if( fd_cpuset_test( float_cpu_set, cpu ) && fd_shmem_numa_idx( cpu )==numa_idx ) fd_cpuset_insert( cpu_set, cpu );
+      if( FD_UNLIKELY( !fd_cpuset_cnt( cpu_set ) ) ) fd_memcpy( cpu_set, float_cpu_set, fd_cpuset_footprint() );
     }
     if( FD_UNLIKELY( !fd_cpuset_cnt( cpu_set ) ) ) fd_cpuset_insert( cpu_set, tile->cpu_idx );
     if( FD_UNLIKELY( -1==setpriority( PRIO_PROCESS, 0, -19 ) ) ) FD_LOG_ERR(( "setpriority() failed (%i-%s)", errno, fd_io_strerror( errno ) ));
   } else {
-    fd_memcpy( cpu_set, floating_cpu_set, fd_cpuset_footprint() );
+    fd_cpuset_intersect( cpu_set, float_cpu_set, floating_cpu_set );
+    if( FD_UNLIKELY( !fd_cpuset_cnt( cpu_set ) ) ) fd_memcpy( cpu_set, floating_cpu_set, fd_cpuset_footprint() );
     if( FD_UNLIKELY( -1==setpriority( PRIO_PROCESS, 0, floating_priority ) ) ) FD_LOG_ERR(( "setpriority() failed (%i-%s)", errno, fd_io_strerror( errno ) ));
   }
 
@@ -344,6 +353,7 @@ fd_topo_run_single_process( fd_topo_t *       topo,
       if( FD_UNLIKELY( idx!=ULONG_MAX ) ) waker_client_cnt = fd_ulong_max( waker_client_cnt, idx+1UL );
     }
     fd_waker_install( waker_client_cnt );
+    fd_sleep_eventfd_install( topo );
   }
 
   /* Save the current affinity, it will be restored after creating any child tiles */
@@ -360,8 +370,13 @@ fd_topo_run_single_process( fd_topo_t *       topo,
     fd_cpuset_insert( float_cpu_set, topo->tiles[ i ].cpu_idx );
     any_floats = 1;
   }
-  for( ulong i=0UL; i<topo->tile_cnt; i++ )
-    if( FD_LIKELY( !topo->tiles[ i ].floats && topo->tiles[ i ].cpu_idx!=ULONG_MAX ) ) fd_cpuset_remove( float_cpu_set, topo->tiles[ i ].cpu_idx );
+  for( ulong i=0UL; i<topo->tile_cnt; i++ ) {
+    fd_topo_tile_t const * tile = &topo->tiles[ i ];
+    if( FD_UNLIKELY( tile->floats || tile->cpu_idx==ULONG_MAX ) ) continue;
+    fd_cpuset_remove( float_cpu_set, tile->cpu_idx );
+    ulong sibling = fd_tile_private_sibling_idx( tile->cpu_idx );
+    if( FD_LIKELY( sibling!=ULONG_MAX ) ) fd_cpuset_remove( float_cpu_set, sibling );
+  }
 
   errno = 0;
   int save_priority = getpriority( PRIO_PROCESS, 0 );

@@ -1,6 +1,50 @@
-#define FD_TILE_TEST 1
+#define _GNU_SOURCE
+#include "../../disco/stem/fd_stem.h"
+#include "utils/fd_ssctrl.h"
+
+static ulong             test_publish_cnt;
+static ulong             test_publish_sig;
+static ulong             test_publish_sz;
+static ulong             test_publish_chunk;
+static void *            test_output;
+static fd_ssctrl_start_t test_start;
+
+static ulong
+test_stem_publish( fd_stem_context_t * stem FD_PARAM_UNUSED,
+                   ulong               out_idx FD_PARAM_UNUSED,
+                   ulong               sig,
+                   ulong               chunk,
+                   ulong               sz,
+                   ulong               ctl     FD_PARAM_UNUSED,
+                   ulong               tsorig  FD_PARAM_UNUSED,
+                   ulong               tspub   FD_PARAM_UNUSED ) {
+  test_publish_cnt++;
+  test_publish_sig   = sig;
+  test_publish_sz    = sz;
+  test_publish_chunk = chunk;
+  if( sig==FD_SNAPSHOT_MSG_CTRL_START && sz ) {
+    FD_TEST( sz==sizeof(test_start) );
+    fd_memcpy( &test_start, fd_chunk_to_laddr_const( test_output, chunk ), sz );
+  }
+  return 0UL;
+}
+
+#define fd_stem_publish test_stem_publish
+#define FD_TILE_TEST    1
 #include "fd_snapct_tile.c"
+#undef fd_stem_publish
 #include <stdlib.h>
+#include <sys/epoll.h>
+
+/* after_credit reads the tile clock and the waker readiness word */
+static ulong test_waker_fseq[ FD_FSEQ_FOOTPRINT/sizeof(ulong) ] __attribute__((aligned(FD_FSEQ_ALIGN)));
+
+static void
+test_ctx_wake_init( fd_snapct_tile_t * ctx ) {
+  fd_clock_tile_init( ctx->clock );
+  ctx->waker_fseq = fd_fseq_join( fd_fseq_new( test_waker_fseq, 0UL ) );
+  FD_TEST( ctx->waker_fseq );
+}
 
 #define TEST_SSPING_SEED    (0x0123456789abcdefUL)
 #define TEST_GOSSIP_CI_SEED (0x123456789abcdef0UL)
@@ -54,6 +98,7 @@ setup_gossip_only_snapct( void *                       scratch,
   FD_SCRATCH_ALLOC_INIT( l, scratch );
   fd_snapct_tile_t * ctx  = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_snapct_tile_t),  sizeof(fd_snapct_tile_t)       );
   memset( ctx, 0, sizeof(fd_snapct_tile_t) );
+  test_ctx_wake_init( ctx );
   gossip_ci_entry_t * ci_table = FD_SCRATCH_ALLOC_APPEND( l, alignof(gossip_ci_entry_t), sizeof(gossip_ci_entry_t)*GOSSIP_PEERS_MAX );
   void *              ci_map   = FD_SCRATCH_ALLOC_APPEND( l, gossip_ci_map_align(),      gossip_ci_map_footprint( gossip_ci_map_chain_cnt_est( GOSSIP_PEERS_MAX ) ) );
 
@@ -111,6 +156,7 @@ setup_blacklist_snapct( void *              scratch,
   FD_SCRATCH_ALLOC_INIT( l, scratch );
   fd_snapct_tile_t * ctx = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_snapct_tile_t), sizeof(fd_snapct_tile_t) );
   memset( ctx, 0, sizeof(fd_snapct_tile_t) );
+  test_ctx_wake_init( ctx );
 
   void * _selector = FD_SCRATCH_ALLOC_APPEND( l, fd_sspeer_selector_align(), fd_sspeer_selector_footprint( TOTAL_PEERS_MAX )                  );
   void * _bl_pool  = FD_SCRATCH_ALLOC_APPEND( l, blacklist_pool_align(),     blacklist_pool_footprint( bl_max )                               );
@@ -139,6 +185,7 @@ setup_full_snapct( void *                       scratch,
   FD_SCRATCH_ALLOC_INIT( l, scratch );
   fd_snapct_tile_t *  ctx      = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_snapct_tile_t),  sizeof(fd_snapct_tile_t)                                                   );
   memset( ctx, 0, sizeof(fd_snapct_tile_t) );
+  test_ctx_wake_init( ctx );
   gossip_ci_entry_t * ci_table = FD_SCRATCH_ALLOC_APPEND( l, alignof(gossip_ci_entry_t), sizeof(gossip_ci_entry_t)*GOSSIP_PEERS_MAX                                 );
   void *              ci_map   = FD_SCRATCH_ALLOC_APPEND( l, gossip_ci_map_align(),      gossip_ci_map_footprint( gossip_ci_map_chain_cnt_est( GOSSIP_PEERS_MAX ) ) );
   void *              sel      = FD_SCRATCH_ALLOC_APPEND( l, fd_sspeer_selector_align(), fd_sspeer_selector_footprint( TOTAL_PEERS_MAX )                            );
@@ -276,6 +323,7 @@ static void
 test_load_complete_signal( void ) {
   fd_snapct_tile_t ctx[1];
   memset( ctx, 0, sizeof(fd_snapct_tile_t) );
+  test_ctx_wake_init( ctx );
 
   /* snapld_frag never dereferences stem in the paths below. */
 
@@ -680,6 +728,72 @@ test_contact_info_public_to_invalid_update( fd_ssping_t * ssping ) {
   free( scratch );
 }
 
+static void
+test_start_after_init_acks( void ) {
+  void *            scratch = aligned_alloc( scratch_align(), scratch_footprint( NULL ) ); FD_TEST( scratch );
+  fd_snapct_tile_t * ctx     = scratch;
+  static uchar output[ 16384UL ] __attribute__((aligned(FD_CHUNK_ALIGN)));
+  void * sel = aligned_alloc( fd_sspeer_selector_align(), fd_sspeer_selector_footprint( TOTAL_PEERS_MAX ) ); FD_TEST( sel );
+  gossip_ci_entry_t * ci_table = aligned_alloc( alignof(gossip_ci_entry_t), sizeof(gossip_ci_entry_t)*GOSSIP_PEERS_MAX ); FD_TEST( ci_table );
+  void * ci_map = aligned_alloc( gossip_ci_map_align(), gossip_ci_map_footprint( gossip_ci_map_chain_cnt_est( GOSSIP_PEERS_MAX ) ) ); FD_TEST( ci_map );
+  for( int file=0; file<2; file++ ) {
+    for( int full=0; full<2; full++ ) {
+      fd_memset( ctx, 0, sizeof(*ctx) );
+      test_ctx_wake_init( ctx );
+      ctx->selector      = fd_sspeer_selector_join( fd_sspeer_selector_new( sel, TOTAL_PEERS_MAX, TEST_SELECTOR_SEED ) );
+      fd_memset( ci_table, 0, sizeof(gossip_ci_entry_t)*GOSSIP_PEERS_MAX );
+      ctx->gossip.ci_table = ci_table;
+      ctx->gossip.ci_map   = gossip_ci_map_join( gossip_ci_map_new( ci_map, gossip_ci_map_chain_cnt_est( GOSSIP_PEERS_MAX ), TEST_GOSSIP_CI_SEED ) );
+      ctx->state         = file ? (full ? FD_SNAPCT_STATE_READING_FULL_FILE : FD_SNAPCT_STATE_READING_INCREMENTAL_FILE)
+                                : (full ? FD_SNAPCT_STATE_READING_FULL_HTTP : FD_SNAPCT_STATE_READING_INCREMENTAL_HTTP);
+      ctx->flush_ack_cnt = 9;
+      ctx->out_ld.mem    = (fd_wksp_t *)output;
+      ctx->out_ld.wmark  = 128UL;
+
+      test_output      = output;
+      test_publish_cnt = 0UL;
+
+      /* Exercise INIT serialization without creating a download output
+         file. */
+      init_load( ctx, NULL, full, 1 );
+      FD_TEST( test_publish_cnt==1UL && test_publish_sz==sizeof(fd_ssctrl_init_t) );
+      ulong           init_chunk = test_publish_chunk;
+      fd_ssctrl_init_t saved_init = *(fd_ssctrl_init_t *)output;
+      ctx->peer.addr                    = test_addr( 0x7f000001U, 8899 );
+      ctx->resolved_servers_cnt          = 1UL;
+      ctx->resolved_servers[ 0 ].addr     = ctx->peer.addr;
+      ctx->resolved_servers[ 0 ].is_https = 1;
+      fd_cstr_ncpy( ctx->resolved_servers[ 0 ].hostname, "snapshots.example", FD_FQDN_BUF_MAX );
+      ulong sig  = full ? FD_SNAPSHOT_MSG_CTRL_INIT_FULL : FD_SNAPSHOT_MSG_CTRL_INIT_INCR;
+      int   busy = 0;
+      for( int ack=0; ack<ctx->flush_ack_cnt; ack++ ) {
+        after_credit( ctx, NULL, NULL, &busy );
+        FD_TEST( !ctx->start_sent && test_publish_cnt==1UL );
+        if( !ack ) snapld_frag( ctx, sig, 0UL, 0UL, NULL );
+        else       ctrl_ack_frag( ctx, sig );
+      }
+      after_credit( ctx, NULL, NULL, &busy );
+      FD_TEST( ctx->start_sent && test_publish_cnt==2UL );
+      FD_TEST( test_publish_sig==FD_SNAPSHOT_MSG_CTRL_START );
+      FD_TEST( test_publish_sz==(file ? 0UL : sizeof(fd_ssctrl_start_t)) );
+      FD_TEST( test_publish_chunk!=init_chunk );
+      FD_TEST( !memcmp( output, &saved_init, sizeof(saved_init) ) );
+      if( !file ) {
+        FD_TEST( test_start.addr.l==ctx->peer.addr.l && test_start.is_https );
+        FD_TEST( !strcmp( test_start.hostname, "snapshots.example" ) );
+        FD_TEST( !strcmp( test_start.path, full ? "/snapshot.tar.bz2" : "/incremental-snapshot.tar.bz2" ) );
+        FD_TEST( test_start.path_len==strlen( test_start.path ) );
+      }
+      after_credit( ctx, NULL, NULL, &busy );
+      FD_TEST( test_publish_cnt==2UL );
+    }
+  }
+  free( ci_map );
+  free( ci_table );
+  free( sel );
+  free( scratch );
+}
+
 int
 main( int     argc,
       char ** argv ) {
@@ -697,12 +811,15 @@ main( int     argc,
   test_block_list_contact_info_insert();
   test_contact_info_slot_reuse_after_unallowed_peer_expires();
   test_load_complete_signal();
+  test_start_after_init_acks();
 
   /* Shared ssping: can only be created once (opens real sockets). */
   ulong ssping_max = 16UL;
   void * _ssping_mem = aligned_alloc( fd_ssping_align(), fd_ssping_footprint( ssping_max ) );
   FD_TEST( _ssping_mem );
-  fd_ssping_t * ssping = fd_ssping_join( fd_ssping_new( _ssping_mem, ssping_max, TEST_SSPING_SEED, on_ping_stub, NULL ) );
+  int epoll_fd = epoll_create1( 0 );
+  FD_TEST( epoll_fd!=-1 );
+  fd_ssping_t * ssping = fd_ssping_join( fd_ssping_new( _ssping_mem, ssping_max, TEST_SSPING_SEED, on_ping_stub, NULL, epoll_fd ) );
   FD_TEST( ssping );
 
   test_contact_info_public_rpc_address( ssping );

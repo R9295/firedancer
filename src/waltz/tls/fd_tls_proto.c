@@ -13,24 +13,6 @@ static uchar const hello_retry_magic[ 32 ] =
     0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E,
     0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C };
 
-#define FD_TLS_ENCODE_EXT_BEGIN( type )                         \
-  do {                                                          \
-    int valid = 1;                                              \
-    FD_TLS_SERDE_LOCATE( ext_type, _, ushort, 1 );              \
-    FD_TLS_SERDE_LOCATE( ext_sz,   _, ushort, 1 );              \
-    FD_TLS_SERDE_CHECK                                          \
-    ushort *    ext_type_ptr = (ushort *)_field_ext_type_laddr; \
-    ushort *    ext_sz_ptr   = (ushort *)_field_ext_sz_laddr;   \
-    ulong const ext_start    = wire_laddr;                      \
-    *ext_type_ptr = fd_ushort_bswap( type );
-
-#define FD_TLS_ENCODE_EXT_END                    \
-    ulong ext_sz = wire_laddr - ext_start;       \
-    if( FD_UNLIKELY( ext_sz > USHORT_MAX ) )     \
-      return -(long)FD_TLS_ALERT_INTERNAL_ERROR; \
-    *ext_sz_ptr = fd_ushort_bswap( ext_sz );     \
-  } while(0)
-
 /* Decode ClientHello (RFC 8446 Section 4.1.2) */
 long
 fd_tls_decode_client_hello( fd_tls_client_hello_t * out,
@@ -231,12 +213,18 @@ fd_tls_encode_client_hello( fd_tls_client_hello_t const * in,
   /* Advertise the signature algorithms the caller opted into, in
      descending order of preference */
 
-  ushort ext_sigalg[2];
+  ushort ext_sigalg[5];
   ulong  ext_sigalg_cnt = 0UL;
   if( in->signature_algorithms.ecdsa_secp256r1_sha256 )
     ext_sigalg[ ext_sigalg_cnt++ ] = FD_TLS_SIGNATURE_ECDSA_SECP256R1_SHA256;
   if( in->signature_algorithms.ed25519 )
     ext_sigalg[ ext_sigalg_cnt++ ] = FD_TLS_SIGNATURE_ED25519;
+  if( in->signature_algorithms.rsa_pss_rsae_sha256 )
+    ext_sigalg[ ext_sigalg_cnt++ ] = FD_TLS_SIGNATURE_RSA_PSS_RSAE_SHA256;
+  if( in->signature_algorithms.rsa_pss_rsae_sha384 )
+    ext_sigalg[ ext_sigalg_cnt++ ] = FD_TLS_SIGNATURE_RSA_PSS_RSAE_SHA384;
+  if( in->signature_algorithms.rsa_pss_rsae_sha512 )
+    ext_sigalg[ ext_sigalg_cnt++ ] = FD_TLS_SIGNATURE_RSA_PSS_RSAE_SHA512;
   if( FD_UNLIKELY( !ext_sigalg_cnt ) ) return -(long)FD_TLS_ALERT_INTERNAL_ERROR;
 
   ushort ext_sigalg_ext_type = FD_TLS_EXT_SIGNATURE_ALGORITHMS;
@@ -265,14 +253,16 @@ fd_tls_encode_client_hello( fd_tls_client_hello_t const * in,
     FD_TLS_ENCODE_STATIC_BATCH( FIELDS )
 # undef FIELDS
 
-  if( in->signature_algorithms_cert.ed25519 ||
-      in->signature_algorithms_cert.ecdsa_secp256r1_sha256 ||
-      in->signature_algorithms_cert.ecdsa_secp384r1_sha384 ) {
-    ushort schemes[3];
+  do {
+    ushort schemes[6];
     ulong  cnt = 0UL;
     if( in->signature_algorithms_cert.ecdsa_secp256r1_sha256 ) schemes[cnt++] = FD_TLS_SIGNATURE_ECDSA_SECP256R1_SHA256;
     if( in->signature_algorithms_cert.ecdsa_secp384r1_sha384 ) schemes[cnt++] = FD_TLS_SIGNATURE_ECDSA_SECP384R1_SHA384;
     if( in->signature_algorithms_cert.ed25519                ) schemes[cnt++] = FD_TLS_SIGNATURE_ED25519;
+    if( in->signature_algorithms_cert.rsa_pkcs1_sha256       ) schemes[cnt++] = FD_TLS_SIGNATURE_RSA_PKCS1_SHA256;
+    if( in->signature_algorithms_cert.rsa_pkcs1_sha384       ) schemes[cnt++] = FD_TLS_SIGNATURE_RSA_PKCS1_SHA384;
+    if( in->signature_algorithms_cert.rsa_pkcs1_sha512       ) schemes[cnt++] = FD_TLS_SIGNATURE_RSA_PKCS1_SHA512;
+    if( !cnt ) break;
     ushort type    = FD_TLS_EXT_SIGNATURE_ALGORITHMS_CERT;
     ushort list_sz = (ushort)(2UL*cnt);
     ushort ext_sz  = (ushort)(list_sz+2U);
@@ -283,7 +273,7 @@ fd_tls_encode_client_hello( fd_tls_client_hello_t const * in,
       FIELD( 3, schemes,  ushort, cnt )
       FD_TLS_ENCODE_STATIC_BATCH( FIELDS )
 #   undef FIELDS
-  }
+  } while(0);
 
   /* Add Server Name Indication (SNI) */
 
@@ -499,7 +489,7 @@ fd_tls_encode_server_hello( fd_tls_server_hello_t const * in,
     FD_TLS_ENCODE_STATIC_BATCH( FIELDS )
 # undef FIELDS
 
-  *extension_tot_sz = fd_ushort_bswap( (ushort)( (ulong)wire_laddr - extension_start ) );
+  FD_STORE( ushort, extension_tot_sz, fd_ushort_bswap( (ushort)( (ulong)wire_laddr - extension_start ) ) );
   return (long)( wire_laddr - (ulong)wire );
 }
 
@@ -548,7 +538,7 @@ fd_tls_encode_hello_retry_request( fd_tls_server_hello_t const * in,
     FD_TLS_ENCODE_STATIC_BATCH( FIELDS )
 # undef FIELDS
 
-  *extension_tot_sz = fd_ushort_bswap( (ushort)( (ulong)wire_laddr - extension_start ) );
+  FD_STORE( ushort, extension_tot_sz, fd_ushort_bswap( (ushort)( (ulong)wire_laddr - extension_start ) ) );
   return (long)( wire_laddr - (ulong)wire );
 }
 
@@ -785,6 +775,13 @@ fd_tls_decode_cert_verify( fd_tls_cert_verify_t * out,
     if( FD_UNLIKELY( sig_sz > 73U || sig_sz < 8U ) )
       return -(long)FD_TLS_ALERT_ILLEGAL_PARAMETER;
     break;
+  case FD_TLS_SIGNATURE_RSA_PSS_RSAE_SHA256:
+  case FD_TLS_SIGNATURE_RSA_PSS_RSAE_SHA384:
+  case FD_TLS_SIGNATURE_RSA_PSS_RSAE_SHA512:
+    /* Signature is the size of the modulus */
+    if( FD_UNLIKELY( sig_sz > FD_RSA_MOD_SZ_MAX || sig_sz < FD_RSA_MOD_BITS_MIN/8UL ) )
+      return -(long)FD_TLS_ALERT_ILLEGAL_PARAMETER;
+    break;
   default:
     return -(long)FD_TLS_ALERT_ILLEGAL_PARAMETER;
   }
@@ -948,6 +945,24 @@ fd_tls_decode_ext_signature_algorithms( fd_tls_ext_signature_algorithms_t * out,
     case FD_TLS_SIGNATURE_ECDSA_SECP384R1_SHA384:
       out->ecdsa_secp384r1_sha384 = 1;
       break;
+    case FD_TLS_SIGNATURE_RSA_PKCS1_SHA256:
+      out->rsa_pkcs1_sha256 = 1;
+      break;
+    case FD_TLS_SIGNATURE_RSA_PKCS1_SHA384:
+      out->rsa_pkcs1_sha384 = 1;
+      break;
+    case FD_TLS_SIGNATURE_RSA_PKCS1_SHA512:
+      out->rsa_pkcs1_sha512 = 1;
+      break;
+    case FD_TLS_SIGNATURE_RSA_PSS_RSAE_SHA256:
+      out->rsa_pss_rsae_sha256 = 1;
+      break;
+    case FD_TLS_SIGNATURE_RSA_PSS_RSAE_SHA384:
+      out->rsa_pss_rsae_sha384 = 1;
+      break;
+    case FD_TLS_SIGNATURE_RSA_PSS_RSAE_SHA512:
+      out->rsa_pss_rsae_sha512 = 1;
+      break;
     default:
       /* Ignore unsupported signature algorithms ... */
       break;
@@ -1099,7 +1114,7 @@ fd_tls_extract_cert_pubkey_( fd_tls_extract_cert_pubkey_res_t * res,
     /* We never solicit CertificateEntry extensions (RFC 8446 Section
        4.4.2), so the extensions vector must be empty */
     ushort const * ext_sz_be = FD_TLS_SKIP_FIELD( ushort );
-    ulong          ext_sz    = fd_ushort_bswap( *ext_sz_be );
+    ulong          ext_sz    = fd_ushort_bswap( FD_LOAD( ushort, ext_sz_be ) );
     if( FD_UNLIKELY( ext_sz > wire_sz ) ) return -(long)FD_TLS_ALERT_DECODE_ERROR;
     if( FD_UNLIKELY( ext_sz ) ) return -(long)FD_TLS_ALERT_UNSUPPORTED_EXTENSION;
   }

@@ -94,6 +94,12 @@ struct fd_snapshot_manifest_vote_stakes {
   /* The validator's commission rate as of the given epoch. */
   ushort commission;
 
+  /* The validator's block revenue commission (basis points) */
+  ushort commission_block_bps;
+
+  /* The validator's pending delegator rewards as of the given epoch */
+  ulong  pending_delegator_rewards;
+
   /* The epoch credits array tracks the history of how many credits the
      provided vote account earned in each recorded epoch.  Entries are
      ordered by strictly increasing epoch: epoch_credits[0] is the
@@ -433,6 +439,12 @@ struct fd_snapshot_manifest {
 
      where <epoch> assumes these values:
 
+       E-3 - represents the stakes at the beginning of epoch E-4.
+       E-2 - represents the stakes at the beginning of epoch E-3.
+             Agave retains MAX_LEADER_SCHEDULE_STAKES (5) entries and
+             a block footer may carry a finalization cert from any
+             epoch it retains, so these are loaded as well.
+
        E-1 - represents the stakes at the beginning of epoch E-2,
              used to compute the leader schedule at E-1.  Also used
              by delay_commission_updates (SIMD-0249) to determine
@@ -445,10 +457,14 @@ struct fd_snapshot_manifest {
        E+1 - represents the stakes at the beginning of epoch E,
              used to compute the leader schedule at E+1.
 
-     The epoch stakes are stored in an array:
-       epoch_stakes[0] = epoch E-1
-       epoch_stakes[1] = epoch E
-       epoch_stakes[2] = epoch E+1 */
+     The epoch stakes are stored in an array indexed from
+     epoch_stakes_base = max( E-3, 0 ):
+       epoch_stakes[0] = epoch E-3
+       epoch_stakes[1] = epoch E-2
+       epoch_stakes[2] = epoch E-1
+       epoch_stakes[3] = epoch E
+       epoch_stakes[4] = epoch E+1
+     Entries the snapshot does not carry keep epoch ULONG_MAX. */
   fd_snapshot_manifest_epoch_stakes_t epoch_stakes[ FD_RUNTIME_MANIFEST_EPOCH_STAKES_LEN ];
 };
 

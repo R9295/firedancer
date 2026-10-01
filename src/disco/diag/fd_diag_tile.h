@@ -2,6 +2,7 @@
 #define HEADER_fd_src_disco_diag_fd_diag_tile_h
 
 #include "../fd_disco_base.h"
+#include "../topo/fd_cpu_topo.h"
 
 #define FD_DIAG_BUNDLE_STATUS_DISABLED     (0UL) /* No bundle tiles configured */
 #define FD_DIAG_BUNDLE_STATUS_DISCONNECTED (1UL) /* All bundle tiles disconnected */
@@ -9,10 +10,11 @@
 #define FD_DIAG_BUNDLE_STATUS_CONNECTED    (3UL) /* At least one bundle tile connected */
 #define FD_DIAG_BUNDLE_STATUS_SLEEPING     (4UL) /* At least one bundle tile sleeping, none connected */
 
-#define FD_DIAG_VOTE_STATUS_DISABLED    (0UL) /* Non-voting or no tower tile */
-#define FD_DIAG_VOTE_STATUS_NOT_STARTED (1UL) /* Tower tile not running or no votes cast yet */
-#define FD_DIAG_VOTE_STATUS_DELINQUENT  (2UL) /* Vote distance exceeds threshold or vote stalled */
-#define FD_DIAG_VOTE_STATUS_VOTING      (3UL) /* Voting normally */
+#define FD_DIAG_VOTE_STATUS_DISABLED     (0UL) /* Non-voting or no tower tile */
+#define FD_DIAG_VOTE_STATUS_NOT_STARTED  (1UL) /* Tower tile not running or no votes cast yet */
+#define FD_DIAG_VOTE_STATUS_DELINQUENT   (2UL) /* Vote distance exceeds threshold or vote stalled */
+#define FD_DIAG_VOTE_STATUS_VOTING       (3UL) /* Voting normally */
+#define FD_DIAG_VOTE_STATUS_INADMISSIBLE (4UL) /* Voting, but vote account fails the admission ticket filter */
 
 #define FD_DIAG_REPLAY_STATUS_DISABLED    (0UL) /* No replay tile */
 #define FD_DIAG_REPLAY_STATUS_NOT_STARTED (1UL) /* Replay tile not running or slots are zero */
@@ -24,6 +26,12 @@
 #define FD_DIAG_TURBINE_STATUS_STALLED          (2UL) /* Turbine slot not advancing */
 #define FD_DIAG_TURBINE_STATUS_REPAIR_OUTPACING (3UL) /* Repair byte throughput exceeds turbine */
 #define FD_DIAG_TURBINE_STATUS_RUNNING          (4UL) /* Turbine receiving normally */
+
+#define FD_DIAG_BUILDER_STATUS_DISABLED     (0UL)
+#define FD_DIAG_BUILDER_STATUS_DISCONNECTED (1UL)
+#define FD_DIAG_BUILDER_STATUS_CONNECTING   (2UL)
+#define FD_DIAG_BUILDER_STATUS_UNHEALTHY    (3UL)
+#define FD_DIAG_BUILDER_STATUS_CONNECTED    (4UL)
 
 #define FD_DIAG_SYSTEM_CPU_MAX      (1024UL)
 #define FD_DIAG_SYSTEM_NUMA_MAX     (64UL)
@@ -41,9 +49,20 @@ struct fd_diag_system_cpu {
   ushort cpu_idx;
   ushort numa_idx;
   ushort sibling_idx; /* USHORT_MAX when unavailable/offline */
+  ushort die_idx;
   uchar  online;
 };
 typedef struct fd_diag_system_cpu fd_diag_system_cpu_t;
+
+static inline void
+fd_diag_system_cpu_init( fd_diag_system_cpu_t * cpu,
+                         fd_topo_cpu_t const *  topo_cpu ) {
+  cpu->cpu_idx     = (ushort)topo_cpu->idx;
+  cpu->numa_idx    = (ushort)topo_cpu->numa_node;
+  cpu->sibling_idx = topo_cpu->sibling==ULONG_MAX ? USHORT_MAX : (ushort)topo_cpu->sibling;
+  cpu->die_idx     = topo_cpu->die_idx==ULONG_MAX ? USHORT_MAX : (ushort)topo_cpu->die_idx;
+  cpu->online      = (uchar)topo_cpu->online;
+}
 
 struct fd_diag_system_numa_mem {
   ushort numa_idx;

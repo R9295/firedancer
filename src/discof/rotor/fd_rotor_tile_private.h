@@ -5,7 +5,20 @@
 
 #include "../../flamenco/gossip/fd_gossip_message.h"
 #include "../repair/fd_repair.h"
+#include "../repair/fd_repair_metrics.h"
+#include "../repair/fd_inflight.h"
+#include "../repair/fd_policy.h"
+#include "../chainer/fd_chainer.h"
+#include "fd_schedulor.h"
+#include "fd_requestor.h"
+#include "../../disco/fd_clock_tile.h"
+#include "../../disco/events/generated/fd_event_gen.h"
+#include "../../disco/keyguard/fd_keyswitch.h"
+#include "../../disco/metrics/fd_metrics.h"
 #include "../../disco/net/fd_net_tile.h"
+#include "../../disco/shred/fd_rnonce_ss.h"
+#include "../../disco/store/fd_store.h"
+#include "../../disco/topo/fd_topo.h"
 #include "../../util/net/fd_net_headers.h"
 
 typedef union {
@@ -86,12 +99,132 @@ typedef struct sign_pending sign_pending_t;
 #define QUEUE_MAX        (2*FD_REPAIR_PEER_MAX)
 #include "../../util/tmpl/fd_queue.c"
 
-/* ag_req_queue stores alpenglow metadata repair requests.  We can cap
-   this queue at 1024 requests, as long as after_credit drains all
-   meta requests. */
+#define IN_KIND_CONTACT (0)
+#define IN_KIND_NET     (1)
+#define IN_KIND_SHRED   (2)
+#define IN_KIND_SIGN    (3)
+#define IN_KIND_SNAP    (4)
+#define IN_KIND_GOSSIP  (5)
+#define IN_KIND_GENESIS (6)
+#define IN_KIND_REPLAY  (7)
+#define IN_KIND_VOTOR   (8)
 
-#define QUEUE_NAME       meta_queue
-#define QUEUE_T          fd_repair_msg_t
-#include "../../util/tmpl/fd_queue_dynamic.c"
+#define MAX_IN_LINKS      (32)
+#define MAX_SIGN_TILE_CNT (16UL)
+struct ctx {
+  fd_clock_tile_t clock[1];
+
+  ulong       repair_seed;
+  fd_pubkey_t identity_public_key;
+
+  fd_chainer_t *      chainer;   /* slot version / FEC store */
+  fd_schedulor_t *    schedulor; /* blocks to check, by timeout */
+  fd_requestor_t *    requestor; /* cursor walk of the block being repaired */
+  fd_repair_t *       protocol;  /* repair message construction */
+  fd_policy_t *       policy;    /* repair peers and selection */
+  fd_inflights_t *    rtt;       /* sent requests by nonce, for response latency only */
+
+  fd_event_block_received_t * receive_event;
+
+  fd_store_t *     store;     /* rotor publishes/removes FEC sets to/from the store */
+  fd_store_map_t   store_map[1];
+
+  fd_keyswitch_t * keyswitch;
+  int              halt_signing;
+
+  /* When set, publish_fec_replay re-publishes the entire ancestry path
+     of FECs from the chainer root down to the FEC being delivered, so
+     replay can reconstruct a fork it evicted.  See fd_rotor_tile.h. */
+  int         deliver_from_root;
+  out_ele_t * redeliver;
+  ulong       replay_root_slot;
+  fd_hash_t   replay_root_hash;
+
+  /* Pending sign requests */
+
+  uint            pending_key_next;
+  sign_req_t *     signs_map;
+  sign_pending_t * toss_queue;
+
+  fd_wksp_t * wksp;
+
+  fd_stem_context_t * stem;
+
+  uchar    in_kind [ MAX_IN_LINKS ];
+  in_ctx_t in_links[ MAX_IN_LINKS ];
+
+
+  out_ctx_t net_out_ctx   [1];
+  out_ctx_t replay_out_ctx[1];
+  out_ctx_t rserve_out_ctx[1]; /* idx==UINT_MAX if rserve is disabled */
+
+  /* repair_sign links (to sign tiles 1+), round-robin */
+  ulong     repair_sign_cnt;
+  out_ctx_t repair_sign_out_ctx[ MAX_SIGN_TILE_CNT ];
+
+  /* Buffer for incoming net frags */
+  uchar net_buf[ FD_NET_MTU ];
+
+  /* The snapshot manifest arrives on one frag and is applied on the
+     DONE frag that follows; snapin_manif is reliable so the chunk
+     stays valid in between. */
+  ulong manifest_chunk;
+
+  ushort            net_id;
+  fd_ip4_udp_hdrs_t intake_hdr[1];
+
+  fd_rnonce_ss_t repair_nonce_ss[1];
+  uint           ag_nonce; /* counter nonce for alpenglow metadata requests */
+
+  ulong turbine_slot0; /* first turbine slot seen */
+  int   catchup_seeded; /* the root..turbine_slot0 seed burst has been sent */
+  ulong current_slot;  /* highest turbine slot seen */
+
+  struct {
+    ulong send_pkt_cnt;
+    ulong sent_by_kind[ 16 ];
+    ulong checks;
+    ulong no_peer;
+    ulong malformed_ping;
+    ulong unknown_peer_ping;
+    ulong fail_sigverify_ping;
+    ulong unsolicited_meta;
+    ulong failed_parent_fec_count;
+    ulong failed_fec_root;
+    ulong fecs_delivered;
+    ulong shred_old;               /* shreds at or below the root */
+    ulong sign_unavail;            /* no sign tile credit available */
+
+    /* the two replay message kinds rotor acts on, counted in before_frag */
+    ulong replay_root_advanced;
+    ulong replay_missing_fec;
+
+    /* response side */
+    ulong repair_shred_rx;         /* data shreds that arrived as repair responses */
+    ulong shred_match_block_id;    /* ... credited to a ShredForBlockId request */
+    ulong shred_match_positional;  /* ... credited to a positional Shred request */
+    ulong shred_match_miss;        /* ... matching no outstanding request */
+    ulong meta_rx;                 /* metadata responses received */
+    ulong meta_malformed;          /* ... that failed to decode */
+    ulong meta_ok_parent_fec_count;
+    ulong meta_ok_fec_root;
+
+    fd_histf_t response_latency[ 1 ];
+  } metrics[ 1 ];
+
+  /* Slot-level metrics */
+
+  fd_repair_metrics_t * slot_metrics;
+
+  /* Highest slot rotor has completed a FEC set for off the network,
+     our own leader FEC sets excluded.  This is the cluster tip, and it is rotor's to
+     track: replay used to derive it from the FEC sets repair forwarded
+     indiscriminately, but rotor delivers only what is replayable and
+     in order, so a delivered FEC's slot is the replay frontier rather
+     than the tip.  Shipped to replay on every delivered FEC.  0 until
+     the first FEC set completes. */
+  ulong                 highest_fec_complete_slot;
+};
+typedef struct ctx ctx_t;
 
 #endif /* HEADER_fd_src_discof_rotor_fd_rotor_tile_private_h */

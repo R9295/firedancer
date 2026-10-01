@@ -8,10 +8,10 @@
 #endif
 
 /* FEATURE_ID_CNT is the number of features in ids */
-#define FD_FEATURE_ID_CNT (296UL)
+#define FD_FEATURE_ID_CNT (301UL)
 
 /* Feature set ID calculated from all feature names */
-#define FD_FEATURE_SET_ID (219526686U)
+#define FD_FEATURE_SET_ID (1766517360U)
 
 union fd_features {
   ulong f[ FD_FEATURE_ID_CNT ];
@@ -299,10 +299,10 @@ union fd_features {
     /* 0x2bc8c7833f988c0a */ ulong reduce_slot_time_to_200ms;
     /* 0xf2d71f1fc49f0d35 */ ulong set_lamports_per_byte_to_6333;
     /* 0x805cef511fbe564a */ ulong set_lamports_per_byte_to_5080;
-    /* 0x413e7499321753dd */ ulong set_lamports_per_byte_to_2575;
-    /* 0xb8e3d94b5613cdeb */ ulong set_lamports_per_byte_to_1322;
-    /* 0x078408ee87746a0b */ ulong set_lamports_per_byte_to_696;
-    /* 0x0b606154993bf43d */ ulong set_lamports_per_byte_to_6960;
+    /* 0x2c05ce7fe856c10c */ ulong set_lamports_per_byte_to_2575;
+    /* 0xdbc6433ff156c10c */ ulong set_lamports_per_byte_to_1322;
+    /* 0x0c7d6b2d3358c10c */ ulong set_lamports_per_byte_to_696;
+    /* 0x542d5add8c56c10c */ ulong set_lamports_per_byte_to_6960;
     /* 0x4153c63f859c899c */ ulong relax_post_exec_min_balance_check;
     /* 0xe8f8dc2ca192d30c */ ulong upgrade_bpf_stake_program_to_v5_1;
     /* 0x1dd8741ccebef821 */ ulong custom_commission_collector;
@@ -312,5 +312,10 @@ union fd_features {
     /* 0xb2513619e40fef85 */ ulong alpenglow;
     /* 0x1e7f253e967667d3 */ ulong relax_fee_payer_constraint;
     /* 0x77d57539c0a4f4d4 */ ulong alpenglow_fast_leader_handover;
+    /* 0x76648e7186624c0d */ ulong enforce_correct_proof_size;
+    /* 0xd97500e64edd695e */ ulong block_revenue_sharing;
+    /* 0x351933dc20486107 */ ulong vote_account_initialize_v2;
+    /* 0x7b717607817b2451 */ ulong raise_cpi_nesting_limit_to_8;
+    /* 0x0aa7b29de47f96cb */ ulong loader_v3_set_program_data_to_elf_length;
   };
 };

@@ -153,7 +153,9 @@ get_net_stats( ulong volatile const * net_metrics[ FD_TOPO_MAX_TILES ],
     if( dt<=(long)10e6 ) continue;
 
     ulong cum_idle_now  = metrics[ MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG        ) ];
+    /* */ cum_idle_now += metrics[ MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_SLEEPING        ) ];
     ulong cum_tick_now  = cum_idle_now;
+    /* */ cum_tick_now += metrics[ MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_SLEEPING     ) ];
     /* */ cum_tick_now += metrics[ MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_HOUSEKEEPING    ) ];
     /* */ cum_tick_now += metrics[ MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_PROCESSING_HOUSEKEEPING   ) ];
     /* */ cum_tick_now += metrics[ MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_HOUSEKEEPING ) ];
@@ -315,6 +317,7 @@ pktgen_cmd_fn( args_t *   args FD_PARAM_UNUSED,
     FD_LOG_ERR(( "failed to parse prometheus listen address `%s`", config->tiles.metric.prometheus_listen_address ));
   metric_tile->metric.prometheus_listen_port = config->tiles.metric.prometheus_listen_port;
 
+  configure_stage( &fd_cfg_stage_uverbs,           CONFIGURE_CMD_INIT, config );
   configure_stage( &fd_cfg_stage_sysctl,           CONFIGURE_CMD_INIT, config );
   configure_stage( &fd_cfg_stage_hugetlbfs,        CONFIGURE_CMD_INIT, config );
   configure_stage( &fd_cfg_stage_bonding,          CONFIGURE_CMD_INIT, config );

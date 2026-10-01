@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "fd_svm_mini.h"
+#include "../fd_runtime_stack_tmpl.h"
 #include "../../progcache/fd_progcache_admin.h"
 #include "../../progcache/fd_progcache_user.h"
 #include "../../runtime/fd_bank.h"
@@ -13,6 +14,7 @@
 #include "../../runtime/sysvar/fd_sysvar_epoch_schedule.h"
 #include "../../runtime/sysvar/fd_sysvar_slot_history.h"
 #include "../../runtime/program/fd_vote_program.h"
+#include "../../runtime/program/vote/fd_vote_codec_tmpl.h"
 #include "../../stakes/fd_stake_types.h"
 #include "../../stakes/fd_stake_delegations.h"
 #include "../../stakes/fd_vote_stakes.h"
@@ -59,6 +61,13 @@ fd_svm_test_boot( int *    pargc,
                   fd_svm_mini_limits_t const * limits ) {
 
   fd_boot( pargc, pargv );
+
+  int spill_fd = memfd_create( "svm_mini_stakedel_spill", 0 );
+  FD_TEST( spill_fd>=0 );
+  if( spill_fd!=FD_STAKE_DELEGATIONS_FD ) {
+    FD_TEST( dup2( spill_fd, FD_STAKE_DELEGATIONS_FD )==FD_STAKE_DELEGATIONS_FD );
+    FD_TEST( !close( spill_fd ) );
+  }
 
   char const * page_sz_cstr = fd_env_strip_cmdline_cstr ( pargc, pargv, "--page-sz",  NULL, NULL            );
   ulong        page_cnt     = fd_env_strip_cmdline_ulong( pargc, pargv, "--page-cnt", NULL, 0UL             );
@@ -107,13 +116,13 @@ fd_svm_mini_wksp_data_max( fd_svm_mini_limits_t const * limits ) {
   ulong pcache_sz         = fd_progcache_shmem_footprint( txn_max, fd_progcache_shmem_min_sz( txn_max ) );
   ulong txncache_shmem_sz = fd_txncache_shmem_footprint( txn_max, limits->max_txn_per_slot );
   ulong txncache_sz       = fd_txncache_footprint( txn_max );
-  ulong banks_sz          = fd_banks_footprint( txn_max, limits->max_fork_width, limits->max_stake_accounts, limits->max_fallback_stake_accounts, limits->max_vote_accounts );
+  ulong banks_sz          = fd_banks_footprint( txn_max, limits->max_fork_width, limits->max_stake_accounts, limits->max_vote_accounts );
   ulong runtime_stack_sz  = fd_runtime_stack_footprint( limits->max_vote_accounts, limits->max_vote_accounts, limits->max_stake_accounts );
 
   ulong accdb_shmem_sz = fd_accdb_shmem_footprint( limits->max_accounts, limits->max_live_slots,
                                                     TEST_WRITES_PER_SLOT, TEST_PARTITION_CNT,
                                                     TEST_CACHE_FOOTPRINT, TEST_CACHE_MIN_RESERVED, joiner_cnt, 0UL );
-  ulong accdb_join_sz  = fd_accdb_footprint( limits->max_live_slots );
+  ulong accdb_join_sz  = fd_accdb_footprint( limits->max_live_slots, 1 );
 
 # define WKSP_ALLOC(a,s) fd_ulong_align_up( fd_ulong_max((s),1UL), fd_ulong_max((a),FD_WKSP_ALIGN_DEFAULT) )
   ulong sz = 0UL;
@@ -147,14 +156,13 @@ fd_svm_mini_create( fd_wksp_t *                  wksp,
   ulong txncache_shmem_sz = fd_txncache_shmem_footprint( txn_max, limits->max_txn_per_slot );
   ulong txncache_sz       = fd_txncache_footprint( txn_max );
   ulong banks_sz         = fd_banks_footprint( txn_max, limits->max_fork_width,
-                                               limits->max_stake_accounts, limits->max_fallback_stake_accounts,
-                                               limits->max_vote_accounts );
+                                               limits->max_stake_accounts, limits->max_vote_accounts );
   ulong runtime_stack_sz = fd_runtime_stack_footprint( limits->max_vote_accounts, limits->max_vote_accounts, limits->max_stake_accounts );
 
   ulong accdb_shmem_sz = fd_accdb_shmem_footprint( limits->max_accounts, limits->max_live_slots,
                                                     TEST_WRITES_PER_SLOT, TEST_PARTITION_CNT,
                                                     TEST_CACHE_FOOTPRINT, TEST_CACHE_MIN_RESERVED, joiner_cnt, 0UL );
-  ulong accdb_join_sz  = fd_accdb_footprint( limits->max_live_slots );
+  ulong accdb_join_sz  = fd_accdb_footprint( limits->max_live_slots, 1 );
 
   /* Allocate objects */
 
@@ -187,7 +195,7 @@ fd_svm_mini_create( fd_wksp_t *                  wksp,
                           TEST_WRITES_PER_SLOT, TEST_PARTITION_CNT,
                           TEST_PARTITION_SZ, TEST_CACHE_FOOTPRINT, TEST_CACHE_MIN_RESERVED, 0, 42UL, joiner_cnt, 0UL ) );
   FD_TEST( shmem );
-  fd_accdb_t * accdb = fd_accdb_join( fd_accdb_new( accdb_join, shmem, accdb_fd, 0UL, NULL ) );
+  fd_accdb_t * accdb = fd_accdb_join( fd_accdb_new( accdb_join, shmem, accdb_fd, 0UL, NULL, NULL, 0UL, 1 ) );
   FD_TEST( accdb );
 
   /* Save accdb init params for reset */
@@ -205,8 +213,8 @@ fd_svm_mini_create( fd_wksp_t *                  wksp,
   mini->txncache_shmem = shtxncache;
   FD_TEST( (mini->txncache = fd_txncache_join( fd_txncache_new( txncache_mem, shtxncache ) )) );
 
-  mini->banks = fd_banks_join( fd_banks_new( banks_mem, txn_max, limits->max_fork_width,
-                               limits->max_stake_accounts, limits->max_fallback_stake_accounts,
+  mini->banks = fd_banks_join( fd_banks_new( banks_mem, FD_STAKE_DELEGATIONS_FD, txn_max, limits->max_fork_width,
+                               limits->max_stake_accounts, limits->max_disk_records,
                                limits->max_vote_accounts, 0, 8888UL ) );
   FD_TEST( mini->banks );
 
@@ -403,8 +411,7 @@ fd_svm_mini_init_mock_validators( fd_svm_mini_t *              mini,
                                       ULONG_MAX,  /* deactivation_epoch */
                                       0UL,        /* credits_observed */
                                       fd_ulong_max( stake_min_bal, uniform_stake ),
-                                      (uint)FD_STAKE_STATE_SZ,
-                                      FD_STAKE_DELEGATIONS_WARMUP_COOLDOWN_RATE_ENUM_025 /* warmup_cooldown_rate */ );
+                                      (uint)FD_STAKE_STATE_SZ );
 
     stakes[i] = (fd_vote_stake_weight_t){
       .vote_key = vote_key,
@@ -455,7 +462,7 @@ fd_svm_mini_reset( fd_svm_mini_t *        mini,
   FD_TEST( 0==ftruncate( accdb_fd, 0 ) );
 
   /* Re-initialize accdb join in place */
-  fd_accdb_t * accdb = fd_accdb_join( fd_accdb_new( mini->accdb_join_mem, shmem, accdb_fd, 0UL, NULL ) );
+  fd_accdb_t * accdb = fd_accdb_join( fd_accdb_new( mini->accdb_join_mem, shmem, accdb_fd, 0UL, NULL, NULL, 0UL, 1 ) );
   FD_TEST( accdb );
   mini->runtime->accdb = accdb;
 

@@ -4,6 +4,7 @@
 
 #include "../../../util/log/fd_log.h"
 #include "../../../flamenco/runtime/sysvar/fd_sysvar_epoch_schedule.h"
+#include "../../../flamenco/runtime/program/vote/fd_vote_codec.h"
 
 #define SSMANIFEST_DEBUG 0
 
@@ -974,8 +975,8 @@ state_dst( fd_ssmanifest_parser_t * parser ) {
     case STATE_EPOCH_STAKES_VOTE_ACCOUNTS_VALUE_DATA_V4_INFLATION_REWARDS_COLLECTOR:                          return parser->epoch_idx!=ULONG_MAX ? manifest->epoch_stakes[ parser->epoch_idx ].vote_stakes[ idx2 ].commission_inflation : NULL;
     case STATE_EPOCH_STAKES_VOTE_ACCOUNTS_VALUE_DATA_V4_BLOCK_REVENUE_COLLECTOR:                              return parser->epoch_idx!=ULONG_MAX ? manifest->epoch_stakes[ parser->epoch_idx ].vote_stakes[ idx2 ].commission_block : NULL;
     case STATE_EPOCH_STAKES_VOTE_ACCOUNTS_VALUE_DATA_V4_INFLATION_REWARDS_COMMISSION_BPS:                     return parser->epoch_idx!=ULONG_MAX ? (uchar *)&manifest->epoch_stakes[ parser->epoch_idx ].vote_stakes[ idx2 ].commission : NULL;
-    case STATE_EPOCH_STAKES_VOTE_ACCOUNTS_VALUE_DATA_V4_BLOCK_REVENUE_COMMISSION_BPS:                         return NULL;
-    case STATE_EPOCH_STAKES_VOTE_ACCOUNTS_VALUE_DATA_V4_PENDING_DELEGATOR_REWARDS:                            return NULL;
+    case STATE_EPOCH_STAKES_VOTE_ACCOUNTS_VALUE_DATA_V4_BLOCK_REVENUE_COMMISSION_BPS:                         return parser->epoch_idx!=ULONG_MAX ? (uchar *)&manifest->epoch_stakes[ parser->epoch_idx ].vote_stakes[ idx2 ].commission_block_bps : NULL;
+    case STATE_EPOCH_STAKES_VOTE_ACCOUNTS_VALUE_DATA_V4_PENDING_DELEGATOR_REWARDS:                            return parser->epoch_idx!=ULONG_MAX ? (uchar *)&manifest->epoch_stakes[ parser->epoch_idx ].vote_stakes[ idx2 ].pending_delegator_rewards : NULL;
     case STATE_EPOCH_STAKES_VOTE_ACCOUNTS_VALUE_DATA_V4_BLS_PUBKEY_COMPRESSED_OPTION:                         return &parser->option;
     case STATE_EPOCH_STAKES_VOTE_ACCOUNTS_VALUE_DATA_V4_BLS_PUBKEY_COMPRESSED:                                return parser->epoch_idx!=ULONG_MAX ? manifest->epoch_stakes[ parser->epoch_idx ].vote_stakes[ idx2 ].identity_bls : NULL;
     case STATE_EPOCH_STAKES_VOTE_ACCOUNTS_VALUE_DATA_V4_VOTES_LENGTH:                                         return (uchar*)&parser->length4;
@@ -1096,8 +1097,8 @@ state_dst( fd_ssmanifest_parser_t * parser ) {
     case STATE_VERSIONED_EPOCH_STAKES_STAKES_VOTE_ACCOUNTS_VALUE_DATA_V4_INFLATION_REWARDS_COLLECTOR:         return parser->epoch_idx!=ULONG_MAX ? manifest->epoch_stakes[ parser->epoch_idx ].vote_stakes[ idx2 ].commission_inflation : NULL;
     case STATE_VERSIONED_EPOCH_STAKES_STAKES_VOTE_ACCOUNTS_VALUE_DATA_V4_BLOCK_REVENUE_COLLECTOR:             return parser->epoch_idx!=ULONG_MAX ? manifest->epoch_stakes[ parser->epoch_idx ].vote_stakes[ idx2 ].commission_block : NULL;
     case STATE_VERSIONED_EPOCH_STAKES_STAKES_VOTE_ACCOUNTS_VALUE_DATA_V4_INFLATION_REWARDS_COMMISSION_BPS:    return parser->epoch_idx!=ULONG_MAX ? (uchar *)&manifest->epoch_stakes[ parser->epoch_idx ].vote_stakes[ idx2 ].commission : NULL;
-    case STATE_VERSIONED_EPOCH_STAKES_STAKES_VOTE_ACCOUNTS_VALUE_DATA_V4_BLOCK_REVENUE_COMMISSION_BPS:        return NULL;
-    case STATE_VERSIONED_EPOCH_STAKES_STAKES_VOTE_ACCOUNTS_VALUE_DATA_V4_PENDING_DELEGATOR_REWARDS:           return NULL;
+    case STATE_VERSIONED_EPOCH_STAKES_STAKES_VOTE_ACCOUNTS_VALUE_DATA_V4_BLOCK_REVENUE_COMMISSION_BPS:        return parser->epoch_idx!=ULONG_MAX ? (uchar *)&manifest->epoch_stakes[ parser->epoch_idx ].vote_stakes[ idx2 ].commission_block_bps : NULL;
+    case STATE_VERSIONED_EPOCH_STAKES_STAKES_VOTE_ACCOUNTS_VALUE_DATA_V4_PENDING_DELEGATOR_REWARDS:           return parser->epoch_idx!=ULONG_MAX ? (uchar *)&manifest->epoch_stakes[ parser->epoch_idx ].vote_stakes[ idx2 ].pending_delegator_rewards : NULL;
     case STATE_VERSIONED_EPOCH_STAKES_STAKES_VOTE_ACCOUNTS_VALUE_DATA_V4_BLS_PUBKEY_COMPRESSED_OPTION:        return &parser->option;
     case STATE_VERSIONED_EPOCH_STAKES_STAKES_VOTE_ACCOUNTS_VALUE_DATA_V4_BLS_PUBKEY_COMPRESSED:               return parser->epoch_idx!=ULONG_MAX ? manifest->epoch_stakes[ parser->epoch_idx ].vote_stakes[ idx2 ].identity_bls : NULL;
     case STATE_VERSIONED_EPOCH_STAKES_STAKES_VOTE_ACCOUNTS_VALUE_DATA_V4_VOTES_LENGTH:                        return (uchar*)&parser->length4;
@@ -1476,13 +1477,6 @@ state_validate( fd_ssmanifest_parser_t * parser ) {
       }
       break;
     }
-    case STATE_STAKES_STAKE_DELEGATIONS_LENGTH: {
-      if( FD_UNLIKELY( parser->length1>FD_RUNTIME_MAX_STAKE_ACCOUNTS ) ) {
-        FD_LOG_WARNING(( "invalid stakes_stake_delegations length %lu (max %lu)", parser->length1, FD_RUNTIME_MAX_STAKE_ACCOUNTS ));
-        return -1;
-      }
-      break;
-    }
     case STATE_STAKES_STAKE_DELEGATIONS_WARMUP_COOLDOWN_RATE: {
       if( FD_UNLIKELY( parser->warmup_cooldown_rate>1.0 ) ) {
         FD_LOG_WARNING(( "invalid stakes_stake_delegations warmup cooldown rate %f", parser->warmup_cooldown_rate ));
@@ -1748,7 +1742,7 @@ state_process( fd_ssmanifest_parser_t * parser ) {
     parser->leader_schedule_epoch    = fd_slot_to_leader_schedule_epoch( &epoch_schedule, manifest->slot );
     ulong const epoch_stakes_ele_cnt = FD_RUNTIME_MANIFEST_EPOCH_STAKES_LEN;
 
-    ulong const epoch_stakes_base = parser->epoch>0UL ? parser->epoch-1UL : 0UL;
+    ulong const epoch_stakes_base = parser->epoch>3UL ? parser->epoch-3UL : 0UL;
     if( FD_UNLIKELY( parser->leader_schedule_epoch-epoch_stakes_base>=epoch_stakes_ele_cnt ) ) {
       FD_LOG_WARNING(( "fd_ssmanifest_parser only supports up to %lu epoch_stakes entries, but leader schedule epoch is %lu epochs after base epoch",
                        epoch_stakes_ele_cnt, parser->leader_schedule_epoch-epoch_stakes_base ));
@@ -1767,7 +1761,7 @@ state_process( fd_ssmanifest_parser_t * parser ) {
       return -1;
     }
 
-    ulong const epoch_stakes_base = parser->epoch>0UL ? parser->epoch-1UL : 0UL;
+    ulong const epoch_stakes_base = parser->epoch>3UL ? parser->epoch-3UL : 0UL;
     if( parser->epoch_stakes_epoch>=epoch_stakes_base && parser->epoch_stakes_epoch<=parser->leader_schedule_epoch ) {
       parser->epoch_idx = parser->epoch_stakes_epoch-epoch_stakes_base;
       parser->manifest->epoch_stakes[ parser->epoch_idx ].epoch = parser->epoch_stakes_epoch;
@@ -1805,6 +1799,12 @@ state_process( fd_ssmanifest_parser_t * parser ) {
       || parser->state==STATE_EPOCH_STAKES_VOTE_ACCOUNTS_VALUE_DATA_V0235_COMMISSION ) ) ) {
     parser->manifest->epoch_stakes[ parser->epoch_idx ].vote_stakes[ parser->idx2 ].commission &= 0xFF;
     parser->manifest->epoch_stakes[ parser->epoch_idx ].vote_stakes[ parser->idx2 ].commission *= 100;
+  }
+
+  if( FD_UNLIKELY( parser->epoch_idx!=ULONG_MAX && !parser->option &&
+      (  parser->state==STATE_VERSIONED_EPOCH_STAKES_STAKES_VOTE_ACCOUNTS_VALUE_DATA_V4_BLS_PUBKEY_COMPRESSED_OPTION
+      || parser->state==STATE_EPOCH_STAKES_VOTE_ACCOUNTS_VALUE_DATA_V4_BLS_PUBKEY_COMPRESSED_OPTION ) ) ) {
+    memset( parser->manifest->epoch_stakes[ parser->epoch_idx ].vote_stakes[ parser->idx2 ].identity_bls, 0, 48UL );
   }
 
   if( FD_UNLIKELY( parser->state==STATE_STAKES_VOTE_ACCOUNTS_VALUE_DATA_LENGTH ) ) parser->account_data_start = parser->off;
@@ -2048,10 +2048,12 @@ state_is_optional_extras_field( fd_ssmanifest_parser_t * parser ) {
   }
 }
 
-/* Pre-v4 vote states carry no SIMD-0232 collector fields: when the
-   node pubkey field of one completes, default the inflation collector
-   to the vote account and the block revenue collector to the node
-   identity (both parsed by then). */
+/* Pre-v4 vote states carry no SIMD-0232 collector or SIMD-0123 fields:
+   when the node pubkey field of one completes, default the inflation
+   collector to the vote account, the block revenue collector to the
+   node identity (both parsed by then), the block revenue commission to
+   FD_VOTE_DEFAULT_BLOCK_REVENUE_COMMISSION_BPS, the pending delegator
+   rewards to 0 and clear the BLS pubkey. */
 
 static void
 state_default_collectors( fd_ssmanifest_parser_t * parser ) {
@@ -2067,6 +2069,10 @@ state_default_collectors( fd_ssmanifest_parser_t * parser ) {
     &parser->manifest->epoch_stakes[ parser->epoch_idx ].vote_stakes[ parser->idx2 ];
   memcpy( vote_stakes->commission_inflation, vote_stakes->vote,     32UL );
   memcpy( vote_stakes->commission_block,     vote_stakes->identity, 32UL );
+  vote_stakes->commission_block_bps      = FD_VOTE_DEFAULT_BLOCK_REVENUE_COMMISSION_BPS;
+  vote_stakes->pending_delegator_rewards = 0UL;
+  vote_stakes->has_identity_bls          = 0;
+  memset( vote_stakes->identity_bls, 0, 48UL );
 }
 
 int

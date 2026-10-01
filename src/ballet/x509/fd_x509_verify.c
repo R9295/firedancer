@@ -60,6 +60,26 @@ fd_x509_verify_sig( fd_x509_cert_info_t const * cert,
     return ( err == FD_SECP384R1_SUCCESS ) ? 0 : -1;
   }
 
+  case FD_X509_SIG_RSA_SHA256:
+  case FD_X509_SIG_RSA_SHA384:
+  case FD_X509_SIG_RSA_SHA512: {
+#if !FD_HAS_INT128
+    return 1;  /* no fd_rsa */
+#else
+    if( FD_UNLIKELY( issuer_key_type != FD_X509_KEY_RSA ) ) return -1;
+
+    fd_rsa_pubkey_t key[1];
+    if( FD_UNLIKELY( fd_x509_decode_rsa_pubkey( issuer_pubkey, issuer_pubkey_len, key ) ) )
+      return -1;
+
+    int hash = cert->sig_alg==FD_X509_SIG_RSA_SHA256 ? FD_RSA_HASH_SHA256 :
+               cert->sig_alg==FD_X509_SIG_RSA_SHA384 ? FD_RSA_HASH_SHA384 :
+                                                       FD_RSA_HASH_SHA512;
+    int err = fd_rsa_verify_pkcs1_v15( key, cert->sig, cert->sig_len, cert->tbs, cert->tbs_len, hash );
+    return ( err == FD_RSA_SUCCESS ) ? 0 : -1;
+#endif
+  }
+
   default:
     return 1;  /* unsupported sig algorithm */
   }
@@ -333,6 +353,8 @@ fd_x509_verify_chain( uchar const * const *        chain_der,
 
   if( FD_UNLIKELY( fd_x509_cert_parse( chain_der[0], chain_der_sz[0], &certs[0] ) ) )
     return FD_X509_VERIFY_ERR_PARSE;
+  if( FD_UNLIKELY( certs[0].key_type==FD_X509_KEY_UNKNOWN ) )
+    return FD_X509_VERIFY_ERR_UNSUPPORTED;
 
   int time_err = fd_x509_check_validity( &certs[0], unix_seconds );
   if( FD_UNLIKELY( time_err ) ) return time_err;

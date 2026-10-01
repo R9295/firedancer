@@ -348,11 +348,13 @@ SOFTWARE.
 
 =======================================================================
 
-'src/third_party/cjson' is a copy of the cJSON library at
-https://github.com/DaveGamble/cJSON. Version 1.7.19, tag v1.7.19,
-commit c859b25da02955fef659d658b8f324b5cde87be3
+fd_f25519_is_square_var in src/ballet/ed25519/fd_f25519.c contains a
+modified port of the variable time Jacobi symbol (safegcd posdivsteps)
+from libsecp256k1 v0.7.1 src/modinv64_impl.h,
+https://github.com/bitcoin-core/secp256k1
 
-Copyright (c) 2009-2017 Dave Gamble and cJSON contributors
+Copyright (c) 2020 Peter Dettman
+Copyright (c) 2013 Pieter Wuille
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

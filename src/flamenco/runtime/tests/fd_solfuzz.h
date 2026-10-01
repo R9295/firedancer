@@ -11,6 +11,7 @@
    - Multi-session use */
 
 #include "../../capture/fd_solcap_writer.h"
+#include "../../../util/spad/fd_spad.h"
 #include "../../accdb/fd_accdb.h"
 #include "../../progcache/fd_progcache_user.h"
 #include "../fd_bank.h"
@@ -28,6 +29,7 @@ struct fd_solfuzz_runner {
   ulong           wksp_baseline_used_sz;
   fd_spad_t *     spad;
   fd_banks_t *    banks;
+  int             stake_delegations_fd;
   fd_bank_t *     bank;
   fd_runtime_t *  runtime;
 

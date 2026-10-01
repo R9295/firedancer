@@ -220,7 +220,7 @@ ag_repair_response_de( ag_repair_response_t * response,
       if( FD_UNLIKELY( rem < sizeof(uint) ) ) return -1;
       res->fec_set_count = fd_uint_load_4_fast( cur );
       cur += sizeof(uint); rem -= sizeof(uint);
-      if( FD_UNLIKELY( res->fec_set_count>fec_set_max ) ) return -1;
+      if( FD_UNLIKELY( !res->fec_set_count || res->fec_set_count>fec_set_max ) ) return -1;
 
       if( FD_UNLIKELY( rem < sizeof(ulong) ) ) return -1;
       res->parent_slot = fd_ulong_load_8_fast( cur );
@@ -304,11 +304,67 @@ ag_repair_parent_fec_count_verify( ag_parent_fec_count_res_t const * res,
 int
 ag_repair_fec_set_root_verify( ag_fec_root_res_t const * res,
                                fd_hash_t const *         block_id,
-                               uint                      fec_set_idx ) {
+                               uint                      fec_set_idx,
+                               uint                      fec_set_count ) {
+  /* https://github.com/anza-xyz/agave/blob/5f11d68ab206fee323e8d29acd96d517fae3c9ec/core/src/repair/serve_repair.rs#L381 */
+  if( FD_UNLIKELY( !fec_set_count                                             ) ) return -1;
+  if( FD_UNLIKELY( fec_set_idx / FD_FEC_SHRED_CNT >= fec_set_count            ) ) return -1;
+  if( FD_UNLIKELY( res->proof_len != fd_bmtree_depth( fec_set_count+1UL )-1UL ) ) return -1;
+
   fd_bmtree_node_t leaf[1] = {0};
   memcpy( leaf->hash, res->root, FD_SHRED_MERKLE_NODE_SZ );
 
   return verify_merkle_proof( leaf, fec_set_idx / FD_FEC_SHRED_CNT, res->fec_proof[0], res->proof_len, block_id );
+}
+
+ulong
+ag_repair_parent_fec_count_ser( uchar *           buf,
+                                ulong             buf_sz,
+                                uint              fec_set_count,
+                                ulong             parent_slot,
+                                fd_hash_t const * parent_block_id,
+                                uchar const *     proof,
+                                ulong             proof_len,
+                                uint              nonce ) {
+  ulong proof_sz = fd_ulong_sat_mul( proof_len, FD_SHRED_MERKLE_NODE_SZ );
+  if( FD_UNLIKELY( proof_sz==ULONG_MAX )) return 0UL;
+
+  ulong sz       = fd_ulong_sat_add( sizeof(uint) + sizeof(uint) + sizeof(ulong) + sizeof(fd_hash_t) + sizeof(ulong) + sizeof(uint),
+                                     proof_sz );
+  if( FD_UNLIKELY( sz>buf_sz )) return 0UL;
+
+  uchar * cur = buf;
+  FD_STORE( uint,  cur, AG_REPAIR_RESPONSE_PARENT_FEC_SET_COUNT ); cur += sizeof(uint);
+  FD_STORE( uint,  cur, fec_set_count                           ); cur += sizeof(uint);
+  FD_STORE( ulong, cur, parent_slot                             ); cur += sizeof(ulong);
+  memcpy( cur, parent_block_id->uc, sizeof(fd_hash_t) );           cur += sizeof(fd_hash_t);
+  FD_STORE( ulong, cur, proof_sz                                ); cur += sizeof(ulong);
+  memcpy( cur, proof, proof_sz );                                  cur += proof_sz;
+  FD_STORE( uint,  cur, nonce                                   ); cur += sizeof(uint);
+  return sz;
+}
+
+ulong
+ag_repair_fec_set_root_ser( uchar *       buf,
+                            ulong         buf_sz,
+                            uchar const * root,
+                            uchar const * proof,
+                            ulong         proof_len,
+                            uint          nonce ) {
+  ulong proof_sz = fd_ulong_sat_mul( proof_len, FD_SHRED_MERKLE_NODE_SZ );
+  if( FD_UNLIKELY( proof_sz == ULONG_MAX )) return 0UL;
+
+  ulong sz       = fd_ulong_sat_add( sizeof(uint) + FD_SHRED_MERKLE_NODE_SZ + sizeof(ulong) + sizeof(uint),
+                                     proof_sz );
+  if( FD_UNLIKELY( sz>buf_sz ) ) return 0UL;
+
+  uchar * cur = buf;
+  FD_STORE( uint,  cur, AG_REPAIR_RESPONSE_FEC_SET_ROOT ); cur += sizeof(uint);
+  memcpy( cur, root, FD_SHRED_MERKLE_NODE_SZ );            cur += FD_SHRED_MERKLE_NODE_SZ;
+  FD_STORE( ulong, cur, proof_sz                        ); cur += sizeof(ulong);
+  memcpy( cur, proof, proof_sz );                          cur += proof_sz;
+  FD_STORE( uint,  cur, nonce                           ); cur += sizeof(uint);
+  return sz;
 }
 
 int

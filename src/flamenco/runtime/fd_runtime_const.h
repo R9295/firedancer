@@ -31,15 +31,10 @@ FD_PROTOTYPES_BEGIN
 
 #define FD_RUNTIME_MAX_STAKE_ACCOUNTS (2150000UL)
 
-/* FD_RUNTIME_MAX_STAKE_ACCOUNTS_FALLBACK is the number of stake
-   accounts that the system can support.  FD_RUNTIME_STAKE_ACCOUNTS is
-   the measure of active stake accounts while _FALLBACK is the measure
-   of total stake accounts that the network can support.  This is a
-   measured and chosen threshold based on what the wider network on
-   mainnet can reasonably support across clients and valdiator
-   hardware. */
+/* FD_RUNTIME_MAX_STAKE_DELEGATION_DISK_RECORDS is the maximum number
+   of records in each stake-delegation disk tier. */
 
-#define FD_RUNTIME_MAX_STAKE_ACCOUNTS_FALLBACK (100000000UL)
+#define FD_RUNTIME_MAX_STAKE_DELEGATION_DISK_RECORDS (100000000UL)
 
 /* The runtime only supports post-validator_admission_ticket banks.  The
    accumulator can still see one distinct voter per stake account before
@@ -60,10 +55,12 @@ FD_PROTOTYPES_BEGIN
 #define FD_RUNTIME_MAX_SNAPSHOT_VOTE_ACCOUNTS (40200UL)
 
 /* The maximum number of epoch stakes that are needed to be parsed out
-   from the manifest.  Agave produced snapshots include 5 epoch stakes,
-   but only 3 are required for consensus. */
+   from the manifest.  Agave produced snapshots include 5 epoch stakes
+   (MAX_LEADER_SCHEDULE_STAKES), E-3..E+1 for a snapshot in epoch E, and
+   a block footer may carry a finalization cert from any of E-3..E, so
+   all 5 are loaded. */
 
-#define FD_RUNTIME_MANIFEST_EPOCH_STAKES_LEN (3UL)
+#define FD_RUNTIME_MANIFEST_EPOCH_STAKES_LEN (5UL)
 
 #define FD_RUNTIME_SLOTS_PER_EPOCH (432000UL)
 
@@ -162,8 +159,7 @@ FD_PROTOTYPES_BEGIN
 #define FD_MAX_INSTRUCTION_STACK_DEPTH  (5UL)
 
 
-#define FD_RUNTIME_VM_TRACE_EVENT_MAX      (128UL<<20)
-#define FD_RUNTIME_VM_TRACE_EVENT_DATA_MAX (2048UL)
+#define FD_RUNTIME_VM_TRACE_EVENT_MAX (128UL<<20)
 
 #define FD_RUNTIME_VM_TRACE_STATIC_FOOTPRINT (FD_RUNTIME_VM_TRACE_EVENT_MAX + sizeof(fd_vm_trace_t))
 #define FD_RUNTIME_VM_TRACE_STATIC_ALIGN     (8UL)

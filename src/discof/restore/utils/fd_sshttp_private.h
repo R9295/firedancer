@@ -2,6 +2,7 @@
 #define HEADER_fd_src_discof_restore_utils_fd_sshttp_private_h
 
 #include "fd_sshttp.h"
+#include "../../../waltz/fd_fqdn.h"
 
 #include "../../../waltz/tls/fd_tls.h"
 #include "../../../waltz/tlsrec/fd_tlsrec_sock.h"
@@ -23,7 +24,9 @@
 struct fd_sshttp_private {
   int   state;
   long  deadline;
-  ulong empty_recvs;
+
+  int   epoll_fd;
+  uint  epoll_events;
 
   ulong hops;
 
@@ -31,7 +34,7 @@ struct fd_sshttp_private {
   ulong location_len;
 
   fd_ip4_port_t addr;
-  char const *  hostname;
+  char          hostname[ FD_FQDN_BUF_MAX ];
   int           is_https;
   int           sockfd;
 

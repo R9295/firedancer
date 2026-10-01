@@ -42,7 +42,7 @@ $(call add-objs,fd_compute_budget_details,fd_flamenco)
 
 $(call add-hdrs,fd_borrowed_account.h)
 $(call add-objs,fd_borrowed_account,fd_flamenco)
-$(call make-unit-test,test_borrowed_account,test_borrowed_account,fd_flamenco fd_util)
+$(call make-unit-test,test_borrowed_account,test_borrowed_account,fd_flamenco fd_ballet fd_util)
 $(call run-unit-test,test_borrowed_account)
 
 ifdef FD_HAS_HOSTED
@@ -67,7 +67,7 @@ $(call make-unit-test,test_txncache,test_txncache,fd_flamenco fd_ballet fd_util)
 $(call make-fuzz-test,fuzz_txncache_fork_graph,fuzz_txncache_fork_graph,fd_flamenco fd_ballet fd_util)
 endif
 
-$(call add-hdrs,fd_runtime.h fd_runtime_err.h fd_runtime_const.h fd_runtime_stack.h fd_runtime_helpers.h)
+$(call add-hdrs,fd_runtime.h fd_runtime_err.h fd_runtime_const.h fd_runtime_stack.h fd_runtime_stack_tmpl.h fd_runtime_helpers.h)
 $(call add-objs,fd_runtime,fd_flamenco)
 ifdef FD_HAS_HOSTED
 $(call make-unit-test,test_lamports_per_byte_feature_gates,test_lamports_per_byte_feature_gates,fd_flamenco_test fd_flamenco fd_ballet fd_util)

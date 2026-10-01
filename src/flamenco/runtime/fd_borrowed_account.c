@@ -1,6 +1,54 @@
 #include "fd_borrowed_account.h"
 #include "fd_runtime.h"
 
+#if FD_HAS_AVX512
+#include "../../util/simd/fd_avx512.h"
+#elif FD_HAS_AVX
+#include "../../util/simd/fd_avx.h"
+#endif
+
+FD_FN_PURE int
+fd_borrowed_account_is_zeroed( fd_borrowed_account_t const * borrowed_acct ) {
+  uchar const * data    = borrowed_acct->acc->data;
+  ulong         data_sz = borrowed_acct->acc->data_len;
+
+  /* Peel the loop to avoid unaligned accesses. */
+  while( data_sz && ( (ulong)data & 0x3fUL ) ) {
+    if( FD_UNLIKELY( *data ) ) return 0;
+    data++;
+    data_sz--;
+  }
+
+#if FD_HAS_AVX512
+  while( data_sz>=512UL ) {
+    wwv_t x0 = wwv_or( wwv_ldu( data       ), wwv_ldu( data+ 64UL ) );
+    wwv_t x1 = wwv_or( wwv_ldu( data+128UL ), wwv_ldu( data+192UL ) );
+    wwv_t x2 = wwv_or( wwv_ldu( data+256UL ), wwv_ldu( data+320UL ) );
+    wwv_t x3 = wwv_or( wwv_ldu( data+384UL ), wwv_ldu( data+448UL ) );
+    wwv_t x  = wwv_or( wwv_or( x0, x1 ), wwv_or( x2, x3 ) );
+    if( FD_UNLIKELY( _mm512_test_epi64_mask( x, x ) ) ) return 0;
+    data    += 512UL;
+    data_sz -= 512UL;
+  }
+#elif FD_HAS_AVX
+  while( data_sz>=256UL ) {
+    wv_t x0 = wv_or( wv_ldu( data       ), wv_ldu( data+ 32UL ) );
+    wv_t x1 = wv_or( wv_ldu( data+ 64UL ), wv_ldu( data+ 96UL ) );
+    wv_t x2 = wv_or( wv_ldu( data+128UL ), wv_ldu( data+160UL ) );
+    wv_t x3 = wv_or( wv_ldu( data+192UL ), wv_ldu( data+224UL ) );
+    wv_t x  = wv_or( wv_or( x0, x1 ), wv_or( x2, x3 ) );
+    if( FD_UNLIKELY( !_mm256_testz_si256( x, x ) ) ) return 0;
+    data    += 256UL;
+    data_sz -= 256UL;
+  }
+#endif
+
+  for( ulong i=0UL; i<data_sz; i++ )
+    if( FD_UNLIKELY( data[i] ) ) return 0;
+
+  return 1;
+}
+
 int
 fd_borrowed_account_get_data_mut( fd_borrowed_account_t * borrowed_acct,
                                   uchar * *               data_out,
@@ -12,6 +60,8 @@ fd_borrowed_account_get_data_mut( fd_borrowed_account_t * borrowed_acct,
   if( FD_UNLIKELY( err ) ) {
     return err;
   }
+
+  *borrowed_acct->touched = 1;
 
   if ( data_out != NULL )
     *data_out = borrowed_acct->acc->data;
@@ -49,7 +99,7 @@ fd_borrowed_account_set_owner( fd_borrowed_account_t * borrowed_acct,
     return FD_EXECUTOR_INSTR_SUCCESS;
   }
 
-  /* Agave self.touch() is a no-op */
+  *borrowed_acct->touched = 1;
 
   /* Copy into owner
      https://github.com/anza-xyz/agave/blob/v2.1.14/sdk/src/transaction_context.rs#L761 */
@@ -82,7 +132,7 @@ fd_borrowed_account_set_lamports( fd_borrowed_account_t * borrowed_acct,
     return FD_EXECUTOR_INSTR_SUCCESS;
   }
 
-  /* Agave self.touch() is a no-op */
+  *borrowed_acct->touched = 1;
 
   borrowed_acct->acc->lamports = lamports;
   return FD_EXECUTOR_INSTR_SUCCESS;
@@ -99,7 +149,7 @@ fd_borrowed_account_set_data_from_slice( fd_borrowed_account_t * borrowed_acct,
     return err;
   }
 
-  /* Agave self.touch() is a no-op */
+  *borrowed_acct->touched = 1;
 
   /* https://github.com/anza-xyz/agave/blob/v2.1.14/sdk/src/transaction_context.rs#L868 */
   if( FD_UNLIKELY( !fd_borrowed_account_update_accounts_resize_delta( borrowed_acct, data_sz, &err ) ) ) {
@@ -131,7 +181,7 @@ fd_borrowed_account_set_data_length( fd_borrowed_account_t * borrowed_acct,
     return FD_EXECUTOR_INSTR_SUCCESS;
   }
 
-  /* Agave self.touch() is a no-op */
+  *borrowed_acct->touched = 1;
 
   /* https://github.com/anza-xyz/agave/blob/v2.1.14/sdk/src/transaction_context.rs#L890 */
   if( FD_UNLIKELY( !fd_borrowed_account_update_accounts_resize_delta( borrowed_acct, new_len, &err ) ) ) {
@@ -175,7 +225,7 @@ fd_borrowed_account_set_executable( fd_borrowed_account_t * borrowed_acct,
     return FD_EXECUTOR_INSTR_SUCCESS;
   }
 
-  /* Agave self.touch() is a no-op */
+  *borrowed_acct->touched = 1;
 
   /* https://github.com/anza-xyz/agave/blob/v2.1.14/sdk/src/transaction_context.rs#L1027 */
   borrowed_acct->acc->executable = !!is_executable;

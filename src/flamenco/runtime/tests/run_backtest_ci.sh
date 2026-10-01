@@ -34,13 +34,13 @@ src/flamenco/runtime/tests/run_ledger_backtest.sh -l commission_rate_in_basis_po
 src/flamenco/runtime/tests/run_ledger_backtest.sh -l commission_rate_in_basis_points_snapshot-v4.2.0-beta.1-vat -m 10000 -e 950
 src/flamenco/runtime/tests/run_ledger_backtest.sh -l rent_relax_only-v4.2.0-beta.1-vat_rekey -m 2000000 -e 325
 src/flamenco/runtime/tests/run_ledger_backtest.sh -l rent_lamports_per_byte_6333-v4.2.0-beta.1-vat_rekey -m 2000000 -e 325
-src/flamenco/runtime/tests/run_ledger_backtest.sh -l rent_lamports_per_byte_696-v4.2.0-beta.1-vat_rekey -m 2000000 -e 325
-src/flamenco/runtime/tests/run_ledger_backtest.sh -l rent_lamports_per_byte_6960-v4.2.0-beta.1-vat_rekey -m 2000000 -e 325
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l rent_lamports_per_byte_696-v4.3.0-rc.1_rekey -m 2000000 -e 325
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l rent_lamports_per_byte_6960-v4.3.0-rc.1_rekey -m 2000000 -e 325
 src/flamenco/runtime/tests/run_ledger_backtest.sh -l programdata-closeslot -m 10000 -e 330
 src/flamenco/runtime/tests/run_ledger_backtest.sh -l programdata-poison -m 10000 -e 562
 
 # Alpenglow
-src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-legacy-vote-ixs --alpenglow --shred-version 40081 -m 2000000 -e 126
-src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-deactivated-stake --alpenglow --shred-version 14972 -m 2000000 -e 810
-src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-leader-credits --alpenglow --shred-version 49885 -m 2000000 -e 3915
-src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-alpenclock-lamports --alpenglow --shred-version 27708 -m 2000000 -e 280
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-legacy-vote-ixs --alpenglow -m 2000000 -e 126
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-deactivated-stake --alpenglow -m 2000000 -e 810
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-leader-credits --alpenglow -m 2000000 -e 3915
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-alpenclock-lamports --alpenglow -m 2000000 -e 280

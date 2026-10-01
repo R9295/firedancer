@@ -332,8 +332,8 @@ The "Frankendancer" build target (fdctl) only targets x86_64 with a
 Haswell like minimum feature set (AVX2, FMA).
 
 Experimental support exists for the following targets:
-- musl Linux, macOS, FreeBSD, Solana (SVM) C programs
-- arm64, ppc64le, sBPFv1, sBPFv2
+- musl libc
+- arm64
 
 #### 7.4. seccomp
 
@@ -358,7 +358,7 @@ Make sure to handle `EINTR` correctly.
 To generate an HTML coverage report for a single test:
 
 ```bash
-make -j CC=clang EXTRAS=llvm-cov BUILDDIR=clang-cov
+make -j CC=clang EXTRAS=llvm-cov BUILDDIR=clang-cov all
 ./contrib/test/single_test_cov.sh build/clang-cov/unit-test/test_xxx
 ```
 

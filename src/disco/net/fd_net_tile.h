@@ -1,8 +1,7 @@
 #ifndef HEADER_fd_src_disco_net_fd_net_tile_h
 #define HEADER_fd_src_disco_net_fd_net_tile_h
 
-/* fd_net_tile.h contains APIs for providing XDP networking to a
-   Firedancer topology using the 'net' tile. */
+/* fd_net_tile.h declares public APIs used by network tiles, net consumers, and topology builders. */
 
 #include "../fd_disco_base.h"
 #include "../../tango/dcache/fd_dcache.h"
@@ -84,6 +83,14 @@ FD_PROTOTYPES_BEGIN
 char const *
 fd_net_tile_name( char const * provider );
 
+/* fd_net_get_driver writes the device driver name for if_name, or the
+   common member driver for a bond.  Writes "n/a" if no single driver
+   is available. */
+void
+fd_net_get_driver( char *       driver,
+                   ulong        driver_sz,
+                   char const * if_name );
+
 /* fd_topos_net_tiles appends the selected network provider tiles to
    the topology. */
 
@@ -127,6 +134,21 @@ void
 fd_topos_net_tile_finish( fd_topo_t * topo,
                           ulong       net_kind_id );
 
+/* fd_topos_sock_lo adds a loopback RX only sock tile with the same
+   RX consumers as net_tile. */
+void
+fd_topos_sock_lo( fd_topo_t *                 topo,
+                  struct fd_topo_tile const * net_tile );
+
+/* sock_lo_net_tile_id returns the ID of the net tile whose CPU affinity
+   sock copies, or ULONG_MAX if tile is not an RX only loopback sock. */
+ulong
+sock_lo_net_tile_id( struct fd_topo_tile const * tile );
+
+/* sock_lo_set_affinity sets the loopback RX only sock's CPU affinity. */
+void
+sock_lo_set_affinity( fd_topo_t * topo );
+
 /* fd_net_tile_fib4_join returns a pointer to the fib4 object a remote
    net tile's address space.  net_tile is an xdp ("net") or mlx5 tile.
    Intended for diagnostics only. */
@@ -151,11 +173,16 @@ fd_mlx5_tile_fib4_join( fd_fib4_t *                 out,
 
 #if defined(__linux__)
 
-/* fd_mlx5_fds identifies the shared uverbs descriptors retained by the
-   supervisor and inherited by mlx5 tiles. */
+#define FD_MLX5_TILE_MAX (8UL)
+
+/* fd_mlx5_fds identifies the shared uverbs descriptors inherited by mlx5 tiles
+   from the supervisor.  rx_comp_channel_fd[ i ] is inherited only by mlx5:i,
+   and is present only in efficient mode (rx_comp_channel_fd_cnt is 0 otherwise). */
 struct fd_mlx5_fds {
-  int cmd_fd;
-  int async_fd;
+  int   cmd_fd;
+  int   async_fd;
+  ulong rx_comp_channel_fd_cnt;
+  int   rx_comp_channel_fd[ FD_MLX5_TILE_MAX ];
 };
 typedef struct fd_mlx5_fds fd_mlx5_fds_t;
 

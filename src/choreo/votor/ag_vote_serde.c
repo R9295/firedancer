@@ -4,14 +4,14 @@
 
 ulong
 ag_vote_ser( ag_vote_t const * self,
-             uchar             buf[ static AG_VOTE_SER_SZ( 1 ) ] ) {
-  ag_vote_serde_t vote;
-
-  vote.version       = (uchar)1;
-  vote.tag           = (uchar)( self->kind+AG_VOTE_SERDE_TAG_NOTAR );
-  vote.slot          = ag_vote_slot( self );
-  vote.block_id      = ag_vote_block_hash( self );
-  vote.shred_version = ag_vote_shred_version( self );
+             uchar             buf[ static AG_VOTE_SER_MAX ] ) {
+  ag_vote_serde_t vote = {
+    .version       = (uchar)1,
+    .tag           = (uchar)( self->kind+AG_VOTE_SERDE_TAG_NOTAR ),
+    .slot          = ag_vote_slot( self ),
+    .block_id      = ag_vote_block_hash( self ),
+    .shred_version = ag_vote_shred_version( self ),
+  };
 
   ulong off = 0UL;
   buf[ off ] = vote.version;                                                                    off += sizeof(uchar);
@@ -32,7 +32,8 @@ ag_vote_de( ag_vote_t *   self,
             ulong         buf_sz ) {
   FAIL( buf_sz<2 /* version + tag */, SZ );
 
-  ag_vote_serde_t vote; ulong off = 0UL;
+  ulong off = 0UL;
+  ag_vote_serde_t vote;
   vote.version       = buf[ off ];                 off += sizeof(uchar);
   vote.tag           = buf[ off ];                 off += sizeof(uchar);
   FAIL( vote.version!=1, INVAL );
@@ -59,8 +60,6 @@ ag_vote_de( ag_vote_t *   self,
 
   fd_memset( self, 0, sizeof(ag_vote_t) );
   self->kind = kind;
-
-  ag_vote_set_rank( self, USHORT_MAX ); /* FIXME */
 
   switch( kind ) {
   case AG_VOTE_KIND_NOTAR:

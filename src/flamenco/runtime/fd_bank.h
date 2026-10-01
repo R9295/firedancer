@@ -212,10 +212,6 @@ struct fd_bank_cost_tracker {
 };
 typedef struct fd_bank_cost_tracker fd_bank_cost_tracker_t;
 
-#define POOL_NAME fd_bank_cost_tracker_pool
-#define POOL_T    fd_bank_cost_tracker_t
-#include "../../util/tmpl/fd_pool.c"
-
 /* The banks follow a state machine that generally transitions forward:
    All banks start off as INACTIVE.  Once a bank is provisioned (when
    the first FEC is received from the reassembler), it is in the state
@@ -263,13 +259,13 @@ struct fd_bank {
   ulong parent_idx;  /* index of the parent in the node pool */
   ulong child_idx;   /* index of the left-child in the node pool */
   ulong sibling_idx; /* index of the right-sibling in the node pool */
+  ulong dead_prev;   /* dead banks list links, only valid while the bank is dead */
+  ulong dead_next;
   ulong state;       /* keeps track of the state of the bank */
   ulong bank_seq;    /* app-wide bank sequence number */
   uchar is_leader;   /* whether the bank is the leader */
 
-  ulong refcnt; /* reference count on the bank, see replay for more details */
-
-  fd_txncache_fork_id_t  txncache_fork_id;
+  fd_txncache_fork_id_t  txncache_fork_id __attribute__((aligned(64UL)));
   fd_progcache_fork_id_t progcache_fork_id;
   fd_accdb_fork_id_t     accdb_fork_id;
   fd_accdb_fork_id_t     parent_accdb_fork_id;
@@ -282,7 +278,9 @@ struct fd_bank {
 
   ulong banks_data_offset; /* offset from this fd_bank_t back to fd_banks_t */
 
-  /* Timestamps written and read only by replay */
+  /* Written by replay only, on its own line */
+
+  ulong refcnt __attribute__((aligned(64UL))); /* reference count on the bank, see replay for more details */
 
   long first_fec_set_received_nanos;
   long preparation_begin_nanos;
@@ -291,8 +289,8 @@ struct fd_bank {
   long block_completed_nanos;
 
   /* This field should only be accessed by the replay and executor
-     tiles. */
-  fd_rwlock_t lthash_lock;
+     tiles.  Taken per transaction, so on its own line. */
+  fd_rwlock_t lthash_lock __attribute__((aligned(64UL)));
 
   struct {
     fd_lthash_value_t      lthash;
@@ -346,6 +344,12 @@ struct fd_bank {
 };
 typedef struct fd_bank fd_bank_t;
 
+FD_STATIC_ASSERT( offsetof(fd_bank_t, txncache_fork_id)%64UL==0UL, fd_bank_exec_line );
+FD_STATIC_ASSERT( offsetof(fd_bank_t, banks_data_offset)+sizeof(ulong)-offsetof(fd_bank_t, txncache_fork_id)<=64UL, fd_bank_exec_line_sz );
+FD_STATIC_ASSERT( offsetof(fd_bank_t, refcnt)%64UL==0UL, fd_bank_refcnt_line );
+FD_STATIC_ASSERT( offsetof(fd_bank_t, lthash_lock)%64UL==0UL, fd_bank_lthash_lock_line );
+FD_STATIC_ASSERT( offsetof(fd_bank_t, f)-offsetof(fd_bank_t, lthash_lock)>=64UL, fd_bank_lthash_lock_alone );
+
 struct fd_banks_prune_cancel_info {
   fd_txncache_fork_id_t  txncache_fork_id;
   fd_progcache_fork_id_t progcache_fork_id;
@@ -368,21 +372,6 @@ fd_bank_stake_delegations_modify( fd_bank_t * bank );
    The data is laid out contiguously in memory starting from fd_banks_t;
    this can be seen in fd_banks_footprint(). */
 
-#define POOL_NAME fd_banks_pool
-#define POOL_T    fd_bank_t
-#include "../../util/tmpl/fd_pool.c"
-
-struct fd_bank_idx_seq {
-  ulong idx;
-  ulong seq;
-};
-typedef struct fd_bank_idx_seq fd_bank_idx_seq_t;
-
-#define DEQUE_NAME fd_banks_dead
-#define DEQUE_T    fd_bank_idx_seq_t
-#define DEQUE_MAX  FD_BANKS_MAX_BANKS
-#include "../../util/tmpl/fd_deque.c"
-
 struct fd_banks {
   ulong magic;                       /* ==FD_BANKS_MAGIC */
   int   report_runtime_diffs;        /* telemetry: emit the runtime events; report_runtime_diffs flag */
@@ -394,7 +383,6 @@ struct fd_banks {
   ulong bank_seq;                    /* app-wide bank sequence number counter; starts at 1 (0 is reserved as an invalid bank_seq sentinel) */
   ulong evict_rr_idx;                /* internal index for round-robin banks eviction */
   ulong prunable_idx;                /* index of pending prunable bank, ULONG_MAX if none */
-  ulong max_fallback_stake_accounts; /* Maximum number of stake accounts nameable by the pubkey fallback tier */
 
   ulong curr_fork_width;
 
@@ -406,7 +394,7 @@ struct fd_banks {
 
   ulong stake_rewards_offset;
 
-  ulong dead_banks_deque_offset;
+  ulong dead_banks_offset;
 
   /* The epoch credits of every rewarded vote account are captured when a
      bank crosses an epoch boundary, and are read again for the rest of
@@ -506,16 +494,6 @@ fd_bank_lthash_locking_modify( fd_bank_t * bank );
 void
 fd_bank_lthash_end_locking_modify( fd_bank_t * bank );
 
-/* fd_banks_stake_delegations_fork_ids writes the stake delegation fork
-   IDs in bank's ancestry to fork_ids in root-to-bank order, skipping
-   banks without a fork ID, and returns the number written.  fork_ids
-   must have room for banks->max_total_banks elements. */
-
-ulong
-fd_banks_stake_delegations_fork_ids( fd_banks_t *      banks,
-                                     fd_bank_t const * bank,
-                                     ushort *          fork_ids );
-
 /* fd_banks_stake_delegations_root_query() will return a pointer to the
    full stake delegations for the current root. This function should
    only be called on boot. */
@@ -573,20 +551,21 @@ ulong
 fd_banks_footprint( ulong max_total_banks,
                     ulong max_fork_width,
                     ulong max_stake_accounts,
-                    ulong max_fallback_stake_accounts,
                     ulong max_vote_accounts );
 
 /* fd_banks_new() creates a new fd_banks_t struct.  This function
    lays out the memory for all of the constituent fd_bank_t structs
    and pools depending on the max_total_banks and the max_fork_width for
-   a given block. */
+   a given block.  stake_delegations_fd identifies the backing file for
+   this instance's stake delegation store. */
 
 void *
 fd_banks_new( void * mem,
+              int    stake_delegations_fd,
               ulong  max_total_banks,
               ulong  max_fork_width,
               ulong  max_stake_accounts,
-              ulong  max_fallback_stake_accounts,
+              ulong  max_disk_records,
               ulong  max_vote_accounts,
               ulong  bench_max_cost_per_block, /* [development.bench], floors the block cost limit */
               ulong  seed );
@@ -681,7 +660,7 @@ fd_banks_advance_root_prepare( fd_banks_t * banks,
                                ulong *      advanceable_bank_idx_out );
 
 /* fd_banks_mark_bank_dead marks the current bank (and all of its
-   descendants) as dead.  Already-dead subtrees are skipped.  If
+   descendants) as dead.  Already-dead banks are not reported again.  If
    opt_idxs is non-NULL, it is populated with each bank index newly
    marked dead.  The caller is responsible for ensuring the buffer is
    large enough to hold the whole subtree.  If opt_idxs_cnt is non-NULL,

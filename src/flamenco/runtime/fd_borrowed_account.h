@@ -7,12 +7,6 @@
 #include "sysvar/fd_sysvar_rent.h"
 #include "program/fd_program_util.h"
 
-#if FD_HAS_AVX512
-#include "../../util/simd/fd_avx512.h"
-#elif FD_HAS_AVX
-#include "../../util/simd/fd_avx.h"
-#endif
-
 #define MAX_PERMITTED_DATA_LENGTH                 (FD_RUNTIME_ACC_SZ_MAX) /* 10MiB */
 #define MAX_PERMITTED_ACCOUNT_DATA_ALLOCS_PER_TXN (10L<<21)  /* 20MiB */
 
@@ -33,6 +27,9 @@ struct fd_borrowed_account {
   ushort                      index_in_instruction;
 
   ulong *                     refcnt;
+
+  /* The transaction's touched flag for this account. */
+  uchar *                     touched;
 };
 
 typedef struct fd_borrowed_account fd_borrowed_account_t;
@@ -48,11 +45,13 @@ fd_borrowed_account_init( fd_borrowed_account_t *     borrowed_acct,
                           fd_acc_t *                  acc,
                           fd_exec_instr_ctx_t const * instr_ctx,
                           ushort                      index_in_instruction,
-                          ulong *                     refcnt ) {
+                          ulong *                     refcnt,
+                          uchar *                     touched ) {
   borrowed_acct->acc                  = acc;
   borrowed_acct->instr_ctx            = instr_ctx;
   borrowed_acct->index_in_instruction = index_in_instruction;
   borrowed_acct->refcnt               = refcnt;
+  borrowed_acct->touched              = touched;
 }
 
 /* Drop mirrors the behavior of rust's std::mem::drop on mutable borrows.
@@ -85,8 +84,9 @@ fd_borrowed_account_get_data_len( fd_borrowed_account_t const * borrowed_acct ) 
    solana_sdk::transaction_context::BorrowedAccount::get_data_mut.
 
    Returns a writable slice of the account data (transaction wide).
-   Acquires a writable handle. This function assumes that the relevant
-   borrowed has already acquired exclusive write access.
+   Assumes the caller already holds the account's mutable borrow.
+   Returns 0 on success or an FD_EXECUTOR_INSTR_ERR_{...} code if the
+   data cannot be changed.
 
    https://github.com/anza-xyz/agave/blob/v2.1.14/sdk/src/transaction_context.rs#L823 */
 
@@ -103,8 +103,7 @@ fd_borrowed_account_get_owner( fd_borrowed_account_t const * borrowed_acct ) {
 /* fd_borrowed_account_get_lamports mirrors Agave function
    solana_sdk::transaction_context::BorrowedAccount::get_lamports.
 
-   Returns current number of lamports in account.  Well behaved if meta
-   is NULL.
+   Returns the current number of lamports in the account.
 
    https://github.com/anza-xyz/agave/blob/v2.1.14/sdk/src/transaction_context.rs#L767 */
 
@@ -129,8 +128,9 @@ fd_borrowed_account_set_owner( fd_borrowed_account_t * borrowed_acct,
 
    Runs through a sequence of permission checks, then sets the account
    balance.  Does not update global capitalization.  On success, returns
-   0 and updates meta->lamports.  On failure, returns an
-   FD_EXECUTOR_INSTR_ERR_{...} code.  Acquires a writable handle.
+   0 and updates acc->lamports.  On failure, returns an
+   FD_EXECUTOR_INSTR_ERR_{...} code.  Assumes the caller already holds
+   the account's mutable borrow.
 
    https://github.com/anza-xyz/agave/blob/v2.1.14/sdk/src/transaction_context.rs#L773 */
 
@@ -142,8 +142,8 @@ fd_borrowed_account_set_lamports( fd_borrowed_account_t * borrowed_acct,
    solana_transaction_context::instruction_accounts::BorrowedInstructionAccount::set_data_from_slice.
 
    Firedancer account storage is preallocated, so the destination
-   account must already have enough space to fit data.  Acquires a
-   writable handle.
+   account must already have enough space to fit data.  Assumes the
+   caller already holds the account's mutable borrow.
 
    https://github.com/anza-xyz/agave/blob/v4.2.0-beta.0/transaction-context/src/instruction_accounts.rs#L177-L192 */
 
@@ -155,7 +155,9 @@ fd_borrowed_account_set_data_from_slice( fd_borrowed_account_t * borrowed_acct,
 /* fd_borrowed_account_set_data_length mirrors Agave function
    solana_transaction_context::instruction_accounts::BorrowedInstructionAccount::set_data_length.
 
-   Acquires a writable handle. Returns 0 on success.
+   Assumes the caller already holds the account's mutable borrow.
+   Returns 0 on success.
+
    https://github.com/anza-xyz/agave/blob/v4.2.0-beta.0/transaction-context/src/instruction_accounts.rs#L194-L207 */
 
 int
@@ -167,7 +169,7 @@ fd_borrowed_account_set_data_length( fd_borrowed_account_t * borrowed_acct,
 
    Returns FD_EXECUTOR_INSTR_SUCCESS if the set is successful.
 
-   https://github.com/anza-xyz/agave/blob/v2.1.14/sdk/src/transaction_context.rs#L10015 */
+   https://github.com/anza-xyz/agave/blob/v2.1.14/sdk/src/transaction_context.rs#L1001 */
 
 int
 fd_borrowed_account_set_executable( fd_borrowed_account_t * borrowed_acct,
@@ -180,7 +182,7 @@ fd_borrowed_account_set_executable( fd_borrowed_account_t * borrowed_acct,
 
    Does not update global capitalization. Returns 0 on
    success or an FD_EXECUTOR_INSTR_ERR_{...} code on failure.
-   Gracefully handles underflow.
+   Gracefully handles overflow.
 
    https://github.com/anza-xyz/agave/blob/v2.1.14/sdk/src/transaction_context.rs#L797 */
 
@@ -221,8 +223,8 @@ fd_borrowed_account_checked_sub_lamports( fd_borrowed_account_t * borrowed_acct,
   return fd_borrowed_account_set_lamports( borrowed_acct, balance_post );
 }
 
-/* fd_borrowed_account_update_acounts_resize_delta mirrors Agave function
-   solana_sdk::transaction_context:BorrowedAccount::update_accounts_resize_delta.
+/* fd_borrowed_account_update_accounts_resize_delta mirrors Agave function
+   solana_sdk::transaction_context::BorrowedAccount::update_accounts_resize_delta.
 
    https://github.com/anza-xyz/agave/blob/v2.1.14/sdk/src/transaction_context.rs#L1123 */
 
@@ -236,7 +238,7 @@ fd_borrowed_account_update_accounts_resize_delta( fd_borrowed_account_t * borrow
 /* fd_borrowed_account_is_rent_exempt_at_data_length mirrors Agave function
    solana_sdk::transaction_context::BorrowedAccount::is_rent_exempt_at_data_length.
 
-   Returns 1 if an account is rent exempt at it's current data length.
+   Returns 1 if an account is rent exempt at its current data length.
 
    https://github.com/anza-xyz/agave/blob/v2.1.14/sdk/src/transaction_context.rs#L987 */
 
@@ -266,7 +268,10 @@ fd_borrowed_account_is_executable( fd_borrowed_account_t const * borrowed_acct )
 
 /* fd_borrowed_account_is_signer mirrors the Agave function
    solana_sdk::transaction_context::BorrowedAccount::is_signer.
-   Returns 1 if the account is a signer or is writable and 0 otherwise.
+
+   Returns 1 if the account is a signer of the current instruction.
+   Otherwise, returns 0, including when the account is not an
+   instruction account (index_in_instruction out of bounds).
 
    https://github.com/anza-xyz/agave/blob/v2.1.14/sdk/src/transaction_context.rs#L1039 */
 
@@ -282,9 +287,12 @@ fd_borrowed_account_is_signer( fd_borrowed_account_t const * borrowed_acct ) {
   return fd_instr_acc_is_signer_idx( instr, borrowed_acct->index_in_instruction, NULL );
 }
 
-/* fd_borrowed_account_is_writer mirrors the Agave function
-   solana_sdk::transaction_context::BorrowedAccount::is_writer.
-   Returns 1 if the account is a signer or is writable and 0 otherwise.
+/* fd_borrowed_account_is_writable mirrors the Agave function
+   solana_sdk::transaction_context::BorrowedAccount::is_writable.
+
+   Returns 1 if the account is writable in the current instruction.
+   Otherwise, returns 0, including when the account is not an
+   instruction account (index_in_instruction out of bounds).
 
    https://github.com/anza-xyz/agave/blob/v2.1.14/sdk/src/transaction_context.rs#L1052 */
 
@@ -320,7 +328,7 @@ fd_borrowed_account_is_owned_by_current_program( fd_borrowed_account_t const * b
   return !memcmp( program_id_pubkey->key, borrowed_acct->acc->owner, sizeof(fd_pubkey_t) );
 }
 
-/* fd_borrowed_account_can_data_be changed mirrors Agave function
+/* fd_borrowed_account_can_data_be_changed mirrors Agave function
    solana_sdk::transaction_context::BorrowedAccount::can_data_be_changed.
 
    https://github.com/anza-xyz/agave/blob/v2.1.14/sdk/src/transaction_context.rs#L1074 */
@@ -347,7 +355,7 @@ fd_borrowed_account_can_data_be_changed( fd_borrowed_account_t const * borrowed_
 }
 
 /* fd_borrowed_account_can_data_be_resized mirrors Agave function
-   solana_sdk::transaction_context::BorrowedAccount::can_data_be_resized
+   solana_transaction_context::instruction_accounts::BorrowedInstructionAccount::can_data_be_resized.
 
    https://github.com/anza-xyz/agave/blob/v4.2.0-beta.0/transaction-context/src/instruction_accounts.rs#L351-L357 */
 
@@ -356,47 +364,11 @@ fd_borrowed_account_can_data_be_resized( fd_borrowed_account_t const * borrowed_
                                          ulong                         new_length,
                                          int *                         err );
 
-FD_FN_PURE static inline int
-fd_borrowed_account_is_zeroed( fd_borrowed_account_t const * borrowed_acct ) {
-  uchar const * data    = borrowed_acct->acc->data;
-  ulong         data_sz = borrowed_acct->acc->data_len;
+/* fd_borrowed_account_is_zeroed returns 1 if every byte of the account
+   data is zero (or the account has no data) and 0 otherwise. */
 
-  /* Peel the loop to avoid unaligned accesses. */
-  while( data_sz && ( (ulong)data & 0x3fUL ) ) {
-    if( FD_UNLIKELY( *data ) ) return 0;
-    data++;
-    data_sz--;
-  }
-
-#if FD_HAS_AVX512
-  while( data_sz>=512UL ) {
-    wwv_t x0 = wwv_or( wwv_ldu( data       ), wwv_ldu( data+ 64UL ) );
-    wwv_t x1 = wwv_or( wwv_ldu( data+128UL ), wwv_ldu( data+192UL ) );
-    wwv_t x2 = wwv_or( wwv_ldu( data+256UL ), wwv_ldu( data+320UL ) );
-    wwv_t x3 = wwv_or( wwv_ldu( data+384UL ), wwv_ldu( data+448UL ) );
-    wwv_t x  = wwv_or( wwv_or( x0, x1 ), wwv_or( x2, x3 ) );
-    if( FD_UNLIKELY( _mm512_test_epi64_mask( x, x ) ) ) return 0;
-    data    += 512UL;
-    data_sz -= 512UL;
-  }
-#elif FD_HAS_AVX
-  while( data_sz>=256UL ) {
-    wv_t x0 = wv_or( wv_ldu( data       ), wv_ldu( data+ 32UL ) );
-    wv_t x1 = wv_or( wv_ldu( data+ 64UL ), wv_ldu( data+ 96UL ) );
-    wv_t x2 = wv_or( wv_ldu( data+128UL ), wv_ldu( data+160UL ) );
-    wv_t x3 = wv_or( wv_ldu( data+192UL ), wv_ldu( data+224UL ) );
-    wv_t x  = wv_or( wv_or( x0, x1 ), wv_or( x2, x3 ) );
-    if( FD_UNLIKELY( !_mm256_testz_si256( x, x ) ) ) return 0;
-    data    += 256UL;
-    data_sz -= 256UL;
-  }
-#endif
-
-  for( ulong i=0UL; i<data_sz; i++ )
-    if( FD_UNLIKELY( data[i] ) ) return 0;
-
-  return 1;
-}
+FD_FN_PURE int
+fd_borrowed_account_is_zeroed( fd_borrowed_account_t const * borrowed_acct );
 
 FD_PROTOTYPES_END
 

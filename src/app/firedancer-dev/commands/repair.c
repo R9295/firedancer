@@ -24,9 +24,10 @@
 #include "../../../discof/restore/utils/fd_ssmanifest_parser.h"
 #include "../../../discof/genesis/fd_genesi_tile.h"
 #include "../../../flamenco/runtime/sysvar/fd_sysvar_epoch_schedule.h"
-#include "../../../flamenco/stakes/fd_stake_weight.h"
+#include "../../../flamenco/stakes/fd_stake_weight_sort.h"
 #include "../../../flamenco/leaders/fd_leaders_base.h"
-#include "../../../discof/repair/fd_repair_tile.c"
+#include "../../../discof/repair/fd_repair_tile_private.h"
+#include "../../../discof/tower/fd_tower_tile.h"
 
 #include "gossip.h"
 #include "core_subtopo.h"
@@ -221,7 +222,7 @@ repair_load_manifest( fd_topo_t *  topo,
   fd_epoch_schedule_t const * schedule = &schedule_local;
   ulong epoch = fd_slot_to_epoch( schedule, manifest->slot, NULL );
 
-  ulong epoch_stakes_base      = epoch > 0UL ? epoch - 1UL : 0UL;
+  ulong epoch_stakes_base      = epoch > 3UL ? epoch - 3UL : 0UL;
   ulong leader_schedule_epoch  = fd_slot_to_leader_schedule_epoch( schedule, manifest->slot );
   ulong cur_idx = epoch - epoch_stakes_base;
   FD_TEST( cur_idx < FD_RUNTIME_MANIFEST_EPOCH_STAKES_LEN );
@@ -429,14 +430,16 @@ repair_topo( config_t * config ) {
 
   /**/                 fd_topob_tile_out( topo, "repair",  0UL,                       "repair_net",    0UL                                                  );
 
-  /* Sign links don't need to be reliable because they are synchronous,
-    so there's at most one fragment in flight at a time anyway.  The
-    sign links are also not polled by the mux, instead the tiles will
-    read the sign responses out of band in a dedicated spin loop. */
+  /* Sign links don't need to be reliable because each requester has a
+     small bounded number of requests in flight: one for the tiles that
+     sign synchronously and read the response out of band in a spin
+     loop (their response link is not polled by fd_stem), and up to
+     FD_SHRED_SIGN_PEND_MAX for shred, which takes its responses as
+     ordinary polled frags. */
   for( ulong i=0UL; i<shred_tile_cnt; i++ ) {
     /**/               fd_topob_tile_in(  topo, "sign",   0UL,           "metric_in", "shred_sign",    i,            FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
     /**/               fd_topob_tile_out( topo, "shred",  i,                          "shred_sign",    i                                                    );
-    /**/               fd_topob_tile_in(  topo, "shred",  i,             "metric_in", "sign_shred",    i,            FD_TOPOB_UNRELIABLE, FD_TOPOB_UNPOLLED );
+    /**/               fd_topob_tile_in(  topo, "shred",  i,             "metric_in", "sign_shred",    i,            FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
     /**/               fd_topob_tile_out( topo, "sign",   0UL,                        "sign_shred",    i                                                    );
   }
   FOR(gossvf_tile_cnt) fd_topob_tile_in ( topo, "gossvf",   i,           "metric_in", "replay_epoch",  0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED   );
@@ -453,7 +456,7 @@ repair_topo( config_t * config ) {
   FOR(sign_tile_cnt-1) fd_topob_tile_in ( topo, "repair", 0UL,           "metric_in", "sign_repair",   i,            FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
 
   /**/                 fd_topob_tile_out( topo, "repair", 0UL,                        "repair_out",   0UL                                                   );
-  /**/                 fd_topob_tile_in ( topo, "gossip", 0UL,           "metric_in", "sign_gossip",   0UL,          FD_TOPOB_UNRELIABLE, FD_TOPOB_UNPOLLED );
+  /**/                 fd_topob_tile_in ( topo, "gossip", 0UL,           "metric_in", "sign_gossip",   0UL,          FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
   /**/                 fd_topob_tile_in ( topo, "ipecho", 0UL,           "metric_in", "genesi_out",    0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED   );
   /**/                 fd_topob_tile_in ( topo, "repair", 0UL,           "metric_in", "tower_out",     0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED   );
 
@@ -781,8 +784,8 @@ print_tile_metrics( volatile ulong * shred_metrics,
 #define DIFFX(METRIC) repair_metrics[ MIDX( COUNTER, TILE, METRIC ) ] - repair_metrics_prev[ MIDX( COUNTER, TILE, METRIC ) ]
   ulong hkeep_ticks        = DIFFX(REGIME_DURATION_NANOS_CAUGHT_UP_HOUSEKEEPING) + DIFFX(REGIME_DURATION_NANOS_PROCESSING_HOUSEKEEPING) + DIFFX(REGIME_DURATION_NANOS_BACKPRESSURE_HOUSEKEEPING);
   ulong busy_ticks         = DIFFX(REGIME_DURATION_NANOS_PROCESSING_PREFRAG) + DIFFX(REGIME_DURATION_NANOS_PROCESSING_POSTFRAG ) + DIFFX(REGIME_DURATION_NANOS_CAUGHT_UP_PREFRAG);
-  ulong caught_up_ticks    = DIFFX(REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG);
-  ulong backpressure_ticks = DIFFX(REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG);
+  ulong caught_up_ticks    = DIFFX(REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG) + DIFFX(REGIME_DURATION_NANOS_CAUGHT_UP_SLEEPING);
+  ulong backpressure_ticks = DIFFX(REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG) + DIFFX(REGIME_DURATION_NANOS_BACKPRESSURE_SLEEPING);
   ulong total_ticks = hkeep_ticks + busy_ticks + caught_up_ticks + backpressure_ticks;
 
   printf( " Repair Hkeep: %.1f %%  Busy: %.1f %%  Idle: %.1f %%  Backp: %0.1f %%\n",

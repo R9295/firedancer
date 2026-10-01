@@ -14,6 +14,14 @@
 #define AG_POOL_ERR_SLASHABLE          (-3)
 #define AG_POOL_ERR_CERT_VERIFY        (-4)
 
+#define AG_POOL_QUORUM_REACHED_FINAL          (AG_CERT_KIND_FINAL)
+#define AG_POOL_QUORUM_REACHED_FAST_FINAL     (AG_CERT_KIND_FAST_FINAL)
+#define AG_POOL_QUORUM_REACHED_NOTAR          (AG_CERT_KIND_NOTAR)
+#define AG_POOL_QUORUM_REACHED_NOTAR_FALLBACK (AG_CERT_KIND_NOTAR_FALLBACK)
+#define AG_POOL_QUORUM_REACHED_SKIP           (AG_CERT_KIND_SKIP)
+#define AG_POOL_QUORUM_REACHED_SAFE_TO_NOTAR  (5)
+#define AG_POOL_QUORUM_REACHED_SAFE_TO_SKIP   (6)
+
 typedef struct ag_pool ag_pool_t;
 
 FD_PROTOTYPES_BEGIN
@@ -54,15 +62,32 @@ ag_pool_advance_epoch( ag_pool_t *             self,
                        ulong                   epoch_rank,
                        ulong                   epoch_slot );
 
+/* Replaces our rank in the epoch starting at epoch_slot, for when our
+   identity changes after the epoch advanced.  The epoch's live slot
+   states then treat the new rank's votes as ours.  USHORT_MAX if we
+   are not ranked in that epoch. */
+
+void
+ag_pool_set_rank( ag_pool_t * self,
+                  ulong       epoch_slot,
+                  ulong       epoch_rank );
+
+/* Definition 13. Pool::add_cert */
+
 int
 ag_pool_add_cert( ag_pool_t *       self,
                   ag_cert_t const * cert,
                   fd_bls_set_t *    bad );
 
+/* Definition 12. Pool::add_vote */
+
 int
 ag_pool_add_vote( ag_pool_t *       self,
                   ag_vote_t const * vote,
-                  fd_bls_set_t *    bad );
+                  fd_bls_set_t *    bad,
+                  uchar *           quorum_reached );
+
+/* Definition 16. Pool::add_block */
 
 int
 ag_pool_add_block( ag_pool_t *           self,
@@ -70,25 +95,33 @@ ag_pool_add_block( ag_pool_t *           self,
                    ag_block_id_t const * parent_id,
                    fd_bls_set_t *        bad );
 
+/* PoolImpl::slot_state, read-only */
+
 ag_slot_state_t const *
 ag_pool_slot_state( ag_pool_t const * self,
                     ulong             slot );
 
+/* Section 4.1. Pool::recover_from_standstill */
+
 void
 ag_pool_recover_from_standstill( ag_pool_t * self );
+
+/* Definition 14. Pool::finalized_slot */
 
 FD_FN_PURE ulong
 ag_pool_finalized_slot( ag_pool_t const * self );
 
-int
-ag_pool_finalized_block_hash( ag_pool_t const * self,
-                              ulong             slot,
-                              ag_block_hash_t   out_hash );
+FD_FN_PURE uchar const *
+ag_pool_finalized_block_hash( ag_pool_t const * self );
+
+/* Definition 15. Pool::parents_ready */
 
 ag_block_id_t const *
 ag_pool_parents_ready( ag_pool_t * self,
                        ulong       slot,
                        ulong *     cnt );
+
+/* Definition 15. Pool::wait_for_parent_ready; slot ULONG_MAX is the pending receiver */
 
 ag_block_id_t
 ag_pool_wait_for_parent_ready( ag_pool_t * self,
@@ -101,6 +134,9 @@ ag_pool_poll_pool_event( ag_pool_t *       self,
 int
 ag_pool_poll_repair_event( ag_pool_t *         self,
                            ag_event_repair_t * event );
+
+FD_FN_PURE ulong
+ag_pool_pool_event_cnt( ag_pool_t const * self );
 
 FD_PROTOTYPES_END
 

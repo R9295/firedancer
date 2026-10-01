@@ -12,6 +12,7 @@
 #include "../fd_flamenco_base.h"
 #include "../accdb/fd_accdb.h"
 #include "../alpenglow/fd_alpenglow.h"
+#include "../../disco/pack/fd_microblock.h"
 
 /* The general structure for executing transactions in Firedancer can
    be thought of as a state machine where transaction execution is a
@@ -167,6 +168,10 @@ struct fd_runtime {
 
     struct {
       fd_vote_state_versioned_t vote_state;
+    } deposit_delegator_rewards;
+
+    struct {
+      fd_vote_state_versioned_t vote_state;
     } withdraw;
 
     struct {
@@ -208,6 +213,10 @@ struct fd_runtime {
     ulong cu_cum;
     ulong instr_cum;
     ulong cpi_cum;
+
+    /* Committed writable accounts left byte-identical by the txn,
+       whose lthash update was skipped */
+    ulong lthash_unchanged_cnt;
   } metrics;
 
   struct {
@@ -319,6 +328,10 @@ struct fd_txn_out {
     uchar vote_update [ MAX_TX_ACCOUNT_LOCKS ];
     uchar new_vote    [ MAX_TX_ACCOUNT_LOCKS ];
     uchar rm_vote     [ MAX_TX_ACCOUNT_LOCKS ];
+
+    /* Set when the transaction modifies the account (agave's touch).
+       Only touched writable accounts are committed. */
+    uchar touched     [ MAX_TX_ACCOUNT_LOCKS ];
 
     ulong nonce_idx_in_txn; /* !=ULONG_MAX if exists */
     ulong nonce_rollback_data_len;

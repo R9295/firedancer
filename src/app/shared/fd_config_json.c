@@ -11,7 +11,7 @@
    or knowingly skipped) before the constant is bumped.  String keys of
    the user's own file are separately forced through the classification
    lists below. */
-FD_STATIC_ASSERT( sizeof(fd_config_t)==22987008UL, update_fd_config_to_json_for_the_layout_change );
+FD_STATIC_ASSERT( sizeof(fd_config_t)==22991088UL, update_fd_config_to_json_for_the_layout_change );
 
 #define REDACTED "[redacted]"
 
@@ -110,6 +110,7 @@ static char const * const jw_redacted_keys[] = {
   "paths.snapshots",
   "paths.genesis",
   "paths.accounts",
+  "paths.stake_delegations",
   "paths.shredb",
   "paths.guidb",
   "log.path",
@@ -141,6 +142,7 @@ static char const * const jw_redacted_keys[] = {
 
 static char const * const jw_reported_keys[] = {
   "name",
+  "layout.mode",
   "log.colorize",
   "log.level_logfile",
   "log.level_stderr",
@@ -314,14 +316,15 @@ fd_config_to_json( fd_config_t const * config,
   jw_str  ( &w, "action",            config->action );
 
   jw_obj_open( &w, "paths" );
-    jw_path( &w, "base",         config->paths.base );
-    jw_path( &w, "identity_key", config->paths.identity_key );
-    jw_path( &w, "vote_account", config->paths.vote_account );
-    jw_path( &w, "snapshots",    config->paths.snapshots );
-    jw_path( &w, "genesis",      config->paths.genesis );
-    jw_path( &w, "accounts",     config->paths.accounts );
-    jw_path( &w, "shredb",       config->paths.shredb );
-    jw_path( &w, "guidb",        config->paths.guidb );
+    jw_path( &w, "base",                    config->paths.base );
+    jw_path( &w, "identity_key",            config->paths.identity_key );
+    jw_path( &w, "vote_account",            config->paths.vote_account );
+    jw_path( &w, "snapshots",               config->paths.snapshots );
+    jw_path( &w, "genesis",                 config->paths.genesis );
+    jw_path( &w, "accounts",                config->paths.accounts );
+    jw_path( &w, "stake_delegations",       config->paths.stake_delegations );
+    jw_path( &w, "shredb",                  config->paths.shredb );
+    jw_path( &w, "guidb",                   config->paths.guidb );
     jw_path_arr( &w, "authorized_voter_paths", f->paths.authorized_voter_paths_cnt );
   jw_obj_close( &w );
 
@@ -353,6 +356,7 @@ fd_config_to_json( fd_config_t const * config,
     jw_ulong( &w, "quic_tile_count",   config->layout.quic_tile_count );
     jw_ulong( &w, "verify_tile_count", config->layout.verify_tile_count );
     jw_ulong( &w, "shred_tile_count",  config->layout.shred_tile_count );
+    jw_str  ( &w, "mode",                       f->layout.mode );
     jw_bool ( &w, "enable_block_production",    f->layout.enable_block_production );
     jw_bool ( &w, "enable_snapshot_production", f->layout.enable_snapshot_production );
     jw_ulong( &w, "sign_tile_count",            f->layout.sign_tile_count );
@@ -593,7 +597,6 @@ fd_config_to_json( fd_config_t const * config,
       jw_ulong( &w, "gui_listen_port",           config->tiles.gui.gui_listen_port );
       jw_ulong( &w, "max_http_connections",      config->tiles.gui.max_http_connections );
       jw_ulong( &w, "max_websocket_connections", config->tiles.gui.max_websocket_connections );
-      jw_ulong( &w, "max_http_request_length",   config->tiles.gui.max_http_request_length );
       jw_ulong( &w, "send_buffer_size_mb",       config->tiles.gui.send_buffer_size_mb );
       jw_ulong( &w, "db_size_gib",               config->tiles.gui.db_size_gib );
     jw_obj_close( &w );
@@ -603,7 +606,6 @@ fd_config_to_json( fd_config_t const * config,
       jw_ulong( &w, "rpc_listen_port",           config->tiles.rpc.rpc_listen_port );
       jw_ulong( &w, "max_http_connections",      config->tiles.rpc.max_http_connections );
       jw_ulong( &w, "max_websocket_connections", config->tiles.rpc.max_websocket_connections );
-      jw_ulong( &w, "max_http_request_length",   config->tiles.rpc.max_http_request_length );
       jw_ulong( &w, "send_buffer_size_mb",       config->tiles.rpc.send_buffer_size_mb );
       jw_bool ( &w, "delay_startup",             config->tiles.rpc.delay_startup );
     jw_obj_close( &w );

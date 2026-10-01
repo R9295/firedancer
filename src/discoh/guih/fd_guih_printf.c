@@ -937,8 +937,10 @@ fd_guih_printf_tile_timers( fd_guih_t *                   gui,
          JSON. */
       idle_ratio = -1;
     } else {
-      ulong idle_time         = cur[ i ].timers[ FD_METRICS_ENUM_TILE_REGIME_V_CAUGHT_UP_POSTFRAG_IDX   ] - prev[ i ].timers[ FD_METRICS_ENUM_TILE_REGIME_V_CAUGHT_UP_POSTFRAG_IDX   ];
-      ulong backpressure_time = cur[ i ].timers[ FD_METRICS_ENUM_TILE_REGIME_V_BACKPRESSURE_PREFRAG_IDX ] - prev[ i ].timers[ FD_METRICS_ENUM_TILE_REGIME_V_BACKPRESSURE_PREFRAG_IDX ];
+      ulong idle_time         = cur[ i ].timers[ FD_METRICS_ENUM_TILE_REGIME_V_CAUGHT_UP_POSTFRAG_IDX    ] - prev[ i ].timers[ FD_METRICS_ENUM_TILE_REGIME_V_CAUGHT_UP_POSTFRAG_IDX    ]
+                              + cur[ i ].timers[ FD_METRICS_ENUM_TILE_REGIME_V_CAUGHT_UP_SLEEPING_IDX    ] - prev[ i ].timers[ FD_METRICS_ENUM_TILE_REGIME_V_CAUGHT_UP_SLEEPING_IDX    ];
+      ulong backpressure_time = cur[ i ].timers[ FD_METRICS_ENUM_TILE_REGIME_V_BACKPRESSURE_PREFRAG_IDX  ] - prev[ i ].timers[ FD_METRICS_ENUM_TILE_REGIME_V_BACKPRESSURE_PREFRAG_IDX  ]
+                              + cur[ i ].timers[ FD_METRICS_ENUM_TILE_REGIME_V_BACKPRESSURE_SLEEPING_IDX ] - prev[ i ].timers[ FD_METRICS_ENUM_TILE_REGIME_V_BACKPRESSURE_SLEEPING_IDX ];
       idle_ratio = (double)(idle_time+backpressure_time) / (double)(cur_total - prev_total);
     }
 
@@ -1069,7 +1071,7 @@ fd_guih_printf_tile_metrics( fd_guih_t *                   gui,
   jsonp_close_array( gui->http );
   jsonp_open_array( gui->http, "priority" );
     for( ulong i=0UL; i<gui->topo->tile_cnt; i++ ) {
-      int priority = fd_topob_tile_priority_type( gui->topo->tiles[ i ].name );
+      int priority = fd_topob_tile_priority_type( &gui->topo->tiles[ i ] );
 
       char const * priority_type_str = "unknown";
       switch( priority ) {

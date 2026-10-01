@@ -10,14 +10,43 @@
 #include "ag_epoch_info.h"
 #include "ag_vote.h"
 
+static inline void
+bls_key_from_sec( ag_bls_key_t         out,
+                  fd_bls_sec_t const * sec ) {
+  fd_bls_pub_t pub[1];
+  fd_bls_sec_to_pub( sec, pub );
+  blst_p1_compress( out, pub );
+}
+
+/* epoch_info_build fills epoch_info from an already ranked validator
+   list.  Production ranks in the votor tile (rank_voters). */
+
+static inline void
+epoch_info_build( ag_epoch_info_t *           epoch_info,
+                  ag_validator_info_t const * validators,
+                  ulong                       validator_cnt ) {
+  epoch_info->total_stake = 0UL;
+  for( ulong i=0UL; i<validator_cnt; i++ ) {
+    FD_TEST( validators[i].id==i );
+    epoch_info->validators[i] = validators[i];
+    FD_TEST( !fd_bls_pub_de( &epoch_info->pubkeys[i], validators[i].bls_key, sizeof(ag_bls_key_t) ) );
+    epoch_info->total_stake  += validators[i].stake;
+  }
+  epoch_info->validator_cnt = validator_cnt;
+}
+
+static uchar const test_bls_public_key[ FD_BLS_PUB_COMPRESSED_SZ ] = {0};
+
 /* sec_sign_fn is the fd_bls_sign_fn of a test that holds the secret
    key in memory; ctx points to the fd_bls_sec_t. */
 
-static void
+static inline void
 sec_sign_fn( void *         ctx,
              fd_bls_sig_t * sig,
+             uchar const *  public_key,
              uchar const *  msg,
              ulong          msg_sz ) {
+  (void)public_key;
   fd_bls_sec_sign( (fd_bls_sec_t const *)ctx, msg, msg_sz, sig );
 }
 

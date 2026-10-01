@@ -14,6 +14,7 @@
 
 #include <sys/socket.h> /* SOCK_CLOEXEC, SOCK_NONBLOCK needed for seccomp filter */
 
+#include <linux/futex.h>
 #include "generated/fd_gui_tile_seccomp.h"
 
 #include "../../disco/tiles.h"
@@ -26,18 +27,20 @@
 #include "../../disco/metrics/fd_metrics.h"
 #include "../../disco/net/fd_net_tile.h"
 #include "../../disco/waker/fd_waker.h"
+#include "../../disco/sleep/fd_sleep.h"
 #include "../../disco/fd_clock_tile.h"
 #include "../../discof/genesis/fd_genesi_tile.h" // TODO: Layering violation
 #include "../../ballet/sha256/fd_sha256.h"
 #include "../../ballet/base64/fd_base64.h"
 #include "../../waltz/http/fd_http_server.h"
 #include "../../waltz/http/fd_http_server_private.h"
-#include "../../third_party/cjson/cJSON_alloc.h"
 #include "../../discof/repair/fd_repair.h"
 #include "../../discof/replay/fd_replay_tile.h"
 #include "../../discof/votor/fd_votor_tile.h"
 #include "../../disco/shred/fd_shred_tile.h"
 #include "../../flamenco/accdb/fd_accdb_shmem.h"
+
+FD_STATIC_ASSERT( FD_METRICS_ENUM_GUI_DB_CNT==FD_GUI_HIST_CNT, gui_db_enum );
 
 #define IN_KIND_PACK_EXECLE   ( 2UL)
 #define IN_KIND_PACK_POH      ( 3UL)
@@ -113,6 +116,8 @@ typedef struct {
   ulong in_cnt;
   ulong idle_cnt;
 
+  long deadline_ticks;
+
   fd_clock_tile_t clock[1];
 
   ulong chunk;
@@ -153,7 +158,6 @@ typedef struct {
 
   ulong           in_kind[ FD_TOPO_MAX_TILE_IN_LINKS ];
   int             in_reliable[ FD_TOPO_MAX_TILE_IN_LINKS ];
-  ulong *         in_fseq    [ FD_TOPO_MAX_TILE_IN_LINKS ];
   ulong           in_bank_idx[ FD_TOPO_MAX_TILE_IN_LINKS ];
   fd_gui_in_ctx_t in[ FD_TOPO_MAX_TILE_IN_LINKS ];
 
@@ -166,7 +170,6 @@ scratch_align( void ) {
   a = fd_ulong_max( a, fd_http_server_align() );
   a = fd_ulong_max( a, fd_gui_peers_align() );
   a = fd_ulong_max( a, fd_gui_align() );
-  a = fd_ulong_max( a, fd_alloc_align() );
   return a;
 }
 
@@ -182,13 +185,7 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
   l = FD_LAYOUT_APPEND( l, fd_gui_peers_align(),    fd_gui_peers_footprint( http_param.max_ws_connection_cnt ) );
   l = FD_LAYOUT_APPEND( l, fd_gui_align(),          fd_gui_footprint( tile->gui.tile_cnt, tile->gui.max_live_slots, tile->gui.max_txn_per_slot ) );
   l = FD_LAYOUT_APPEND( l, fd_gui_store_align(),    fd_gui_store_footprint( tile->gui.db_size_gib<<30, fd_gui_hist_db_cnt(), fd_gui_hist_db_descs( tile->gui.db_size_gib<<30 ) ) );
-  l = FD_LAYOUT_APPEND( l, fd_alloc_align(),        fd_alloc_footprint() );
   return FD_LAYOUT_FINI( l, scratch_align() );
-}
-
-FD_FN_PURE static inline ulong
-loose_footprint( fd_topo_tile_t const * tile FD_PARAM_UNUSED ) {
-  return 128UL * (1UL<<20UL); /* 128MiB of heap space for the cJSON allocator */
 }
 
 static inline void
@@ -260,14 +257,25 @@ metrics_write( fd_gui_ctx_t * ctx ) {
   FD_MCNT_ENUM_COPY( GUI, DB_FORCED_EVICTION,    hist_reserves );
 }
 
+static inline void
+deadline_update( fd_gui_ctx_t * ctx,
+                 long           now ) {
+  long due = fd_long_min( fd_gui_next_deadline( ctx->gui ), fd_gui_peers_next_deadline( ctx->peers ) );
+  ctx->deadline_ticks = due-now>=FD_SLEEP_PARK_CAP_NS ? LONG_MAX : fd_clock_tile_wallclock_to_tickcount( ctx->clock, due );
+}
+
+static long
+next_deadline( fd_gui_ctx_t const * ctx ) {
+  return ctx->deadline_ticks;
+}
+
 static void
 before_credit( fd_gui_ctx_t *      ctx,
                fd_stem_context_t * stem,
                int *               charge_busy ) {
-  (void)stem;
-
   ctx->idle_cnt++;
-  if( FD_LIKELY( ctx->idle_cnt<2UL*ctx->in_cnt ) ) return;
+  int due = stem->now>=ctx->deadline_ticks;
+  if( FD_LIKELY( ctx->idle_cnt<2UL*ctx->in_cnt && !due ) ) return;
   ctx->idle_cnt = 0UL;
 
   int charge_busy_server = 0;
@@ -289,6 +297,8 @@ before_credit( fd_gui_ctx_t *      ctx,
   int charge_poll = 0;
   charge_poll |= fd_gui_poll( ctx->gui, now );
   charge_poll |= fd_gui_peers_poll( ctx->peers, now );
+
+  deadline_update( ctx, now );
 
   *charge_busy = charge_busy_server | charge_poll;
 }
@@ -527,7 +537,7 @@ after_frag( fd_gui_ctx_t *      ctx,
     case IN_KIND_REPAIR_NET: {
       if( FD_UNLIKELY( ctx->parsed.repair_net.slot==ULONG_MAX ) ) break;
       long tsorig_ns = fd_clock_tile_tickcomp_to_wallclock( ctx->clock, tsorig );
-      fd_gui_handle_repair_request( ctx->gui, ctx->parsed.repair_net.slot, ctx->parsed.repair_net.shred_idx, tsorig_ns );
+      fd_gui_handle_repair_request( ctx->gui, ctx->parsed.repair_net.slot, ctx->parsed.repair_net.shred_idx, tsorig_ns, fd_clock_tile_now( ctx->clock ) );
       break;
     }
     case IN_KIND_NET_GOSSVF: {
@@ -589,7 +599,7 @@ after_frag( fd_gui_ctx_t *      ctx,
         FD_LOG_ERR(( "unexpected poh packet type %lu", fd_disco_poh_sig_pkt_type( sig ) ));
       }
       /* The link is shallow; return the credit now, like the execle. */
-      fd_fseq_update( ctx->in_fseq[ in_idx ], seq+1UL );
+      fd_stem_credit_return( stem, in_idx, seq+1UL );
       break;
     }
     case IN_KIND_EXECLE_POH: {
@@ -904,7 +914,6 @@ unprivileged_init( fd_topo_t const *      topo,
   void * _peers      = FD_SCRATCH_ALLOC_APPEND( l, fd_gui_peers_align(),    fd_gui_peers_footprint( http_param.max_ws_connection_cnt) );
   void * _gui        = FD_SCRATCH_ALLOC_APPEND( l, fd_gui_align(),          fd_gui_footprint( tile->gui.tile_cnt, tile->gui.max_live_slots, tile->gui.max_txn_per_slot ) );
                        FD_SCRATCH_ALLOC_APPEND( l, fd_gui_store_align(),       fd_gui_store_footprint( tile->gui.db_size_gib<<30, fd_gui_hist_db_cnt(), fd_gui_hist_db_descs( tile->gui.db_size_gib<<30 ) ) );
-  void * _alloc      = FD_SCRATCH_ALLOC_APPEND( l, fd_alloc_align(),        fd_alloc_footprint()                                      );
 
   fd_http_static_file_t const * index_html = index_html_etag_init( ctx );
 
@@ -983,12 +992,8 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->waker_fseq = fd_fseq_join( fd_topo_obj_laddr( topo, tile->waker_fseq_obj_id ) );
   FD_TEST( ctx->waker_fseq );
 
-  fd_alloc_t * alloc = fd_alloc_join( fd_alloc_new( _alloc, 1UL ), 1UL );
-  FD_TEST( alloc );
-  cJSON_alloc_install( alloc );
-
-
-  ctx->idle_cnt = 0UL;
+  ctx->idle_cnt       = 0UL;
+  deadline_update( ctx, fd_clock_tile_now( ctx->clock ) );
   FD_TEST( tile->in_cnt<=sizeof(ctx->in)/sizeof(ctx->in[0]) );
   ctx->in_cnt = tile->in_cnt;
 
@@ -996,11 +1001,7 @@ unprivileged_init( fd_topo_t const *      topo,
     fd_topo_link_t const * link = &topo->links[ tile->in_link_id[ i ] ];
     fd_topo_wksp_t const * link_wksp = &topo->workspaces[ topo->objs[ link->dcache_obj_id ].wksp_id ];
 
-    if( FD_LIKELY( !strcmp( link->name, "pack_execle"  ) ) ) {
-      ctx->in_kind[ i ] = IN_KIND_PACK_EXECLE;
-      ctx->in_fseq[ i ] = fd_fseq_join( fd_topo_obj_laddr( topo, tile->in_link_fseq_obj_id[ i ] ) );
-      FD_TEST( ctx->in_fseq[ i ] );
-    }
+    if( FD_LIKELY( !strcmp( link->name, "pack_execle"  ) ) ) ctx->in_kind[ i ] = IN_KIND_PACK_EXECLE;
     else if( FD_LIKELY( !strcmp( link->name, "pack_poh"     ) ) ) ctx->in_kind[ i ] = IN_KIND_PACK_POH;
     else if( FD_LIKELY( !strcmp( link->name, "execle_poh"   ) ) ) ctx->in_kind[ i ] = IN_KIND_EXECLE_POH;
     else if( FD_LIKELY( !strcmp( link->name, "shred_out"    ) ) ) ctx->in_kind[ i ] = IN_KIND_SHRED_OUT;
@@ -1013,7 +1014,7 @@ unprivileged_init( fd_topo_t const *      topo,
     else if( FD_LIKELY( !strcmp( link->name, "snapct_gui"    ) ) ) ctx->in_kind[ i ] = IN_KIND_SNAPCT;
     else if( FD_LIKELY( !strcmp( link->name, "repair_net"    ) ) ) ctx->in_kind[ i ] = IN_KIND_REPAIR_NET;
     else if( FD_LIKELY( !strcmp( link->name, "tower_out"     ) ) ) ctx->in_kind[ i ] = IN_KIND_TOWER_OUT;
-    else if( FD_LIKELY( !strcmp( link->name, "replay_out"    ) ) ) ctx->in_kind[ i ] = IN_KIND_REPLAY_OUT;
+    else if( FD_LIKELY( !strcmp( link->name, "replay_slot"   ) ) ) ctx->in_kind[ i ] = IN_KIND_REPLAY_OUT;
     else if( FD_LIKELY( !strcmp( link->name, "replay_epoch"  ) ) ) ctx->in_kind[ i ] = IN_KIND_EPOCH;
     else if( FD_LIKELY( !strcmp( link->name, "genesi_out"    ) ) ) ctx->in_kind[ i ] = IN_KIND_GENESI_OUT;
     else if( FD_LIKELY( !strcmp( link->name, "snapin_gui"    ) ) ) ctx->in_kind[ i ] = IN_KIND_SNAPIN;
@@ -1099,6 +1100,7 @@ rlimit_file_cnt( fd_topo_t const *      topo FD_PARAM_UNUSED,
 #define STEM_CALLBACK_DURING_HOUSEKEEPING during_housekeeping
 #define STEM_CALLBACK_METRICS_WRITE       metrics_write
 #define STEM_CALLBACK_BEFORE_CREDIT       before_credit
+#define STEM_CALLBACK_NEXT_DEADLINE       next_deadline
 #define STEM_CALLBACK_BEFORE_FRAG         before_frag
 #define STEM_CALLBACK_DURING_FRAG         during_frag
 #define STEM_CALLBACK_RETURNABLE_FRAG     returnable_frag
@@ -1114,7 +1116,6 @@ fd_topo_run_tile_t fd_tile_gui = {
   .populate_allowed_fds     = populate_allowed_fds,
   .scratch_align            = scratch_align,
   .scratch_footprint        = scratch_footprint,
-  .loose_footprint          = loose_footprint,
   .privileged_init          = privileged_init,
   .unprivileged_init        = unprivileged_init,
   .run                      = stem_run,

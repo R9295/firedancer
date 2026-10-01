@@ -43,11 +43,17 @@
 | <span class="metrics-name">tile_&#8203;regime_&#8203;duration_&#8203;nanos</span><br/>{tile_&#8203;regime="<span class="metrics-enum">backpressure_&#8203;prefrag</span>"} | counter | Mutually exclusive and exhaustive duration the tile spent in each regime, in nanoseconds (Backpressure + Prefrag) |
 | <span class="metrics-name">tile_&#8203;regime_&#8203;duration_&#8203;nanos</span><br/>{tile_&#8203;regime="<span class="metrics-enum">caught_&#8203;up_&#8203;postfrag</span>"} | counter | Mutually exclusive and exhaustive duration the tile spent in each regime, in nanoseconds (Caught up + Postfrag) |
 | <span class="metrics-name">tile_&#8203;regime_&#8203;duration_&#8203;nanos</span><br/>{tile_&#8203;regime="<span class="metrics-enum">processing_&#8203;postfrag</span>"} | counter | Mutually exclusive and exhaustive duration the tile spent in each regime, in nanoseconds (Processing + Postfrag) |
+| <span class="metrics-name">tile_&#8203;regime_&#8203;duration_&#8203;nanos</span><br/>{tile_&#8203;regime="<span class="metrics-enum">caught_&#8203;up_&#8203;sleeping</span>"} | counter | Mutually exclusive and exhaustive duration the tile spent in each regime, in nanoseconds (Caught up + Sleeping) |
+| <span class="metrics-name">tile_&#8203;regime_&#8203;duration_&#8203;nanos</span><br/>{tile_&#8203;regime="<span class="metrics-enum">backpressure_&#8203;sleeping</span>"} | counter | Mutually exclusive and exhaustive duration the tile spent in each regime, in nanoseconds (Backpressure + Sleeping) |
 | <span class="metrics-name">tile_&#8203;cpu_&#8203;duration_&#8203;nanos</span><br/>{cpu_&#8203;regime="<span class="metrics-enum">wait</span>"} | counter | CPU time spent in each CPU regime, in nanoseconds (Wait (task was runnable but not scheduled)) |
 | <span class="metrics-name">tile_&#8203;cpu_&#8203;duration_&#8203;nanos</span><br/>{cpu_&#8203;regime="<span class="metrics-enum">idle</span>"} | counter | CPU time spent in each CPU regime, in nanoseconds (Idle (task was not runnable)) |
 | <span class="metrics-name">tile_&#8203;cpu_&#8203;duration_&#8203;nanos</span><br/>{cpu_&#8203;regime="<span class="metrics-enum">user</span>"} | counter | CPU time spent in each CPU regime, in nanoseconds (User (task was scheduled and executing in user mode)) |
 | <span class="metrics-name">tile_&#8203;cpu_&#8203;duration_&#8203;nanos</span><br/>{cpu_&#8203;regime="<span class="metrics-enum">system</span>"} | counter | CPU time spent in each CPU regime, in nanoseconds (System (task was scheduled and executing in kernel mode)) |
 | <span class="metrics-name">tile_&#8203;cpu_&#8203;duration_&#8203;nanos</span><br/>{cpu_&#8203;regime="<span class="metrics-enum">interrupt</span>"} | counter | CPU time spent in each CPU regime, in nanoseconds (Interrupt (CPU time stolen by hardirq/softirq handlers or a hypervisor; fixed tiles only)) |
+| <span class="metrics-name">tile_&#8203;park</span> | counter | Times the tile attempted to park while idle (efficient mode) |
+| <span class="metrics-name">tile_&#8203;unpark</span><br/>{park_&#8203;wake="<span class="metrics-enum">ring</span>"} | counter | Times the tile resumed from a park attempt, by cause (Woken by a doorbell ring) |
+| <span class="metrics-name">tile_&#8203;unpark</span><br/>{park_&#8203;wake="<span class="metrics-enum">deadline</span>"} | counter | Times the tile resumed from a park attempt, by cause (Deadline or park cap lapsed) |
+| <span class="metrics-name">tile_&#8203;unpark</span><br/>{park_&#8203;wake="<span class="metrics-enum">pending</span>"} | counter | Times the tile resumed from a park attempt, by cause (Pre-park recheck found work, didn't park) |
 | <span class="metrics-name">tile_&#8203;irq_&#8203;preempted</span> | counter | Times the tile was interrupted by an IRQ (fixed tiles only) |
 | <span class="metrics-name">tile_&#8203;tlb_&#8203;shootdown</span> | counter | TLB shootdowns observed on the tile CPU (fixed tiles only) |
 | <span class="metrics-name">tile_&#8203;timer_&#8203;tick</span> | counter | Local timer interrupts (LOC) observed on the tile CPU (fixed tiles only) |
@@ -75,6 +81,14 @@
 | <span class="metrics-name">ipecho_&#8203;conn_&#8203;closed</span><br/>{conn_&#8203;close_&#8203;result="<span class="metrics-enum">error</span>"} | counter | Connections to the ipecho service made and closed, by outcome (Closed abnormally) |
 | <span class="metrics-name">ipecho_&#8203;bytes_&#8203;read</span> | counter | Bytes read from all connections to the ipecho service |
 | <span class="metrics-name">ipecho_&#8203;bytes_&#8203;written</span> | counter | Bytes written to all connections to the ipecho service |
+| <span class="metrics-name">ipecho_&#8203;port_&#8203;check_&#8203;udp_&#8203;sent</span> | counter | Port check UDP packets sent by the ipecho service to the joiner's UDP ports |
+| <span class="metrics-name">ipecho_&#8203;port_&#8203;check_&#8203;tcp</span><br/>{port_&#8203;check_&#8203;tcp_&#8203;result="<span class="metrics-enum">connected</span>"} | counter | Port check TCP connections opened by the ipecho service to the joiner's TCP ports, by outcome (Port check connections connected to the joiner's port) |
+| <span class="metrics-name">ipecho_&#8203;port_&#8203;check_&#8203;tcp</span><br/>{port_&#8203;check_&#8203;tcp_&#8203;result="<span class="metrics-enum">failed</span>"} | counter | Port check TCP connections opened by the ipecho service to the joiner's TCP ports, by outcome (Port check connections refused or errored) |
+| <span class="metrics-name">ipecho_&#8203;port_&#8203;check_&#8203;tcp</span><br/>{port_&#8203;check_&#8203;tcp_&#8203;result="<span class="metrics-enum">timeout</span>"} | counter | Port check TCP connections opened by the ipecho service to the joiner's TCP ports, by outcome (Port check connections timed out) |
+| <span class="metrics-name">ipecho_&#8203;port_&#8203;check_&#8203;tcp</span><br/>{port_&#8203;check_&#8203;tcp_&#8203;result="<span class="metrics-enum">dropped</span>"} | counter | Port check TCP connections opened by the ipecho service to the joiner's TCP ports, by outcome (Port check connections not attempted because the socket could not be created) |
+| <span class="metrics-name">ipecho_&#8203;port_&#8203;check_&#8203;tcp</span><br/>{port_&#8203;check_&#8203;tcp_&#8203;result="<span class="metrics-enum">rejected_&#8203;per_&#8203;ip</span>"} | counter | Port check TCP connections opened by the ipecho service to the joiner's TCP ports, by outcome (Port check connections rejected because too many were in flight for a particular IP) |
+| <span class="metrics-name">ipecho_&#8203;port_&#8203;check_&#8203;tcp</span><br/>{port_&#8203;check_&#8203;tcp_&#8203;result="<span class="metrics-enum">evicted</span>"} | counter | Port check TCP connections opened by the ipecho service to the joiner's TCP ports, by outcome (Port check connections evicted because there were too many in flight connections) |
+| <span class="metrics-name">ipecho_&#8203;port_&#8203;check_&#8203;tcp_&#8203;active</span> | gauge | Port check TCP connections opened by the ipecho service to the joiner's TCP ports currently in flight |
 
 </div>
 
@@ -130,24 +144,12 @@
 | <span class="metrics-name">snapin_&#8203;state</span> | gauge | 0=idle, 1=processing, 2=finishing, 3=error, 4=shutdown |
 | <span class="metrics-name">snapin_&#8203;full_&#8203;bytes_&#8203;read</span> | gauge | Bytes read so far from the full snapshot. Might decrease if snapshot load is aborted and restarted |
 | <span class="metrics-name">snapin_&#8203;incremental_&#8203;bytes_&#8203;read</span> | gauge | Bytes read so far from the incremental snapshot. Might decrease if snapshot load is aborted and restarted |
-| <span class="metrics-name">snapin_&#8203;account_&#8203;loaded</span> | gauge | Accounts seen during snapshot loading. Includes duplicates. Resets if snapshot load restarts |
+| <span class="metrics-name">snapin_&#8203;disk_&#8203;bytes_&#8203;written</span> | counter | Bytes this tile has written to the accounts database file |
+| <span class="metrics-name">snapin_&#8203;account_&#8203;loaded</span> | gauge | New accounts loaded during snapshot loading. Excludes replaced and ignored duplicates. Resets if snapshot load restarts |
 | <span class="metrics-name">snapin_&#8203;account_&#8203;replaced</span> | gauge | Previously inserted accounts replaced by a later duplicate. Resets if snapshot load restarts |
 | <span class="metrics-name">snapin_&#8203;account_&#8203;ignored</span> | gauge | Stale duplicate accounts dropped because a previously inserted account was newer. Resets if snapshot load restarts |
 | <span class="metrics-name">snapin_&#8203;account_&#8203;processed</span> | counter | Accounts processed across all snapshots (inserted or otherwise) |
 | <span class="metrics-name">snapin_&#8203;account_&#8203;batch_&#8203;processed</span> | counter | Account batches processed across all snapshots (parallelism indicator) |
-
-</div>
-
-## Snapwr Tile
-
-<div class="metrics">
-
-| Metric | Type | Description |
-|--------|------|-------------|
-| <span class="metrics-name">snapwr_&#8203;full_&#8203;bytes_&#8203;read</span> | gauge | Number of decompressed snapshot bytes consumed from the full snapshot. Might decrease if snapshot load is aborted and restarted |
-| <span class="metrics-name">snapwr_&#8203;incremental_&#8203;bytes_&#8203;read</span> | gauge | Number of decompressed snapshot bytes consumed from the incremental snapshot. Might decrease if snapshot load is aborted and restarted |
-| <span class="metrics-name">snapwr_&#8203;bytes_&#8203;written</span> | gauge | Number of bytes written to the accounts database on disk. Monotonically increasing across snapshot loads. |
-| <span class="metrics-name">snapwr_&#8203;accounts_&#8203;written</span> | gauge | Number of accounts written to the accounts database on disk. Might decrease if snapshot load is aborted and restarted |
 
 </div>
 
@@ -186,9 +188,10 @@
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| <span class="metrics-name">net_&#8203;pkt_&#8203;rx</span> | counter | Packets received |
-| <span class="metrics-name">net_&#8203;pkt_&#8203;rx_&#8203;bytes</span> | counter | Bytes received (including Ethernet header) |
-| <span class="metrics-name">net_&#8203;pkt_&#8203;rx_&#8203;undersize</span> | counter | Incoming packets dropped due to being too small |
+| <span class="metrics-name">net_&#8203;pkt_&#8203;rx</span> | counter | Number of packets successfully published to output links |
+| <span class="metrics-name">net_&#8203;pkt_&#8203;rx_&#8203;bytes</span> | counter | Number of bytes in packets successfully published to output links (including Ethernet header) |
+| <span class="metrics-name">net_&#8203;pkt_&#8203;rx_&#8203;malformed</span> | counter | Number of packets dropped because they were undersized, oversized, or had malformed Ethernet, IPv4, or UDP headers |
+| <span class="metrics-name">net_&#8203;pkt_&#8203;rx_&#8203;route_&#8203;fail</span> | counter | Number of packets dropped due to an incorrect destination IP or failed output link lookup |
 | <span class="metrics-name">net_&#8203;pkt_&#8203;rx_&#8203;fill_&#8203;ring_&#8203;full</span> | counter | Incoming packets dropped due to fill ring being full |
 | <span class="metrics-name">net_&#8203;pkt_&#8203;rx_&#8203;backpressure</span> | counter | Incoming packets dropped due to backpressure |
 | <span class="metrics-name">net_&#8203;rx_&#8203;buffer_&#8203;busy</span> | gauge | Receive buffers currently busy |
@@ -214,12 +217,11 @@
 | <span class="metrics-name">net_&#8203;xdp_&#8203;rx_&#8203;ring_&#8203;full</span> | counter | Dropped due to rx ring being full (xdp_statistics_v1.rx_ring_full) |
 | <span class="metrics-name">net_&#8203;xdp_&#8203;rx_&#8203;fill_&#8203;ring_&#8203;empty</span> | counter | Failed to retrieve item from fill ring because it was empty (xdp_statistics_v1.rx_fill_ring_empty_descs) |
 | <span class="metrics-name">net_&#8203;xdp_&#8203;tx_&#8203;ring_&#8203;empty</span> | counter | Failed to retrieve item from tx ring because it was empty (xdp_statistics_v1.tx_ring_empty_descs) |
-| <span class="metrics-name">net_&#8203;gre_&#8203;pkt_&#8203;rx</span> | counter | Valid GRE packets received |
-| <span class="metrics-name">net_&#8203;gre_&#8203;pkt_&#8203;rx_&#8203;invalid</span> | counter | Invalid GRE packets received |
-| <span class="metrics-name">net_&#8203;gre_&#8203;pkt_&#8203;rx_&#8203;ignored</span> | counter | GRE packets received but ignored |
+| <span class="metrics-name">net_&#8203;gre_&#8203;pkt_&#8203;rx</span> | counter | Number of GRE packets successfully decapsulated and published |
+| <span class="metrics-name">net_&#8203;gre_&#8203;pkt_&#8203;rx_&#8203;invalid</span> | counter | Number of GRE packets dropped because the tunnel peer or headers were invalid |
+| <span class="metrics-name">net_&#8203;gre_&#8203;pkt_&#8203;rx_&#8203;ignored</span> | counter | Number of GRE packets ignored because no GRE tunnel is configured |
 | <span class="metrics-name">net_&#8203;gre_&#8203;pkt_&#8203;tx_&#8203;submitted</span> | counter | GRE packet transmit jobs submitted |
 | <span class="metrics-name">net_&#8203;gre_&#8203;pkt_&#8203;tx_&#8203;no_&#8203;route</span> | counter | GRE packet transmit jobs dropped due to route failure |
-| <span class="metrics-name">net_&#8203;pkt_&#8203;rx_&#8203;src_&#8203;invalid</span> | counter | Incoming packets dropped due to invalid source IP address |
 | <span class="metrics-name">net_&#8203;route_&#8203;count</span><br/>{route_&#8203;table="<span class="metrics-enum">local</span>"} | gauge | IPv4 routes installed in the forwarding table (Local) |
 | <span class="metrics-name">net_&#8203;route_&#8203;count</span><br/>{route_&#8203;table="<span class="metrics-enum">main</span>"} | gauge | IPv4 routes installed in the forwarding table (Main) |
 
@@ -584,6 +586,7 @@
 | <span class="metrics-name">execle_&#8203;txn_&#8203;version</span><br/>{txn_&#8203;version="<span class="metrics-enum">v1</span>"} | counter | Number of transactions executed, broken down by transaction version (Version 1 transaction format) |
 | <span class="metrics-name">execle_&#8203;instruction_&#8203;executed</span> | counter | Number of top-level instructions executed |
 | <span class="metrics-name">execle_&#8203;cpi_&#8203;executed</span> | counter | Number of cross-program invocations executed |
+| <span class="metrics-name">execle_&#8203;lthash_&#8203;unchanged</span> | counter | Number of committed writable accounts left byte-identical by their transaction, whose lthash update was skipped |
 | <span class="metrics-name">execle_&#8203;cu_&#8203;executed</span> | counter | Estimated compute units executed since tile start |
 | <span class="metrics-name">execle_&#8203;txn_&#8203;regime_&#8203;duration_&#8203;nanos</span><br/>{txn_&#8203;regime="<span class="metrics-enum">setup</span>"} | counter | Mutually exclusive and exhaustive duration spent in transaction execution regimes, in nanoseconds (Transaction setup) |
 | <span class="metrics-name">execle_&#8203;txn_&#8203;regime_&#8203;duration_&#8203;nanos</span><br/>{txn_&#8203;regime="<span class="metrics-enum">exec</span>"} | counter | Mutually exclusive and exhaustive duration spent in transaction execution regimes, in nanoseconds (Transaction execution (includes VM setup/execution)) |
@@ -740,6 +743,8 @@
 | <span class="metrics-name">shred_&#8203;shred_&#8203;repair_&#8203;rx_&#8203;bytes</span> | counter | Bytes received from network packets with repair shreds, including network headers |
 | <span class="metrics-name">shred_&#8203;shred_&#8203;turbine_&#8203;rx</span> | counter | Turbine shreds received |
 | <span class="metrics-name">shred_&#8203;shred_&#8203;turbine_&#8203;rx_&#8203;bytes</span> | counter | Bytes received from network packets with turbine shreds, including network headers |
+| <span class="metrics-name">shred_&#8203;repair_&#8203;completion_&#8203;assisted</span> | counter | FEC sets that completed with at least one repair shred contributing |
+| <span class="metrics-name">shred_&#8203;repair_&#8203;completion_&#8203;lag_&#8203;seconds</span> | histogram | Estimated time repair advanced FEC set completion: the delay from a repair-assisted completion until turbine had delivered as many shreds for that set as repair contributed, i.e. when the set would have completed on turbine alone. Counts arrivals rather than distinct indices, so turbine duplicates bias this low |
 | <span class="metrics-name">shred_&#8203;fec_&#8203;fallback_&#8203;write</span> | counter | FEC payloads synchronously spilled by the shred tile |
 | <span class="metrics-name">shred_&#8203;fec_&#8203;fallback_&#8203;write_&#8203;bytes</span> | counter | FEC payload bytes synchronously spilled by the shred tile |
 
@@ -848,6 +853,7 @@
 | <span class="metrics-name">gossip_&#8203;ping_&#8203;tracker_&#8203;added</span> | counter | Peers ever tracked for ping/pong |
 | <span class="metrics-name">gossip_&#8203;ping_&#8203;tracker_&#8203;stake_&#8203;changed</span> | counter | Times a tracked peer was removed from tracking because it became staked |
 | <span class="metrics-name">gossip_&#8203;ping_&#8203;tracker_&#8203;address_&#8203;changed</span> | counter | Times a tracked peer was removed from tracking because its gossip address changed |
+| <span class="metrics-name">gossip_&#8203;sign_&#8203;queue_&#8203;full</span> | counter | Messages dropped because the maximum number of sign requests were already in flight |
 | <span class="metrics-name">gossip_&#8203;crds_&#8203;capacity</span> | gauge | Capacity of the data store |
 | <span class="metrics-name">gossip_&#8203;crds_&#8203;occupied</span><br/>{crds_&#8203;value="<span class="metrics-enum">contact_&#8203;info_&#8203;v1</span>"} | gauge | Entries in the data store (Contact Info V1) |
 | <span class="metrics-name">gossip_&#8203;crds_&#8203;occupied</span><br/>{crds_&#8203;value="<span class="metrics-enum">vote</span>"} | gauge | Entries in the data store (Vote) |
@@ -1005,6 +1011,9 @@
 | <span class="metrics-name">rserve_&#8203;received_&#8203;request_&#8203;count</span><br/>{rserve_&#8203;request_&#8203;types="<span class="metrics-enum">window_&#8203;index</span>"} | counter | Total repair requests received by type, before any validation (Window Index) |
 | <span class="metrics-name">rserve_&#8203;received_&#8203;request_&#8203;count</span><br/>{rserve_&#8203;request_&#8203;types="<span class="metrics-enum">highest_&#8203;window_&#8203;index</span>"} | counter | Total repair requests received by type, before any validation (Highest Window Index) |
 | <span class="metrics-name">rserve_&#8203;received_&#8203;request_&#8203;count</span><br/>{rserve_&#8203;request_&#8203;types="<span class="metrics-enum">orphan</span>"} | counter | Total repair requests received by type, before any validation (Orphan) |
+| <span class="metrics-name">rserve_&#8203;received_&#8203;request_&#8203;count</span><br/>{rserve_&#8203;request_&#8203;types="<span class="metrics-enum">parent_&#8203;fec_&#8203;set_&#8203;count</span>"} | counter | Total repair requests received by type, before any validation (Parent FEC Set Count) |
+| <span class="metrics-name">rserve_&#8203;received_&#8203;request_&#8203;count</span><br/>{rserve_&#8203;request_&#8203;types="<span class="metrics-enum">fec_&#8203;set_&#8203;root</span>"} | counter | Total repair requests received by type, before any validation (FEC Set Root) |
+| <span class="metrics-name">rserve_&#8203;received_&#8203;request_&#8203;count</span><br/>{rserve_&#8203;request_&#8203;types="<span class="metrics-enum">shred_&#8203;for_&#8203;block_&#8203;id</span>"} | counter | Total repair requests received by type, before any validation (Shred For Block Id) |
 | <span class="metrics-name">rserve_&#8203;received_&#8203;request_&#8203;bytes</span> | counter | Total bytes of incoming repair request payloads |
 | <span class="metrics-name">rserve_&#8203;received_&#8203;malformed_&#8203;count</span><br/>{rserve_&#8203;malformed_&#8203;types="<span class="metrics-enum">too_&#8203;small</span>"} | counter | Packets dropped for being malformed, broken down by reason (Too Small) |
 | <span class="metrics-name">rserve_&#8203;received_&#8203;malformed_&#8203;count</span><br/>{rserve_&#8203;malformed_&#8203;types="<span class="metrics-enum">ping</span>"} | counter | Packets dropped for being malformed, broken down by reason (Ping) |
@@ -1016,17 +1025,24 @@
 | <span class="metrics-name">rserve_&#8203;sent_&#8203;response_&#8203;types</span><br/>{rserve_&#8203;sent_&#8203;response_&#8203;types="<span class="metrics-enum">window</span>"} | counter | What types of response messages are we sending (Window) |
 | <span class="metrics-name">rserve_&#8203;sent_&#8203;response_&#8203;types</span><br/>{rserve_&#8203;sent_&#8203;response_&#8203;types="<span class="metrics-enum">highest_&#8203;window</span>"} | counter | What types of response messages are we sending (Highest Window) |
 | <span class="metrics-name">rserve_&#8203;sent_&#8203;response_&#8203;types</span><br/>{rserve_&#8203;sent_&#8203;response_&#8203;types="<span class="metrics-enum">orphan</span>"} | counter | What types of response messages are we sending (Orphan) |
+| <span class="metrics-name">rserve_&#8203;sent_&#8203;response_&#8203;types</span><br/>{rserve_&#8203;sent_&#8203;response_&#8203;types="<span class="metrics-enum">parent_&#8203;fec_&#8203;set_&#8203;count</span>"} | counter | What types of response messages are we sending (Parent FEC Set Count) |
+| <span class="metrics-name">rserve_&#8203;sent_&#8203;response_&#8203;types</span><br/>{rserve_&#8203;sent_&#8203;response_&#8203;types="<span class="metrics-enum">fec_&#8203;set_&#8203;root</span>"} | counter | What types of response messages are we sending (FEC Set Root) |
+| <span class="metrics-name">rserve_&#8203;sent_&#8203;response_&#8203;types</span><br/>{rserve_&#8203;sent_&#8203;response_&#8203;types="<span class="metrics-enum">shred_&#8203;for_&#8203;block_&#8203;id</span>"} | counter | What types of response messages are we sending (Shred For Block Id) |
 | <span class="metrics-name">rserve_&#8203;sent_&#8203;response_&#8203;bytes</span> | counter | Total payload bytes sent in response packets |
 | <span class="metrics-name">rserve_&#8203;missed_&#8203;response_&#8203;types</span><br/>{rserve_&#8203;sent_&#8203;response_&#8203;types="<span class="metrics-enum">ping</span>"} | counter | What types of response messages could we not fulfill (Ping) |
 | <span class="metrics-name">rserve_&#8203;missed_&#8203;response_&#8203;types</span><br/>{rserve_&#8203;sent_&#8203;response_&#8203;types="<span class="metrics-enum">window</span>"} | counter | What types of response messages could we not fulfill (Window) |
 | <span class="metrics-name">rserve_&#8203;missed_&#8203;response_&#8203;types</span><br/>{rserve_&#8203;sent_&#8203;response_&#8203;types="<span class="metrics-enum">highest_&#8203;window</span>"} | counter | What types of response messages could we not fulfill (Highest Window) |
 | <span class="metrics-name">rserve_&#8203;missed_&#8203;response_&#8203;types</span><br/>{rserve_&#8203;sent_&#8203;response_&#8203;types="<span class="metrics-enum">orphan</span>"} | counter | What types of response messages could we not fulfill (Orphan) |
+| <span class="metrics-name">rserve_&#8203;missed_&#8203;response_&#8203;types</span><br/>{rserve_&#8203;sent_&#8203;response_&#8203;types="<span class="metrics-enum">parent_&#8203;fec_&#8203;set_&#8203;count</span>"} | counter | What types of response messages could we not fulfill (Parent FEC Set Count) |
+| <span class="metrics-name">rserve_&#8203;missed_&#8203;response_&#8203;types</span><br/>{rserve_&#8203;sent_&#8203;response_&#8203;types="<span class="metrics-enum">fec_&#8203;set_&#8203;root</span>"} | counter | What types of response messages could we not fulfill (FEC Set Root) |
+| <span class="metrics-name">rserve_&#8203;missed_&#8203;response_&#8203;types</span><br/>{rserve_&#8203;sent_&#8203;response_&#8203;types="<span class="metrics-enum">shred_&#8203;for_&#8203;block_&#8203;id</span>"} | counter | What types of response messages could we not fulfill (Shred For Block Id) |
 | <span class="metrics-name">rserve_&#8203;failed_&#8203;sigverify</span> | counter | How many times we failed to verify the signature of a request |
 | <span class="metrics-name">rserve_&#8203;failed_&#8203;own_&#8203;key</span> | counter | How many requests we've received that were sent by us |
 | <span class="metrics-name">rserve_&#8203;failed_&#8203;invalid_&#8203;token</span> | counter | How many pong requests we've received with outdated or invalid tokens |
 | <span class="metrics-name">rserve_&#8203;failed_&#8203;not_&#8203;for_&#8203;us</span> | counter | How many requests we've received that were not intended for us |
 | <span class="metrics-name">rserve_&#8203;failed_&#8203;outdated</span> | counter | How many requests we've received that had outdated timestamps |
 | <span class="metrics-name">rserve_&#8203;failed_&#8203;invalid_&#8203;shred_&#8203;index</span> | counter | How many requests we've received that had invalid shred indices |
+| <span class="metrics-name">rserve_&#8203;failed_&#8203;invalid_&#8203;fec_&#8203;set_&#8203;index</span> | counter | How many FEC set root requests we've received with a FEC set index that is unaligned or past the end of the block |
 | <span class="metrics-name">rserve_&#8203;failed_&#8203;ping_&#8203;cache_&#8203;lookup</span> | counter | Requests from nodes not in the ping cache, which triggered a ping-back instead of a response |
 | <span class="metrics-name">rserve_&#8203;disk_&#8203;read_&#8203;busy</span> | counter | Repair reads dropped because the requested index binding or ring cell changed |
 | <span class="metrics-name">rserve_&#8203;disk_&#8203;read_&#8203;miss</span> | counter | Repair reads not found in the store |
@@ -1063,6 +1079,7 @@
 | <span class="metrics-name">replay_&#8203;active_&#8203;stake_&#8203;lamports</span> | gauge | Our active stake at the optimistically confirmed slot |
 | <span class="metrics-name">replay_&#8203;cluster_&#8203;active_&#8203;stake_&#8203;lamports</span> | gauge | Total cluster active stake at the optimistically confirmed slot |
 | <span class="metrics-name">replay_&#8203;epoch_&#8203;credits</span> | gauge | Our vote account epoch credits at the optimistically confirmed slot |
+| <span class="metrics-name">replay_&#8203;vote_&#8203;account_&#8203;inadmissible</span> | gauge | 1 if our vote account's stake is not admitted: at the optimistically confirmed slot it fails the validator admission ticket filter (missing, below the V4 rent-exempt minimum, or not V4 with a BLS pubkey), or it passes but has not yet been admitted at an epoch boundary. 0 otherwise |
 | <span class="metrics-name">replay_&#8203;vote_&#8203;slot_&#8203;last_&#8203;rewarded</span> | gauge | Latest slot for which this validator's vote appears in a reward certificate. ULONG_MAX if no participation has been observed, and always ULONG_MAX under Tower |
 | <span class="metrics-name">replay_&#8203;store_&#8203;query_&#8203;work_&#8203;seconds</span> | histogram | Time spent ingesting a queried FEC into the scheduler |
 | <span class="metrics-name">replay_&#8203;store_&#8203;queried</span> | counter | Queries |
@@ -1142,6 +1159,7 @@
 | <span class="metrics-name">replay_&#8203;fec_&#8203;reassembly_&#8203;empty</span> | counter | Times reassembly is empty and a FEC set can't be processed |
 | <span class="metrics-name">replay_&#8203;fec_&#8203;leader_&#8203;bid_&#8203;wait</span> | counter | Times replay is blocked by the PoH tile not sending an end of leader message |
 | <span class="metrics-name">replay_&#8203;fec_&#8203;bank_&#8203;full</span> | counter | Times banks are full and a FEC set can't be processed |
+| <span class="metrics-name">replay_&#8203;fec_&#8203;parent_&#8203;unavailable</span> | counter | Alpenglow: FEC sets dropped because replay could not resolve the block's parent, which was itself dropped on a dead lineage, evicted with its tracking slot reused, or rooted past.  |
 | <span class="metrics-name">replay_&#8203;storage_&#8203;root_&#8203;behind</span> | counter | Times the storage root is behind the consensus root and can't be advanced |
 | <span class="metrics-name">replay_&#8203;progcache_&#8203;rooted</span> | counter | Program cache entries rooted |
 | <span class="metrics-name">replay_&#8203;progcache_&#8203;class_&#8203;used</span><br/>{progcache_&#8203;class="<span class="metrics-enum">class0</span>"} | gauge | Occupied program cache value slots, broken down by size class (<=128 KiB) |
@@ -1261,6 +1279,7 @@
 | <span class="metrics-name">execrp_&#8203;poh_&#8203;hashed</span> | counter | PoH SHA-256 calls executed |
 | <span class="metrics-name">execrp_&#8203;instruction_&#8203;executed</span> | counter | Number of top-level instructions executed |
 | <span class="metrics-name">execrp_&#8203;cpi_&#8203;executed</span> | counter | Number of cross-program invocations executed |
+| <span class="metrics-name">execrp_&#8203;lthash_&#8203;unchanged</span> | counter | Number of committed writable accounts left byte-identical by their transaction, whose lthash update was skipped |
 | <span class="metrics-name">execrp_&#8203;txn_&#8203;regime_&#8203;duration_&#8203;nanos</span><br/>{txn_&#8203;regime="<span class="metrics-enum">setup</span>"} | counter | Mutually exclusive and exhaustive duration spent in transaction execution regimes, in nanoseconds (Transaction setup) |
 | <span class="metrics-name">execrp_&#8203;txn_&#8203;regime_&#8203;duration_&#8203;nanos</span><br/>{txn_&#8203;regime="<span class="metrics-enum">exec</span>"} | counter | Mutually exclusive and exhaustive duration spent in transaction execution regimes, in nanoseconds (Transaction execution (includes VM setup/execution)) |
 | <span class="metrics-name">execrp_&#8203;txn_&#8203;regime_&#8203;duration_&#8203;nanos</span><br/>{txn_&#8203;regime="<span class="metrics-enum">commit</span>"} | counter | Mutually exclusive and exhaustive duration spent in transaction execution regimes, in nanoseconds (Transaction result commit) |
@@ -1394,7 +1413,7 @@
 | <span class="metrics-name">accdb_&#8203;bytes_&#8203;read</span> | counter | Number of bytes read from the account database |
 | <span class="metrics-name">accdb_&#8203;bytes_&#8203;written</span> | counter | Number of bytes written to the account database |
 | <span class="metrics-name">accdb_&#8203;write_&#8203;operation</span> | counter | Number of write operations performed on the account database |
-| <span class="metrics-name">accdb_&#8203;copy_&#8203;operation</span> | counter | Number of in-place copy_file_range operations performed on the account database during compaction |
+| <span class="metrics-name">accdb_&#8203;copy_&#8203;operation</span> | counter | Number of pwritev2 calls that relocated a batch of records during account database compaction |
 | <span class="metrics-name">accdb_&#8203;account_&#8203;deleted</span> | counter | Number of accounts deleted from the account database |
 | <span class="metrics-name">accdb_&#8203;cache_&#8203;class_&#8203;used</span><br/>{accdb_&#8203;cache_&#8203;class="<span class="metrics-enum">class0</span>"} | gauge | Number of slots currently occupied in the account database cache, broken down by size class (0-128 B) |
 | <span class="metrics-name">accdb_&#8203;cache_&#8203;class_&#8203;used</span><br/>{accdb_&#8203;cache_&#8203;class="<span class="metrics-enum">class1</span>"} | gauge | Number of slots currently occupied in the account database cache, broken down by size class (129-512 B) |
@@ -1663,9 +1682,10 @@
 | Metric | Type | Description |
 |--------|------|-------------|
 | <span class="metrics-name">diag_&#8203;bundle_&#8203;status</span> | gauge | Precise status of the bundle subsystem: 0=disabled (no bundle tiles configured), 1=disconnected (all bundle tiles disconnected), 2=connecting (at least one bundle tile connecting, none connected or sleeping), 3=connected (at least one bundle tile connected), 4=sleeping (at least one bundle tile sleeping, none connected) |
-| <span class="metrics-name">diag_&#8203;vote_&#8203;status</span> | gauge | Precise status of the vote subsystem: 0=disabled (non-voting or no tower tile), 1=not started (tower tile not running or no votes cast yet), 2=delinquent (vote distance exceeds threshold or vote stalled), 3=voting (voting normally) |
+| <span class="metrics-name">diag_&#8203;vote_&#8203;status</span> | gauge | Precise status of the vote subsystem: 0=disabled (non-voting or no tower tile), 1=not started (tower tile not running or no votes cast yet), 2=delinquent (vote distance exceeds threshold or vote stalled), 3=voting (voting normally), 4=inadmissible (voting, but the vote account fails the validator admission ticket filter) |
 | <span class="metrics-name">diag_&#8203;replay_&#8203;status</span> | gauge | Precise status of the replay subsystem: 0=disabled (no replay tile), 1=not started (replay tile not running or slots are zero), 2=behind (replay lagging behind turbine or reset slot stalled), 3=running (replay keeping up) |
 | <span class="metrics-name">diag_&#8203;turbine_&#8203;status</span> | gauge | Precise status of the turbine subsystem: 0=disabled (no shred or replay tiles), 1=not started (tiles not all running or turbine slot is zero), 2=stalled (turbine slot not advancing), 3=repair outpacing (repair byte throughput exceeds turbine), 4=running (turbine receiving normally) |
+| <span class="metrics-name">diag_&#8203;builder_&#8203;status</span> | gauge | Precise status of the external block builder subsystem: 0=disabled (no block builder configured), 1=disconnected (block builder disconnected), 2=connecting (block builder connection in progress), 3=unhealthy (connected, but the block builder is not in a usable state), 4=connected (block builder connected and healthy) |
 | <span class="metrics-name">diag_&#8203;device_&#8203;irq</span> | counter | Number of device IRQs across all CPUs |
 | <span class="metrics-name">diag_&#8203;device_&#8203;irq_&#8203;undesired</span> | counter | Number of device hard IRQs that stole CPU time from fixed tiles |
 | <span class="metrics-name">diag_&#8203;softirq</span><br/>{softirq="<span class="metrics-enum">net</span>"} | counter | Number of soft-IRQs across all CPUs (NET_TX, NET_RX) |
@@ -1726,6 +1746,8 @@
 | <span class="metrics-name">gui_&#8203;db_&#8203;used_&#8203;bytes</span><br/>{gui_&#8203;db="<span class="metrics-enum">epoch</span>"} | gauge | Bytes occupied by records present in the store ring (epoch) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;used_&#8203;bytes</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;stats</span>"} | gauge | Bytes occupied by records present in the store ring (tile_stats) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;used_&#8203;bytes</span><br/>{gui_&#8203;db="<span class="metrics-enum">txn_&#8203;waterfall</span>"} | gauge | Bytes occupied by records present in the store ring (txn_waterfall) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;used_&#8203;bytes</span><br/>{gui_&#8203;db="<span class="metrics-enum">timeline_&#8203;day</span>"} | gauge | Bytes occupied by records present in the store ring (timeline_day) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;used_&#8203;bytes</span><br/>{gui_&#8203;db="<span class="metrics-enum">replay_&#8203;txn</span>"} | gauge | Bytes occupied by records present in the store ring (replay_txn) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;capacity_&#8203;bytes</span><br/>{gui_&#8203;db="<span class="metrics-enum">scheduler_&#8203;counts</span>"} | gauge | Total bytes of the non-free regions the store ring currently owns (scheduler_counts) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;capacity_&#8203;bytes</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;timers</span>"} | gauge | Total bytes of the non-free regions the store ring currently owns (tile_timers) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;capacity_&#8203;bytes</span><br/>{gui_&#8203;db="<span class="metrics-enum">shred_&#8203;events</span>"} | gauge | Total bytes of the non-free regions the store ring currently owns (shred_events) |
@@ -1737,6 +1759,8 @@
 | <span class="metrics-name">gui_&#8203;db_&#8203;capacity_&#8203;bytes</span><br/>{gui_&#8203;db="<span class="metrics-enum">epoch</span>"} | gauge | Total bytes of the non-free regions the store ring currently owns (epoch) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;capacity_&#8203;bytes</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;stats</span>"} | gauge | Total bytes of the non-free regions the store ring currently owns (tile_stats) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;capacity_&#8203;bytes</span><br/>{gui_&#8203;db="<span class="metrics-enum">txn_&#8203;waterfall</span>"} | gauge | Total bytes of the non-free regions the store ring currently owns (txn_waterfall) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;capacity_&#8203;bytes</span><br/>{gui_&#8203;db="<span class="metrics-enum">timeline_&#8203;day</span>"} | gauge | Total bytes of the non-free regions the store ring currently owns (timeline_day) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;capacity_&#8203;bytes</span><br/>{gui_&#8203;db="<span class="metrics-enum">replay_&#8203;txn</span>"} | gauge | Total bytes of the non-free regions the store ring currently owns (replay_txn) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;free_&#8203;bytes</span><br/>{gui_&#8203;db="<span class="metrics-enum">scheduler_&#8203;counts</span>"} | gauge | Total bytes of the free regions the store ring currently doesn't own (same for every database) (scheduler_counts) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;free_&#8203;bytes</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;timers</span>"} | gauge | Total bytes of the free regions the store ring currently doesn't own (same for every database) (tile_timers) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;free_&#8203;bytes</span><br/>{gui_&#8203;db="<span class="metrics-enum">shred_&#8203;events</span>"} | gauge | Total bytes of the free regions the store ring currently doesn't own (same for every database) (shred_events) |
@@ -1748,6 +1772,8 @@
 | <span class="metrics-name">gui_&#8203;db_&#8203;free_&#8203;bytes</span><br/>{gui_&#8203;db="<span class="metrics-enum">epoch</span>"} | gauge | Total bytes of the free regions the store ring currently doesn't own (same for every database) (epoch) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;free_&#8203;bytes</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;stats</span>"} | gauge | Total bytes of the free regions the store ring currently doesn't own (same for every database) (tile_stats) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;free_&#8203;bytes</span><br/>{gui_&#8203;db="<span class="metrics-enum">txn_&#8203;waterfall</span>"} | gauge | Total bytes of the free regions the store ring currently doesn't own (same for every database) (txn_waterfall) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;free_&#8203;bytes</span><br/>{gui_&#8203;db="<span class="metrics-enum">timeline_&#8203;day</span>"} | gauge | Total bytes of the free regions the store ring currently doesn't own (same for every database) (timeline_day) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;free_&#8203;bytes</span><br/>{gui_&#8203;db="<span class="metrics-enum">replay_&#8203;txn</span>"} | gauge | Total bytes of the free regions the store ring currently doesn't own (same for every database) (replay_txn) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;used</span><br/>{gui_&#8203;db="<span class="metrics-enum">scheduler_&#8203;counts</span>"} | gauge | Records present in the store ring (scheduler_counts) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;used</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;timers</span>"} | gauge | Records present in the store ring (tile_timers) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;used</span><br/>{gui_&#8203;db="<span class="metrics-enum">shred_&#8203;events</span>"} | gauge | Records present in the store ring (shred_events) |
@@ -1759,6 +1785,8 @@
 | <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;used</span><br/>{gui_&#8203;db="<span class="metrics-enum">epoch</span>"} | gauge | Records present in the store ring (epoch) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;used</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;stats</span>"} | gauge | Records present in the store ring (tile_stats) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;used</span><br/>{gui_&#8203;db="<span class="metrics-enum">txn_&#8203;waterfall</span>"} | gauge | Records present in the store ring (txn_waterfall) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;used</span><br/>{gui_&#8203;db="<span class="metrics-enum">timeline_&#8203;day</span>"} | gauge | Records present in the store ring (timeline_day) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;used</span><br/>{gui_&#8203;db="<span class="metrics-enum">replay_&#8203;txn</span>"} | gauge | Records present in the store ring (replay_txn) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;capacity</span><br/>{gui_&#8203;db="<span class="metrics-enum">scheduler_&#8203;counts</span>"} | gauge | Record capacity of the non-free regions the store ring currently owns (scheduler_counts) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;capacity</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;timers</span>"} | gauge | Record capacity of the non-free regions the store ring currently owns (tile_timers) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;capacity</span><br/>{gui_&#8203;db="<span class="metrics-enum">shred_&#8203;events</span>"} | gauge | Record capacity of the non-free regions the store ring currently owns (shred_events) |
@@ -1770,6 +1798,8 @@
 | <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;capacity</span><br/>{gui_&#8203;db="<span class="metrics-enum">epoch</span>"} | gauge | Record capacity of the non-free regions the store ring currently owns (epoch) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;capacity</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;stats</span>"} | gauge | Record capacity of the non-free regions the store ring currently owns (tile_stats) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;capacity</span><br/>{gui_&#8203;db="<span class="metrics-enum">txn_&#8203;waterfall</span>"} | gauge | Record capacity of the non-free regions the store ring currently owns (txn_waterfall) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;capacity</span><br/>{gui_&#8203;db="<span class="metrics-enum">timeline_&#8203;day</span>"} | gauge | Record capacity of the non-free regions the store ring currently owns (timeline_day) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;capacity</span><br/>{gui_&#8203;db="<span class="metrics-enum">replay_&#8203;txn</span>"} | gauge | Record capacity of the non-free regions the store ring currently owns (replay_txn) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;free</span><br/>{gui_&#8203;db="<span class="metrics-enum">scheduler_&#8203;counts</span>"} | gauge | Record capacity of the free regions the store ring currently doesn't own (differs per database because record sizes differ) (scheduler_counts) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;free</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;timers</span>"} | gauge | Record capacity of the free regions the store ring currently doesn't own (differs per database because record sizes differ) (tile_timers) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;free</span><br/>{gui_&#8203;db="<span class="metrics-enum">shred_&#8203;events</span>"} | gauge | Record capacity of the free regions the store ring currently doesn't own (differs per database because record sizes differ) (shred_events) |
@@ -1781,6 +1811,8 @@
 | <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;free</span><br/>{gui_&#8203;db="<span class="metrics-enum">epoch</span>"} | gauge | Record capacity of the free regions the store ring currently doesn't own (differs per database because record sizes differ) (epoch) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;free</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;stats</span>"} | gauge | Record capacity of the free regions the store ring currently doesn't own (differs per database because record sizes differ) (tile_stats) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;free</span><br/>{gui_&#8203;db="<span class="metrics-enum">txn_&#8203;waterfall</span>"} | gauge | Record capacity of the free regions the store ring currently doesn't own (differs per database because record sizes differ) (txn_waterfall) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;free</span><br/>{gui_&#8203;db="<span class="metrics-enum">timeline_&#8203;day</span>"} | gauge | Record capacity of the free regions the store ring currently doesn't own (differs per database because record sizes differ) (timeline_day) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;free</span><br/>{gui_&#8203;db="<span class="metrics-enum">replay_&#8203;txn</span>"} | gauge | Record capacity of the free regions the store ring currently doesn't own (differs per database because record sizes differ) (replay_txn) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;kv_&#8203;queried</span><br/>{gui_&#8203;db="<span class="metrics-enum">scheduler_&#8203;counts</span>"} | counter | Key-value lookup calls (kv_get + kv_get_any + kv_iter_begin) (scheduler_counts) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;kv_&#8203;queried</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;timers</span>"} | counter | Key-value lookup calls (kv_get + kv_get_any + kv_iter_begin) (tile_timers) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;kv_&#8203;queried</span><br/>{gui_&#8203;db="<span class="metrics-enum">shred_&#8203;events</span>"} | counter | Key-value lookup calls (kv_get + kv_get_any + kv_iter_begin) (shred_events) |
@@ -1792,6 +1824,8 @@
 | <span class="metrics-name">gui_&#8203;db_&#8203;kv_&#8203;queried</span><br/>{gui_&#8203;db="<span class="metrics-enum">epoch</span>"} | counter | Key-value lookup calls (kv_get + kv_get_any + kv_iter_begin) (epoch) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;kv_&#8203;queried</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;stats</span>"} | counter | Key-value lookup calls (kv_get + kv_get_any + kv_iter_begin) (tile_stats) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;kv_&#8203;queried</span><br/>{gui_&#8203;db="<span class="metrics-enum">txn_&#8203;waterfall</span>"} | counter | Key-value lookup calls (kv_get + kv_get_any + kv_iter_begin) (txn_waterfall) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;kv_&#8203;queried</span><br/>{gui_&#8203;db="<span class="metrics-enum">timeline_&#8203;day</span>"} | counter | Key-value lookup calls (kv_get + kv_get_any + kv_iter_begin) (timeline_day) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;kv_&#8203;queried</span><br/>{gui_&#8203;db="<span class="metrics-enum">replay_&#8203;txn</span>"} | counter | Key-value lookup calls (kv_get + kv_get_any + kv_iter_begin) (replay_txn) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;ts_&#8203;record_&#8203;appended</span><br/>{gui_&#8203;db="<span class="metrics-enum">scheduler_&#8203;counts</span>"} | counter | Time-series records appended into the database (scheduler_counts) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;ts_&#8203;record_&#8203;appended</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;timers</span>"} | counter | Time-series records appended into the database (tile_timers) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;ts_&#8203;record_&#8203;appended</span><br/>{gui_&#8203;db="<span class="metrics-enum">shred_&#8203;events</span>"} | counter | Time-series records appended into the database (shred_events) |
@@ -1803,6 +1837,8 @@
 | <span class="metrics-name">gui_&#8203;db_&#8203;ts_&#8203;record_&#8203;appended</span><br/>{gui_&#8203;db="<span class="metrics-enum">epoch</span>"} | counter | Time-series records appended into the database (epoch) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;ts_&#8203;record_&#8203;appended</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;stats</span>"} | counter | Time-series records appended into the database (tile_stats) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;ts_&#8203;record_&#8203;appended</span><br/>{gui_&#8203;db="<span class="metrics-enum">txn_&#8203;waterfall</span>"} | counter | Time-series records appended into the database (txn_waterfall) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;ts_&#8203;record_&#8203;appended</span><br/>{gui_&#8203;db="<span class="metrics-enum">timeline_&#8203;day</span>"} | counter | Time-series records appended into the database (timeline_day) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;ts_&#8203;record_&#8203;appended</span><br/>{gui_&#8203;db="<span class="metrics-enum">replay_&#8203;txn</span>"} | counter | Time-series records appended into the database (replay_txn) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;ts_&#8203;scanned</span><br/>{gui_&#8203;db="<span class="metrics-enum">scheduler_&#8203;counts</span>"} | counter | Time-series scan calls (scheduler_counts) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;ts_&#8203;scanned</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;timers</span>"} | counter | Time-series scan calls (tile_timers) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;ts_&#8203;scanned</span><br/>{gui_&#8203;db="<span class="metrics-enum">shred_&#8203;events</span>"} | counter | Time-series scan calls (shred_events) |
@@ -1814,6 +1850,8 @@
 | <span class="metrics-name">gui_&#8203;db_&#8203;ts_&#8203;scanned</span><br/>{gui_&#8203;db="<span class="metrics-enum">epoch</span>"} | counter | Time-series scan calls (epoch) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;ts_&#8203;scanned</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;stats</span>"} | counter | Time-series scan calls (tile_stats) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;ts_&#8203;scanned</span><br/>{gui_&#8203;db="<span class="metrics-enum">txn_&#8203;waterfall</span>"} | counter | Time-series scan calls (txn_waterfall) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;ts_&#8203;scanned</span><br/>{gui_&#8203;db="<span class="metrics-enum">timeline_&#8203;day</span>"} | counter | Time-series scan calls (timeline_day) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;ts_&#8203;scanned</span><br/>{gui_&#8203;db="<span class="metrics-enum">replay_&#8203;txn</span>"} | counter | Time-series scan calls (replay_txn) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;ts_&#8203;record_&#8203;read</span><br/>{gui_&#8203;db="<span class="metrics-enum">scheduler_&#8203;counts</span>"} | counter | Time-series records returned by scans (scheduler_counts) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;ts_&#8203;record_&#8203;read</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;timers</span>"} | counter | Time-series records returned by scans (tile_timers) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;ts_&#8203;record_&#8203;read</span><br/>{gui_&#8203;db="<span class="metrics-enum">shred_&#8203;events</span>"} | counter | Time-series records returned by scans (shred_events) |
@@ -1825,6 +1863,8 @@
 | <span class="metrics-name">gui_&#8203;db_&#8203;ts_&#8203;record_&#8203;read</span><br/>{gui_&#8203;db="<span class="metrics-enum">epoch</span>"} | counter | Time-series records returned by scans (epoch) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;ts_&#8203;record_&#8203;read</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;stats</span>"} | counter | Time-series records returned by scans (tile_stats) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;ts_&#8203;record_&#8203;read</span><br/>{gui_&#8203;db="<span class="metrics-enum">txn_&#8203;waterfall</span>"} | counter | Time-series records returned by scans (txn_waterfall) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;ts_&#8203;record_&#8203;read</span><br/>{gui_&#8203;db="<span class="metrics-enum">timeline_&#8203;day</span>"} | counter | Time-series records returned by scans (timeline_day) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;ts_&#8203;record_&#8203;read</span><br/>{gui_&#8203;db="<span class="metrics-enum">replay_&#8203;txn</span>"} | counter | Time-series records returned by scans (replay_txn) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;evicted</span><br/>{gui_&#8203;db="<span class="metrics-enum">scheduler_&#8203;counts</span>"} | counter | Records physically evicted from the database (scheduler_counts) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;evicted</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;timers</span>"} | counter | Records physically evicted from the database (tile_timers) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;evicted</span><br/>{gui_&#8203;db="<span class="metrics-enum">shred_&#8203;events</span>"} | counter | Records physically evicted from the database (shred_events) |
@@ -1836,6 +1876,8 @@
 | <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;evicted</span><br/>{gui_&#8203;db="<span class="metrics-enum">epoch</span>"} | counter | Records physically evicted from the database (epoch) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;evicted</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;stats</span>"} | counter | Records physically evicted from the database (tile_stats) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;evicted</span><br/>{gui_&#8203;db="<span class="metrics-enum">txn_&#8203;waterfall</span>"} | counter | Records physically evicted from the database (txn_waterfall) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;evicted</span><br/>{gui_&#8203;db="<span class="metrics-enum">timeline_&#8203;day</span>"} | counter | Records physically evicted from the database (timeline_day) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;record_&#8203;evicted</span><br/>{gui_&#8203;db="<span class="metrics-enum">replay_&#8203;txn</span>"} | counter | Records physically evicted from the database (replay_txn) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;eviction</span><br/>{gui_&#8203;db="<span class="metrics-enum">scheduler_&#8203;counts</span>"} | counter | Database eviction calls that removed at least one record (scheduler_counts) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;eviction</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;timers</span>"} | counter | Database eviction calls that removed at least one record (tile_timers) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;eviction</span><br/>{gui_&#8203;db="<span class="metrics-enum">shred_&#8203;events</span>"} | counter | Database eviction calls that removed at least one record (shred_events) |
@@ -1847,6 +1889,8 @@
 | <span class="metrics-name">gui_&#8203;db_&#8203;eviction</span><br/>{gui_&#8203;db="<span class="metrics-enum">epoch</span>"} | counter | Database eviction calls that removed at least one record (epoch) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;eviction</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;stats</span>"} | counter | Database eviction calls that removed at least one record (tile_stats) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;eviction</span><br/>{gui_&#8203;db="<span class="metrics-enum">txn_&#8203;waterfall</span>"} | counter | Database eviction calls that removed at least one record (txn_waterfall) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;eviction</span><br/>{gui_&#8203;db="<span class="metrics-enum">timeline_&#8203;day</span>"} | counter | Database eviction calls that removed at least one record (timeline_day) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;eviction</span><br/>{gui_&#8203;db="<span class="metrics-enum">replay_&#8203;txn</span>"} | counter | Database eviction calls that removed at least one record (replay_txn) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;region_&#8203;claimed</span><br/>{gui_&#8203;db="<span class="metrics-enum">scheduler_&#8203;counts</span>"} | counter | Regions claimed from the free list by the database (scheduler_counts) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;region_&#8203;claimed</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;timers</span>"} | counter | Regions claimed from the free list by the database (tile_timers) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;region_&#8203;claimed</span><br/>{gui_&#8203;db="<span class="metrics-enum">shred_&#8203;events</span>"} | counter | Regions claimed from the free list by the database (shred_events) |
@@ -1858,6 +1902,8 @@
 | <span class="metrics-name">gui_&#8203;db_&#8203;region_&#8203;claimed</span><br/>{gui_&#8203;db="<span class="metrics-enum">epoch</span>"} | counter | Regions claimed from the free list by the database (epoch) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;region_&#8203;claimed</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;stats</span>"} | counter | Regions claimed from the free list by the database (tile_stats) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;region_&#8203;claimed</span><br/>{gui_&#8203;db="<span class="metrics-enum">txn_&#8203;waterfall</span>"} | counter | Regions claimed from the free list by the database (txn_waterfall) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;region_&#8203;claimed</span><br/>{gui_&#8203;db="<span class="metrics-enum">timeline_&#8203;day</span>"} | counter | Regions claimed from the free list by the database (timeline_day) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;region_&#8203;claimed</span><br/>{gui_&#8203;db="<span class="metrics-enum">replay_&#8203;txn</span>"} | counter | Regions claimed from the free list by the database (replay_txn) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;region_&#8203;reclaimed</span><br/>{gui_&#8203;db="<span class="metrics-enum">scheduler_&#8203;counts</span>"} | counter | Regions returned to the free list by the database (scheduler_counts) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;region_&#8203;reclaimed</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;timers</span>"} | counter | Regions returned to the free list by the database (tile_timers) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;region_&#8203;reclaimed</span><br/>{gui_&#8203;db="<span class="metrics-enum">shred_&#8203;events</span>"} | counter | Regions returned to the free list by the database (shred_events) |
@@ -1869,6 +1915,8 @@
 | <span class="metrics-name">gui_&#8203;db_&#8203;region_&#8203;reclaimed</span><br/>{gui_&#8203;db="<span class="metrics-enum">epoch</span>"} | counter | Regions returned to the free list by the database (epoch) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;region_&#8203;reclaimed</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;stats</span>"} | counter | Regions returned to the free list by the database (tile_stats) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;region_&#8203;reclaimed</span><br/>{gui_&#8203;db="<span class="metrics-enum">txn_&#8203;waterfall</span>"} | counter | Regions returned to the free list by the database (txn_waterfall) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;region_&#8203;reclaimed</span><br/>{gui_&#8203;db="<span class="metrics-enum">timeline_&#8203;day</span>"} | counter | Regions returned to the free list by the database (timeline_day) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;region_&#8203;reclaimed</span><br/>{gui_&#8203;db="<span class="metrics-enum">replay_&#8203;txn</span>"} | counter | Regions returned to the free list by the database (replay_txn) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;map_&#8203;full</span><br/>{gui_&#8203;db="<span class="metrics-enum">scheduler_&#8203;counts</span>"} | counter | Database writes that hit MAP_FULL and were dropped (scheduler_counts) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;map_&#8203;full</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;timers</span>"} | counter | Database writes that hit MAP_FULL and were dropped (tile_timers) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;map_&#8203;full</span><br/>{gui_&#8203;db="<span class="metrics-enum">shred_&#8203;events</span>"} | counter | Database writes that hit MAP_FULL and were dropped (shred_events) |
@@ -1880,6 +1928,8 @@
 | <span class="metrics-name">gui_&#8203;db_&#8203;map_&#8203;full</span><br/>{gui_&#8203;db="<span class="metrics-enum">epoch</span>"} | counter | Database writes that hit MAP_FULL and were dropped (epoch) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;map_&#8203;full</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;stats</span>"} | counter | Database writes that hit MAP_FULL and were dropped (tile_stats) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;map_&#8203;full</span><br/>{gui_&#8203;db="<span class="metrics-enum">txn_&#8203;waterfall</span>"} | counter | Database writes that hit MAP_FULL and were dropped (txn_waterfall) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;map_&#8203;full</span><br/>{gui_&#8203;db="<span class="metrics-enum">timeline_&#8203;day</span>"} | counter | Database writes that hit MAP_FULL and were dropped (timeline_day) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;map_&#8203;full</span><br/>{gui_&#8203;db="<span class="metrics-enum">replay_&#8203;txn</span>"} | counter | Database writes that hit MAP_FULL and were dropped (replay_txn) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;forced_&#8203;eviction</span><br/>{gui_&#8203;db="<span class="metrics-enum">scheduler_&#8203;counts</span>"} | counter | Database writes that evicted records before succeeding (scheduler_counts) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;forced_&#8203;eviction</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;timers</span>"} | counter | Database writes that evicted records before succeeding (tile_timers) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;forced_&#8203;eviction</span><br/>{gui_&#8203;db="<span class="metrics-enum">shred_&#8203;events</span>"} | counter | Database writes that evicted records before succeeding (shred_events) |
@@ -1891,6 +1941,8 @@
 | <span class="metrics-name">gui_&#8203;db_&#8203;forced_&#8203;eviction</span><br/>{gui_&#8203;db="<span class="metrics-enum">epoch</span>"} | counter | Database writes that evicted records before succeeding (epoch) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;forced_&#8203;eviction</span><br/>{gui_&#8203;db="<span class="metrics-enum">tile_&#8203;stats</span>"} | counter | Database writes that evicted records before succeeding (tile_stats) |
 | <span class="metrics-name">gui_&#8203;db_&#8203;forced_&#8203;eviction</span><br/>{gui_&#8203;db="<span class="metrics-enum">txn_&#8203;waterfall</span>"} | counter | Database writes that evicted records before succeeding (txn_waterfall) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;forced_&#8203;eviction</span><br/>{gui_&#8203;db="<span class="metrics-enum">timeline_&#8203;day</span>"} | counter | Database writes that evicted records before succeeding (timeline_day) |
+| <span class="metrics-name">gui_&#8203;db_&#8203;forced_&#8203;eviction</span><br/>{gui_&#8203;db="<span class="metrics-enum">replay_&#8203;txn</span>"} | counter | Database writes that evicted records before succeeding (replay_txn) |
 
 </div>
 
@@ -1935,6 +1987,7 @@
 | <span class="metrics-name">rpc_&#8203;request_&#8203;served</span><br/>{rpc_&#8203;method="<span class="metrics-enum">getSlotLeader</span>"} | counter | Number of RPC requests served (getSlotLeader) |
 | <span class="metrics-name">rpc_&#8203;request_&#8203;served</span><br/>{rpc_&#8203;method="<span class="metrics-enum">getSlotLeaders</span>"} | counter | Number of RPC requests served (getSlotLeaders) |
 | <span class="metrics-name">rpc_&#8203;request_&#8203;served</span><br/>{rpc_&#8203;method="<span class="metrics-enum">getLeaderSchedule</span>"} | counter | Number of RPC requests served (getLeaderSchedule) |
+| <span class="metrics-name">rpc_&#8203;request_&#8203;served</span><br/>{rpc_&#8203;method="<span class="metrics-enum">getAgGenesisCert</span>"} | counter | Number of RPC requests served (getAgGenesisCert) |
 | <span class="metrics-name">rpc_&#8203;conn_&#8203;active</span> | gauge | The number of active HTTP connections to the RPC service |
 | <span class="metrics-name">rpc_&#8203;websocket_&#8203;conn_&#8203;active</span> | gauge | The number of active WebSocket connections to the RPC service |
 | <span class="metrics-name">rpc_&#8203;websocket_&#8203;subscription_&#8203;active</span><br/>{rpc_&#8203;event_&#8203;type="<span class="metrics-enum">vote</span>"} | gauge | The number of active WebSocket subscriptions to the RPC service, broken down by subscription type (vote) |
@@ -1975,8 +2028,8 @@
 |--------|------|-------------|
 | <span class="metrics-name">mlx5_&#8203;pkt_&#8203;rx</span> | counter | Number of packets successfully published to output links. |
 | <span class="metrics-name">mlx5_&#8203;pkt_&#8203;rx_&#8203;bytes</span> | counter | Number of bytes in packets successfully published to output links (including Ethernet header). |
-| <span class="metrics-name">mlx5_&#8203;pkt_&#8203;rx_&#8203;malformed</span> | counter | Number of packets dropped because they exceeded the receive buffer or had malformed Ethernet, IPv4, or UDP headers. |
-| <span class="metrics-name">mlx5_&#8203;pkt_&#8203;rx_&#8203;route_&#8203;fail</span> | counter | Number of packets dropped because the destination UDP port could not be routed to an output link. |
+| <span class="metrics-name">mlx5_&#8203;pkt_&#8203;rx_&#8203;malformed</span> | counter | Number of packets dropped because they were undersized, oversized, or had malformed Ethernet, IPv4, or UDP headers. |
+| <span class="metrics-name">mlx5_&#8203;pkt_&#8203;rx_&#8203;route_&#8203;fail</span> | counter | Number of packets dropped due to an incorrect destination IP or failed output link lookup. |
 | <span class="metrics-name">mlx5_&#8203;gre_&#8203;pkt_&#8203;rx</span> | counter | Number of GRE packets successfully decapsulated and published. |
 | <span class="metrics-name">mlx5_&#8203;gre_&#8203;pkt_&#8203;rx_&#8203;invalid</span> | counter | Number of GRE packets dropped because the tunnel peer or headers were invalid. |
 | <span class="metrics-name">mlx5_&#8203;gre_&#8203;pkt_&#8203;rx_&#8203;ignored</span> | counter | Number of GRE packets ignored because no GRE tunnel is configured. |
@@ -1990,11 +2043,10 @@
 | <span class="metrics-name">mlx5_&#8203;pkt_&#8203;tx_&#8203;route_&#8203;fail</span><br/>{route_&#8203;fail="<span class="metrics-enum">interface</span>"} | counter | Number of transmit jobs dropped because route or source address selection failed. (Interface not available) |
 | <span class="metrics-name">mlx5_&#8203;pkt_&#8203;tx_&#8203;route_&#8203;fail</span><br/>{route_&#8203;fail="<span class="metrics-enum">source_&#8203;ip</span>"} | counter | Number of transmit jobs dropped because route or source address selection failed. (No source IP address chosen) |
 | <span class="metrics-name">mlx5_&#8203;pkt_&#8203;tx_&#8203;route_&#8203;fail</span><br/>{route_&#8203;fail="<span class="metrics-enum">unsupported_&#8203;interface</span>"} | counter | Number of transmit jobs dropped because route or source address selection failed. (Interface type not supported) |
-| <span class="metrics-name">mlx5_&#8203;pkt_&#8203;tx_&#8203;invalid</span> | counter | Number of transmit jobs dropped because the IPv4 version or header length was invalid. |
+| <span class="metrics-name">mlx5_&#8203;pkt_&#8203;tx_&#8203;invalid</span> | counter | Number of transmit jobs dropped for invalid packet headers or GRE packets exceeding the MTU. |
 | <span class="metrics-name">mlx5_&#8203;pkt_&#8203;tx_&#8203;no_&#8203;neighbor</span> | counter | Number of transmit jobs dropped because the next-hop neighbor was unresolved. |
 | <span class="metrics-name">mlx5_&#8203;gre_&#8203;pkt_&#8203;tx_&#8203;submitted</span> | counter | Number of GRE transmit jobs submitted to the NIC. |
 | <span class="metrics-name">mlx5_&#8203;gre_&#8203;pkt_&#8203;tx_&#8203;no_&#8203;route</span> | counter | Number of GRE transmit jobs dropped because the inner or outer route was incomplete. |
-| <span class="metrics-name">mlx5_&#8203;gre_&#8203;pkt_&#8203;tx_&#8203;oversize</span> | counter | Number of GRE transmit jobs dropped because the encapsulated packet exceeded the route MTU. |
 | <span class="metrics-name">mlx5_&#8203;tx_&#8203;buffer_&#8203;busy</span> | gauge | Number of TX buffers pending or submitted to the NIC. |
 | <span class="metrics-name">mlx5_&#8203;tx_&#8203;buffer_&#8203;idle</span> | gauge | Number of TX buffers available for a new transmit job. |
 
@@ -2008,6 +2060,19 @@
 |--------|------|-------------|
 | <span class="metrics-name">waker_&#8203;epoll_&#8203;wait_&#8203;dispatched</span> | counter | epoll_wait syscalls dispatched on the outer epoll set |
 | <span class="metrics-name">waker_&#8203;wake_&#8203;delivered</span> | counter | Client wakes delivered (readiness fseq raised) |
+
+</div>
+
+## Mwaitx Tile
+
+<div class="metrics">
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| <span class="metrics-name">mwaitx_&#8203;nap</span> | counter | Hardware idle-wait naps on the doorbell line |
+| <span class="metrics-name">mwaitx_&#8203;wake_&#8203;issued</span> | counter | futex wakes issued to parked tiles |
+| <span class="metrics-name">mwaitx_&#8203;deadline_&#8203;wake</span> | counter | Wakes rung because a parked tile's deadline lapsed |
+| <span class="metrics-name">mwaitx_&#8203;sweep_&#8203;wake</span> | counter | Wakes rung by the verifying sweep indicating a doorbell raced or lost |
 
 </div>
 
@@ -2232,29 +2297,38 @@
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| <span class="metrics-name">rotor_&#8203;pkt_&#8203;tx</span> | counter | Network packets sent, including reqs, pings, pongs, etc |
-| <span class="metrics-name">rotor_&#8203;request_&#8203;tx</span><br/>{repair_&#8203;sent_&#8203;request_&#8203;type="<span class="metrics-enum">needed_&#8203;window</span>"} | counter | Client messages sent, by type (Need Window) |
-| <span class="metrics-name">rotor_&#8203;request_&#8203;tx</span><br/>{repair_&#8203;sent_&#8203;request_&#8203;type="<span class="metrics-enum">needed_&#8203;highest_&#8203;window</span>"} | counter | Client messages sent, by type (Need Highest Window) |
-| <span class="metrics-name">rotor_&#8203;request_&#8203;tx</span><br/>{repair_&#8203;sent_&#8203;request_&#8203;type="<span class="metrics-enum">needed_&#8203;orphan</span>"} | counter | Client messages sent, by type (Need Orphans) |
-| <span class="metrics-name">rotor_&#8203;request_&#8203;tx</span><br/>{repair_&#8203;sent_&#8203;request_&#8203;type="<span class="metrics-enum">parent_&#8203;fec_&#8203;count</span>"} | counter | Client messages sent, by type (Parent Fec Count) |
-| <span class="metrics-name">rotor_&#8203;request_&#8203;tx</span><br/>{repair_&#8203;sent_&#8203;request_&#8203;type="<span class="metrics-enum">fec_&#8203;root</span>"} | counter | Client messages sent, by type (Fec Root) |
-| <span class="metrics-name">rotor_&#8203;request_&#8203;tx</span><br/>{repair_&#8203;sent_&#8203;request_&#8203;type="<span class="metrics-enum">shred_&#8203;block_&#8203;id</span>"} | counter | Client messages sent, by type (Shred Block Id) |
-| <span class="metrics-name">rotor_&#8203;request_&#8203;tx</span><br/>{repair_&#8203;sent_&#8203;request_&#8203;type="<span class="metrics-enum">pong</span>"} | counter | Client messages sent, by type (Pong) |
+| <span class="metrics-name">rotor_&#8203;pkt_&#8203;tx</span> | counter | Network packets sent, including requests, pings and pongs |
+| <span class="metrics-name">rotor_&#8203;request_&#8203;tx</span><br/>{repair_&#8203;sent_&#8203;request_&#8203;type="<span class="metrics-enum">needed_&#8203;window</span>"} | counter | Repair requests sent, by type (Need Window) |
+| <span class="metrics-name">rotor_&#8203;request_&#8203;tx</span><br/>{repair_&#8203;sent_&#8203;request_&#8203;type="<span class="metrics-enum">needed_&#8203;highest_&#8203;window</span>"} | counter | Repair requests sent, by type (Need Highest Window) |
+| <span class="metrics-name">rotor_&#8203;request_&#8203;tx</span><br/>{repair_&#8203;sent_&#8203;request_&#8203;type="<span class="metrics-enum">needed_&#8203;orphan</span>"} | counter | Repair requests sent, by type (Need Orphans) |
+| <span class="metrics-name">rotor_&#8203;request_&#8203;tx</span><br/>{repair_&#8203;sent_&#8203;request_&#8203;type="<span class="metrics-enum">parent_&#8203;fec_&#8203;count</span>"} | counter | Repair requests sent, by type (Parent Fec Count) |
+| <span class="metrics-name">rotor_&#8203;request_&#8203;tx</span><br/>{repair_&#8203;sent_&#8203;request_&#8203;type="<span class="metrics-enum">fec_&#8203;root</span>"} | counter | Repair requests sent, by type (Fec Root) |
+| <span class="metrics-name">rotor_&#8203;request_&#8203;tx</span><br/>{repair_&#8203;sent_&#8203;request_&#8203;type="<span class="metrics-enum">shred_&#8203;block_&#8203;id</span>"} | counter | Repair requests sent, by type (Shred Block Id) |
+| <span class="metrics-name">rotor_&#8203;request_&#8203;tx</span><br/>{repair_&#8203;sent_&#8203;request_&#8203;type="<span class="metrics-enum">pong</span>"} | counter | Repair requests sent, by type (Pong) |
 | <span class="metrics-name">rotor_&#8203;slot_&#8203;highest_&#8203;repaired</span> | gauge | Highest slot up to which we have fully repaired |
 | <span class="metrics-name">rotor_&#8203;slot_&#8203;current</span> | gauge | Our view of the current cluster slot, max slot received |
-| <span class="metrics-name">rotor_&#8203;shred_&#8203;old</span> | counter | Shreds received that were older than the root |
-| <span class="metrics-name">rotor_&#8203;slot_&#8203;last_&#8203;requested</span> | gauge | Last slot we requested a single shred for |
-| <span class="metrics-name">rotor_&#8203;orphan_&#8203;last_&#8203;requested</span> | gauge | Last slot we requested an orphan for |
-| <span class="metrics-name">rotor_&#8203;request_&#8203;inflight</span> | gauge | Requests currently in the inflight queue, excluding orphans and highest window requests |
-| <span class="metrics-name">rotor_&#8203;peer_&#8203;requested</span> | counter | Peers requested |
-| <span class="metrics-name">rotor_&#8203;shred_&#8203;rerequested</span> | counter | Times we re-requested a shred from the inflights queue |
+| <span class="metrics-name">rotor_&#8203;slot_&#8203;turbine_&#8203;first</span> | gauge | First turbine slot seen, the catchup target |
+| <span class="metrics-name">rotor_&#8203;block_&#8203;check_&#8203;queued</span> | gauge | Blocks queued in the schedulor awaiting a repair check |
+| <span class="metrics-name">rotor_&#8203;request_&#8203;inflight</span> | gauge | Requests sent whose response has not been matched |
+| <span class="metrics-name">rotor_&#8203;fec_&#8203;delivered</span> | counter | FEC sets published to replay |
+| <span class="metrics-name">rotor_&#8203;shred_&#8203;old</span> | counter | Shreds received that were at or below the root |
+| <span class="metrics-name">rotor_&#8203;shred_&#8203;rx</span> | counter | Data shreds received as repair responses |
+| <span class="metrics-name">rotor_&#8203;shred_&#8203;rx_&#8203;block_&#8203;id</span> | counter | Repair response shreds credited to a ShredForBlockId request |
+| <span class="metrics-name">rotor_&#8203;shred_&#8203;rx_&#8203;positional</span> | counter | Repair response shreds credited to a positional Shred request |
+| <span class="metrics-name">rotor_&#8203;shred_&#8203;rx_&#8203;unmatched</span> | counter | Repair response shreds matching no outstanding request |
+| <span class="metrics-name">rotor_&#8203;meta_&#8203;rx</span> | counter | Alpenglow repair metadata responses received |
+| <span class="metrics-name">rotor_&#8203;meta_&#8203;malformed</span> | counter | Metadata responses that failed to decode |
+| <span class="metrics-name">rotor_&#8203;meta_&#8203;unsolicited</span> | counter | Metadata responses matching no outstanding request |
+| <span class="metrics-name">rotor_&#8203;parent_&#8203;fec_&#8203;count_&#8203;ok</span> | counter | getParentAndFecSetCount responses accepted |
+| <span class="metrics-name">rotor_&#8203;parent_&#8203;fec_&#8203;count_&#8203;failed</span> | counter | getParentAndFecSetCount responses that failed verification |
+| <span class="metrics-name">rotor_&#8203;fec_&#8203;root_&#8203;ok</span> | counter | getFecSetRoot responses accepted |
+| <span class="metrics-name">rotor_&#8203;fec_&#8203;root_&#8203;failed</span> | counter | getFecSetRoot responses that failed verification |
+| <span class="metrics-name">rotor_&#8203;replay_&#8203;root_&#8203;advanced</span> | counter | Root advanced messages received from replay |
+| <span class="metrics-name">rotor_&#8203;replay_&#8203;missing_&#8203;fec</span> | counter | Missing FEC messages received from replay, each arming a from-root redelivery |
 | <span class="metrics-name">rotor_&#8203;ping_&#8203;malformed</span> | counter | Malformed pings received |
 | <span class="metrics-name">rotor_&#8203;ping_&#8203;unknown_&#8203;peer</span> | counter | Pings received from an unknown peer |
 | <span class="metrics-name">rotor_&#8203;ping_&#8203;signature_&#8203;failed</span> | counter | Pings whose signature we failed to verify |
-| <span class="metrics-name">rotor_&#8203;shred_&#8203;block_&#8203;id_&#8203;failed</span> | counter | Times we failed to verify a shred for block id response |
-| <span class="metrics-name">rotor_&#8203;fec_&#8203;root_&#8203;failed</span> | counter | Times we failed to verify a FEC root response |
-| <span class="metrics-name">rotor_&#8203;parent_&#8203;fec_&#8203;count_&#8203;failed</span> | counter | Times we failed to verify a parent FEC count response |
-| <span class="metrics-name">rotor_&#8203;response_&#8203;latency_&#8203;nanos</span> | histogram | Time it took to receive a repair request response, in nanoseconds |
+| <span class="metrics-name">rotor_&#8203;response_&#8203;latency_&#8203;nanos</span> | histogram | Time from sending a repair request to receiving its response, in nanoseconds |
 
 </div>
 
@@ -2272,14 +2346,16 @@
 | <span class="metrics-name">votor_&#8203;vote_&#8203;rx</span><br/>{vote_&#8203;rx_&#8203;result="<span class="metrics-enum">success</span>"} | counter | Result of processing an inbound vote (per vote) (Vote was handed to the pool and accepted) |
 | <span class="metrics-name">votor_&#8203;vote_&#8203;rx</span><br/>{vote_&#8203;rx_&#8203;result="<span class="metrics-enum">bad_&#8203;size</span>"} | counter | Result of processing an inbound vote (per vote) (Vote was truncated or had trailing bytes) |
 | <span class="metrics-name">votor_&#8203;vote_&#8203;rx</span><br/>{vote_&#8203;rx_&#8203;result="<span class="metrics-enum">bad_&#8203;encoding</span>"} | counter | Result of processing an inbound vote (per vote) (Vote had an invalid version, tag, or signature encoding) |
-| <span class="metrics-name">votor_&#8203;vote_&#8203;rx</span><br/>{vote_&#8203;rx_&#8203;result="<span class="metrics-enum">shred_&#8203;version</span>"} | counter | Result of processing an inbound vote (per vote) (Vote was for a different shred version) |
 | <span class="metrics-name">votor_&#8203;vote_&#8203;rx</span><br/>{vote_&#8203;rx_&#8203;result="<span class="metrics-enum">unknown_&#8203;signer</span>"} | counter | Result of processing an inbound vote (per vote) (Sending connection had no authenticated identity) |
 | <span class="metrics-name">votor_&#8203;vote_&#8203;rx</span><br/>{vote_&#8203;rx_&#8203;result="<span class="metrics-enum">not_&#8203;a_&#8203;peer</span>"} | counter | Result of processing an inbound vote (per vote) (Sender was not in the peer set) |
-| <span class="metrics-name">votor_&#8203;vote_&#8203;rx</span><br/>{vote_&#8203;rx_&#8203;result="<span class="metrics-enum">not_&#8203;ranked</span>"} | counter | Result of processing an inbound vote (per vote) (Sender was not a ranked validator in the vote slot's epoch) |
-| <span class="metrics-name">votor_&#8203;vote_&#8203;rx</span><br/>{vote_&#8203;rx_&#8203;result="<span class="metrics-enum">slot_&#8203;out_&#8203;of_&#8203;bounds</span>"} | counter | Result of processing an inbound vote (per vote) (Vote slot was either too old or too far in the future) |
+| <span class="metrics-name">votor_&#8203;vote_&#8203;rx</span><br/>{vote_&#8203;rx_&#8203;result="<span class="metrics-enum">banned</span>"} | counter | Result of processing an inbound vote (per vote) (Sender is banned for a failed signature verification) |
+| <span class="metrics-name">votor_&#8203;vote_&#8203;rx</span><br/>{vote_&#8203;rx_&#8203;result="<span class="metrics-enum">bad_&#8203;slot</span>"} | counter | Result of processing an inbound vote (per vote) (Vote slot was either too old or too far in the future) |
+| <span class="metrics-name">votor_&#8203;vote_&#8203;rx</span><br/>{vote_&#8203;rx_&#8203;result="<span class="metrics-enum">bad_&#8203;block_&#8203;hash</span>"} | counter | Result of processing an inbound vote (per vote) (Vote block hash was null) |
+| <span class="metrics-name">votor_&#8203;vote_&#8203;rx</span><br/>{vote_&#8203;rx_&#8203;result="<span class="metrics-enum">bad_&#8203;sig</span>"} | counter | Result of processing an inbound vote (per vote) (Vote signature was the identity point) |
+| <span class="metrics-name">votor_&#8203;vote_&#8203;rx</span><br/>{vote_&#8203;rx_&#8203;result="<span class="metrics-enum">bad_&#8203;rank</span>"} | counter | Result of processing an inbound vote (per vote) (Sender was not a ranked validator in the vote slot's epoch) |
+| <span class="metrics-name">votor_&#8203;vote_&#8203;rx</span><br/>{vote_&#8203;rx_&#8203;result="<span class="metrics-enum">bad_&#8203;shred_&#8203;version</span>"} | counter | Result of processing an inbound vote (per vote) (Vote was for a different shred version) |
 | <span class="metrics-name">votor_&#8203;vote_&#8203;rx</span><br/>{vote_&#8203;rx_&#8203;result="<span class="metrics-enum">duplicate</span>"} | counter | Result of processing an inbound vote (per vote) (Voter had already cast this vote) |
 | <span class="metrics-name">votor_&#8203;vote_&#8203;rx</span><br/>{vote_&#8203;rx_&#8203;result="<span class="metrics-enum">slashable</span>"} | counter | Result of processing an inbound vote (per vote) (Vote constitutes a slashable offence) |
-| <span class="metrics-name">votor_&#8203;vote_&#8203;rx</span><br/>{vote_&#8203;rx_&#8203;result="<span class="metrics-enum">banned</span>"} | counter | Result of processing an inbound vote (per vote) (Sender is banned for a failed signature verification) |
 | <span class="metrics-name">votor_&#8203;cert_&#8203;rx</span><br/>{cert_&#8203;rx_&#8203;result="<span class="metrics-enum">success</span>"} | counter | Result of processing an inbound cert (per cert) (Cert was handed to the pool and accepted) |
 | <span class="metrics-name">votor_&#8203;cert_&#8203;rx</span><br/>{cert_&#8203;rx_&#8203;result="<span class="metrics-enum">bad_&#8203;size</span>"} | counter | Result of processing an inbound cert (per cert) (Cert was truncated or had trailing bytes) |
 | <span class="metrics-name">votor_&#8203;cert_&#8203;rx</span><br/>{cert_&#8203;rx_&#8203;result="<span class="metrics-enum">bad_&#8203;encoding</span>"} | counter | Result of processing an inbound cert (per cert) (Cert had an invalid version, tag, bitmap, or signature encoding) |
@@ -2291,5 +2367,10 @@
 | <span class="metrics-name">votor_&#8203;cert_&#8203;rx</span><br/>{cert_&#8203;rx_&#8203;result="<span class="metrics-enum">duplicate</span>"} | counter | Result of processing an inbound cert (per cert) (Cert was already in the pool) |
 | <span class="metrics-name">votor_&#8203;cert_&#8203;rx</span><br/>{cert_&#8203;rx_&#8203;result="<span class="metrics-enum">failed_&#8203;verify</span>"} | counter | Result of processing an inbound cert (per cert) (Cert failed the stake threshold or the aggregate signature check) |
 | <span class="metrics-name">votor_&#8203;cert_&#8203;rx</span><br/>{cert_&#8203;rx_&#8203;result="<span class="metrics-enum">banned</span>"} | counter | Result of processing an inbound cert (per cert) (Sender is banned for a failed signature verification) |
+| <span class="metrics-name">votor_&#8203;slot_&#8203;state_&#8203;used</span> | gauge | Number of slots tracked by the voting state machine |
+| <span class="metrics-name">votor_&#8203;slot_&#8203;state_&#8203;max</span> | gauge | Capacity of the voting state machine's slot table |
+| <span class="metrics-name">votor_&#8203;finalized_&#8203;slot</span> | gauge | Highest slot with a finalization cert, or 0 if none |
+| <span class="metrics-name">votor_&#8203;rank</span> | gauge | Rank of this validator in the current epoch (0 is the highest rank), -1 if unranked (unstaked) |
+| <span class="metrics-name">votor_&#8203;peers_&#8203;connected</span> | gauge | Number of peers with an active outbound connection |
 
 </div>

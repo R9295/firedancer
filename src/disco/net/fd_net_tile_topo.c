@@ -10,8 +10,74 @@
 #include "../../waltz/ip/fd_iproute.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <net/if.h>
 #include <unistd.h>
+
+static void
+fd_net_read_device_driver( char *       driver,
+                           ulong        driver_sz,
+                           char const * if_name ) {
+  FD_TEST( driver && driver_sz>=4UL );
+  char path[ PATH_MAX ], target[ PATH_MAX ];
+  fd_memcpy( driver, "n/a", 4UL );
+  if( FD_UNLIKELY( !fd_cstr_printf_check( path, sizeof(path), NULL,
+                                         "/sys/class/net/%s/device/driver", if_name ) ) ) {
+    FD_LOG_WARNING(( "cannot read driver for interface `%s`: sysfs path too long", if_name ));
+    return;
+  }
+
+  long n = readlink( path, target, sizeof(target)-1UL );
+  if( FD_UNLIKELY( n<0L ) ) {
+    if( errno!=ENOENT ) FD_LOG_WARNING(( "readlink(%s) failed (%i-%s)", path, errno, fd_io_strerror( errno ) ));
+    return;
+  }
+  if( FD_UNLIKELY( (ulong)n==sizeof(target)-1UL ) ) {
+    FD_LOG_WARNING(( "device driver link `%s` is too long", path ));
+    return;
+  }
+  target[ n ] = '\0';
+
+  char const * base = strrchr( target, '/' );
+  base = base ? base+1 : target;
+  if( FD_UNLIKELY( !base[0] ) ) {
+    FD_LOG_WARNING(( "device driver link `%s` has an empty driver name", path ));
+    return;
+  }
+  ulong name_sz = strlen( base )+1UL;
+  if( FD_UNLIKELY( name_sz>driver_sz ) ) {
+    FD_LOG_WARNING(( "driver name in `%s` exceeds output buffer size %lu", path, driver_sz ));
+    return;
+  }
+  fd_memcpy( driver, base, name_sz );
+}
+
+void
+fd_net_get_driver( char *       driver,
+                   ulong        driver_sz,
+                   char const * if_name ) {
+  FD_TEST( driver && driver_sz>=4UL );
+  if( !fd_bonding_is_master( if_name ) ) {
+    fd_net_read_device_driver( driver, driver_sz, if_name );
+    return;
+  }
+
+  driver[0] = '\0';
+  fd_bonding_slave_iter_t iter[1];
+  for( fd_bonding_slave_iter_init( iter, if_name );
+       !fd_bonding_slave_iter_done( iter );
+       fd_bonding_slave_iter_next( iter ) ) {
+    char member_driver[ NAME_MAX+1UL ];
+    fd_net_read_device_driver( member_driver, fd_ulong_min( sizeof(member_driver), driver_sz ),
+                               fd_bonding_slave_iter_ele( iter ) );
+    if( FD_UNLIKELY( !strcmp( member_driver, "n/a" ) || ( driver[0] && strcmp( driver, member_driver ) ) ) ) {
+      driver[0] = '\0';
+      break;
+    }
+    fd_cstr_ncpy( driver, member_driver, driver_sz );
+  }
+  if( FD_UNLIKELY( !driver[0] ) ) fd_memcpy( driver, "n/a", 4UL );
+}
 
 char const *
 fd_net_tile_name( char const * provider ) {
@@ -47,6 +113,7 @@ setup_mlx5_tile( fd_topo_t *             topo,
                  ulong                   route_max,
                  ulong                   route_peer_max ) {
   fd_topo_tile_t * tile = fd_topob_tile( topo, "mlx5", "mlx5", "metric_in", tile_to_cpu[ topo->tile_cnt ], 0, 0, 0, 0 );
+  tile->sleep_eventfd = topo->sleep_obj_id!=ULONG_MAX;
   fd_topob_link( topo, "net_netlnk", "net_netlnk", 128UL, 0UL, 0UL );
   fd_topob_tile_in(  topo, "netlnk", 0UL,         "metric_in", "net_netlnk", tile_kind_id, FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED );
   fd_topob_tile_out( topo, "mlx5", tile_kind_id,               "net_netlnk", tile_kind_id );
@@ -84,7 +151,7 @@ setup_xdp_tile( fd_topo_t *             topo,
                 char const *            if_phys,
                 ulong                   if_queue,
                 int                     xsk_core_dump ) {
-  fd_topo_tile_t * tile = fd_topob_tile( topo, "net", "net", "metric_in", tile_to_cpu[ topo->tile_cnt ], 0, 0, 0, 0 );
+  fd_topo_tile_t * tile = fd_topob_tile( topo, "net", "net", "metric_in", tile_to_cpu[ topo->tile_cnt ], 0, 0, 0, topo->sleep_obj_id!=ULONG_MAX );
   fd_topob_link( topo, "net_netlnk", "net_netlnk", 128UL, 0UL, 0UL );
   fd_topob_tile_in(  topo, "netlnk", 0UL, "metric_in", "net_netlnk", tile_kind_id, FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED );
   fd_topob_tile_out( topo, "net",    tile_kind_id,                "net_netlnk", tile_kind_id );
@@ -466,9 +533,64 @@ fd_topo_install_xdp( fd_topo_t const * topo,
 
 # undef ADD_IF_IDX
 
+void
+fd_topos_sock_lo( fd_topo_t *            topo,
+                  fd_topo_tile_t const * net_tile ) {
+  fd_topob_wksp( topo, "sock" );
+  fd_topo_tile_t * sock = fd_topob_tile( topo, "sock", "sock", "metric_in", ULONG_MAX, 0, 0, 0, 0 );
+  sock->net = net_tile->net;
+  sock->sock.only_recv_lo = 1;
+  sock->sock.so_rcvbuf    = 32*1024*1024;
+  sock->sock.net_tile_id  = net_tile->id;
+
+  for( ulong i=0UL; i<net_tile->out_cnt; i++ ) {
+    fd_topo_link_t const * net_out_link = &topo->links[ net_tile->out_link_id[ i ] ];
+
+    /* Which links of net to duplicate */
+    if( 0!=strncmp( net_out_link->name, "net_", 4UL ) || 0==strcmp( net_out_link->name, "net_netlnk" ) ) continue;
+
+    /* Duplicate link */
+    fd_topo_link_t * sock_out_link = fd_topob_link( topo, net_out_link->name, "sock", 4096UL, FD_NET_MTU, 64UL );
+    fd_topob_tile_out( topo, "sock", sock->kind_id, sock_out_link->name, sock_out_link->kind_id );
+
+    /* Loop through all tiles, check their in links for net */
+    for( ulong j=0UL; j<topo->tile_cnt; j++ ) {
+      fd_topo_tile_t * consumer = &topo->tiles[ j ];
+      ulong const in_cnt = consumer->in_cnt;
+      for( ulong k=0UL; k<in_cnt; k++ ) {
+        if( consumer->in_link_id[ k ]!=net_out_link->id ) continue;
+
+        /* Add as sock link consumer */
+        char const * fseq_wksp = topo->workspaces[ topo->objs[ consumer->in_link_fseq_obj_id[ k ] ].wksp_id ].name;
+        fd_topob_tile_in( topo, consumer->name, consumer->kind_id, fseq_wksp, sock_out_link->name, sock_out_link->kind_id,
+                          consumer->in_link_reliable[ k ], consumer->in_link_poll[ k ] );
+      }
+    }
+  }
+}
+
+ulong
+sock_lo_net_tile_id( fd_topo_tile_t const * tile ) {
+  if( 0==strcmp( tile->name, "sock" ) && tile->sock.only_recv_lo ) return tile->sock.net_tile_id;
+  return ULONG_MAX;
+}
+
+void
+sock_lo_set_affinity( fd_topo_t * topo ) {
+  for( ulong i=0UL; i<topo->tile_cnt; i++ ) {
+    fd_topo_tile_t * tile = &topo->tiles[ i ];
+    ulong net_tile_id = sock_lo_net_tile_id( tile );
+    if( net_tile_id==ULONG_MAX ) continue;
+    FD_TEST( net_tile_id<topo->tile_cnt );
+    fd_topo_tile_t const * net_tile = &topo->tiles[ net_tile_id ];
+    tile->cpu_idx = net_tile->cpu_idx;
+    tile->floats  = net_tile->floats;
+  }
+}
+
 static void
 fd_topos_mlx5_setup_mem( fd_topo_t *      topo,
-                            fd_topo_tile_t * mlx5_tile ) {
+                         fd_topo_tile_t * mlx5_tile ) {
   ulong cum_frame_cnt = 0UL;
 
   ulong const rx_depth = mlx5_tile->mlx5.rx_queue_size;

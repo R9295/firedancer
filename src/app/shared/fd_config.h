@@ -105,6 +105,8 @@ struct fd_configf {
   } accounts;
 
   struct {
+    char mode[ 16 ];
+
     int  enable_block_production;
     int  enable_snapshot_production;
     uint sign_tile_count;
@@ -113,6 +115,7 @@ struct fd_configf {
     uint execle_tile_count;
     uint execrp_tile_count;
     uint snapdc_tile_count;
+    uint snapin_tile_count;
     uint snapzp_tile_count;
     uint snapsv_tile_count;
     uint snapsv_io_worker_count;
@@ -208,7 +211,7 @@ struct fd_configf {
 
   struct {
     ulong authorized_voter_paths_cnt;
-    char  authorized_voter_paths[ 16 ][ PATH_MAX ];
+    char  authorized_voter_paths[ FD_KEYGUARD_AUTH_VOTERS_MAX ][ PATH_MAX ];
   } paths;
 
 };
@@ -305,6 +308,7 @@ struct fd_config {
     char snapshots[ PATH_MAX ];
     char genesis[ PATH_MAX ];
     char accounts[ PATH_MAX ];
+    char stake_delegations[ PATH_MAX ];
     char shredb[ PATH_MAX ];
     char guidb[ PATH_MAX ];
   } paths;
@@ -523,7 +527,6 @@ struct fd_config {
       ushort gui_listen_port;
       ulong  max_http_connections;
       ulong  max_websocket_connections;
-      ulong  max_http_request_length;
       ulong  send_buffer_size_mb;
       ulong  db_size_gib;
     } gui;
@@ -534,7 +537,6 @@ struct fd_config {
       ushort rpc_listen_port;
       ulong  max_http_connections;
       ulong  max_websocket_connections;
-      ulong  max_http_request_length;
       ulong  send_buffer_size_mb;
       int    delay_startup;
     } rpc;

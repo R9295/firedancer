@@ -1,4 +1,5 @@
 #include "fd_tower_tile.h"
+#include <linux/futex.h>
 #include "generated/fd_tower_tile_seccomp.h"
 
 #include "../../choreo/eqvoc/fd_eqvoc.h"
@@ -11,6 +12,7 @@
 #include "../../disco/fd_txn_p.h"
 #include "../../disco/events/generated/fd_event_gen.h"
 #include "../../disco/shred/fd_shred_tile.h"
+#include "../../disco/keyguard/fd_keyguard.h"
 #include "../../disco/keyguard/fd_keyload.h"
 #include "../../disco/keyguard/fd_keyswitch.h"
 #include "../../disco/metrics/fd_metrics.h"
@@ -23,7 +25,7 @@
 #include "../../flamenco/leaders/fd_multi_epoch_leaders.h"
 #include "../../flamenco/runtime/fd_system_ids.h"
 #include "../../flamenco/runtime/program/vote/fd_vote_state_versioned.h"
-#include "../../flamenco/runtime/program/vote/fd_vote_codec.h"
+#include "../../flamenco/runtime/program/vote/fd_vote_codec_tmpl.h"
 #include "../../util/pod/fd_pod.h"
 #include "../../util/fd_hash32.h"
 
@@ -134,208 +136,8 @@
 #define IN_KIND_SHRED  (5)
 
 #define OUT_IDX 0 /* only a single out link tower_out */
-#define AUTH_VTR_LG_MAX (5) /* The Solana Vote Interface supports up to 32 authorized voters. */
-FD_STATIC_ASSERT( 1<<AUTH_VTR_LG_MAX==32, AUTH_VTR_LG_MAX );
 
-/* Tower processes at most 2 equivocating blocks for a given slot: the
-   first block is the first one we observe for a slot, and the second
-   block is the one that gets duplicate confirmed.  Most of the time,
-   they are the same (ie. the block we first saw is the block that gets
-   duplicate confirmed), but we size for the worst case which is every
-   block in slot_max equivocates and we always see 2 blocks for every
-   slot. */
-
-#define EQVOC_MAX (2)
-
-/* The Alpenglow VAT caps the voting set of validators to 2000.  Only
-   the top 2000 voters by stake will be counted towards consensus rules.
-   Firedancer uses the same bound for TowerBFT.
-
-   Note module implementations may round the max capacity of various
-   structures to pow2 for performance, but the consensus logic will only
-   retain at most 2000 voters.
-
-   https://github.com/solana-foundation/solana-improvement-documents/blob/main/proposals/0357-alpenglow_validator_admission_ticket.md */
-
-#define VTR_MAX (2000) /* the maximum # of unique voters ie. node pubkeys. */
-
-/* PER_VTR_MAX controls how many "entries" a validator is allowed to
-   occupy in various vote-tracking structures.  This is set somewhat
-   arbitrarily based on expected worst-case usage by an honest validator
-   and is set to guard against a malicious spamming validator attempting
-   to oom Firedancer structures. */
-
-#define PER_VTR_MAX (512) /* the maximum amount of slot history the sysvar retains */
-
-struct publish {
-  ulong          sig;
-  fd_tower_msg_t msg;
-};
-typedef struct publish publish_t;
-
-#define DEQUE_NAME publishes
-#define DEQUE_T    publish_t
-#include "../../util/tmpl/fd_deque_dynamic.c"
-
-struct auth_vtr {
-  fd_pubkey_t addr;      /* map key, vote account address */
-  uint        hash;      /* reserved for use by fd_map */
-  ulong       paths_idx; /* index in authorized voter paths */
-};
-typedef struct auth_vtr auth_vtr_t;
-
-#define MAP_NAME               auth_vtr
-#define MAP_T                  auth_vtr_t
-#define MAP_LG_SLOT_CNT        AUTH_VTR_LG_MAX
-#define MAP_KEY                addr
-#define MAP_KEY_T              fd_pubkey_t
-#define MAP_KEY_NULL           (fd_pubkey_t){0}
-#define MAP_KEY_EQUAL(k0,k1)   (!(memcmp((k0).key,(k1).key,sizeof(fd_pubkey_t))))
-#define MAP_KEY_INVAL(k)       (MAP_KEY_EQUAL((k),MAP_KEY_NULL))
-#define MAP_KEY_EQUAL_IS_SLOW  1
-#define MAP_KEY_HASH(k)        ((uint)fd_ulong_hash( fd_ulong_load_8( (k).uc ) ))
-#include "../../util/tmpl/fd_map.c"
-
-struct epoch_vtr {
-  fd_pubkey_t vote_acc;
-  ulong       stake;
-  fd_pubkey_t auth_vtr; /* authorized voter for vote_acc at this map's target epoch; all-zero if unavailable */
-  ulong       next; /* reserved for fd_pool and fd_map_chain */
-};
-typedef struct epoch_vtr epoch_vtr_t;
-
-#define POOL_NAME epoch_vtr_pool
-#define POOL_T    epoch_vtr_t
-#include "../../util/tmpl/fd_pool.c"
-
-#define MAP_NAME               epoch_vtr_map
-#define MAP_ELE_T              epoch_vtr_t
-#define MAP_KEY                vote_acc
-#define MAP_KEY_T              fd_pubkey_t
-#define MAP_KEY_EQ(k0,k1)      (!memcmp((k0),(k1),sizeof(fd_pubkey_t)))
-#define MAP_KEY_HASH(key,seed) (fd_hash32( (key)->uc, (seed) ))
-#define MAP_NEXT               next
-#include "../../util/tmpl/fd_map_chain.c"
-
-#define AUTH_VOTERS_MAX (16UL)
-
-struct in_ctx {
-  int         mcache_only;
-  fd_wksp_t * mem;
-  ulong       chunk0;
-  ulong       wmark;
-  ulong       mtu;
-};
-typedef struct in_ctx in_ctx_t;
-
-struct fd_tower_tile {
-  ulong            seed; /* map seed */
-  int              checkpt_fd;
-  int              restore_fd;
-  fd_pubkey_t      identity_key[1];
-  fd_pubkey_t      vote_account[1];
-  ulong            auth_vtr_path_cnt;  /* number of authorized voter paths passed to tile */
-  uchar            our_vote_acct[FD_VOTE_STATE_DATA_MAX]; /* buffer for reading back our own vote acct data */
-  ulong            our_vote_acct_sz;
-
-  /* owned joins */
-
-  fd_wksp_t *      wksp; /* workspace */
-  fd_keyswitch_t * identity_keyswitch;
-  auth_vtr_t *     auth_vtr;
-  fd_keyswitch_t * auth_vtr_keyswitch; /* authorized voter keyswitch */
-
-  fd_eqvoc_t * eqvoc;
-  fd_ghost_t * ghost;
-  fd_hfork_t * hfork;
-  fd_votes_t * votes;
-  fd_tower_t * tower;
-
-  fd_vote_instruction_t scratch_ix;
-  fd_tower_vote_t *     scratch_tower; /* spare deque used during vote txn processing */
-
-  publish_t *                publishes; /* deque of slot_confirmed msgs queued for publishing */
-  fd_multi_epoch_leaders_t * mleaders; /* multi-epoch leaders */
-
-  /* borrowed joins */
-
-  fd_banks_t * banks;
-  fd_accdb_t * accdb;
-
-  /* static structures */
-
-  fd_pubkey_t                   id_keys  [VTR_MAX]; /* identity keys */
-  fd_pubkey_t                   vote_accs[VTR_MAX]; /* vote account addresses */
-  ulong                         vtr_cnt;            /* actual cnt of elements in above arrays */
-  fd_gossip_duplicate_shred_t   duplicate_chunks[FD_EQVOC_CHUNK_CNT];
-  fd_compact_tower_sync_serde_t compact_tower_sync_serde;
-  uchar                         vote_txn[FD_TPU_PARSED_MTU];
-
-  uchar __attribute__((aligned(FD_MULTI_EPOCH_LEADERS_ALIGN))) mleaders_mem[ FD_MULTI_EPOCH_LEADERS_FOOTPRINT ];
-  uchar __attribute__((aligned(FD_VOTE_STAKES_ITER_ALIGN))) iter_mem[ FD_VOTE_STAKES_ITER_FOOTPRINT ];
-
-  ulong             root_epoch;
-  ulong             root_epoch_total_stake;
-  ulong             next_epoch_total_stake;
-  epoch_vtr_t     * root_epoch_vtr_pool;
-  epoch_vtr_map_t * root_epoch_vtr_map;
-  epoch_vtr_t     * next_epoch_vtr_pool;
-  epoch_vtr_map_t * next_epoch_vtr_map;
-
-  /* metadata */
-
-  int    halt_signing;
-  int    hard_fork_fatal;
-  int    wfs;           /* 1 if booted with wait_for_supermajority */
-  ushort shred_version;
-  int    init; /* 1 after ghost_init has been called */
-
-  /* in/out link setup */
-
-  int      in_kind[ 64UL ];
-  in_ctx_t in     [ 64UL ];
-
-  fd_wksp_t * out_mem;
-  ulong       out_chunk0;
-  ulong       out_wmark;
-  ulong       out_chunk;
-  ulong       out_seq;
-
-  /* metrics */
-
-  struct {
-    ulong not_ready;
-
-    ulong ignored_cnt;
-    ulong ignored_slot;
-    ulong eqvoc_cnt;
-    ulong eqvoc_slot;
-
-    ulong replay_slot;
-    ulong last_vote_slot;
-    ulong reset_slot;
-    ulong root_slot;
-    ulong init_slot;
-
-    ulong fork[ FD_METRICS_ENUM_TOWER_FORK_DECISION_CNT ];
-    ulong gate[ FD_METRICS_ENUM_TOWER_VOTE_GATE_CNT ];
-
-    ulong votes     [ FD_METRICS_ENUM_VOTE_TXN_RESULT_CNT         ];
-    ulong vote_slots[ FD_METRICS_ENUM_VOTE_SLOT_RESULT_CNT        ];
-    ulong gate_int  [ FD_METRICS_ENUM_VOTE_INTERMEDIATE_GATE_CNT  ];
-
-    ulong eqvoc_success;
-    ulong eqvoc_err;
-
-    ulong ghost[ FD_METRICS_ENUM_GHOST_VOTE_RESULT_CNT ];
-
-    ulong hfork[ FD_METRICS_ENUM_HARD_FORK_VOTE_RESULT_CNT ];
-
-    ulong hfork_matched_slot;
-    ulong hfork_mismatched_slot;
-  } metrics;
-};
-typedef struct fd_tower_tile fd_tower_tile_t;
+#include "fd_tower_tile_private.h"
 
 /* Compile-time dependency injection.  This macro defaults to the
    production implementation defined below.  Tests can #define it before
@@ -1096,7 +898,11 @@ count_vote_txn( fd_tower_tile_t * ctx,
   int hfork_err = fd_hfork_count_vote( ctx->hfork, vote_acc, their_block_id, their_bank_hash, their_last_vote->slot, vtr->stake, total_stake );
   update_metrics_hfork( ctx, hfork_err, their_last_vote->slot, their_block_id );
 
-  int votes_err = fd_votes_count_vote( ctx->votes, vote_acc, vtr->stake, their_last_vote->slot, their_block_id );
+  /* One voter lookup, shared by every slot of this txn (the voter set
+     only changes at epoch boundaries, outside this function). */
+  fd_votes_vtr_t * votes_vtr = fd_votes_vtr_query( ctx->votes, vote_acc );
+
+  int votes_err = fd_votes_count_vote_vtr( ctx->votes, votes_vtr, vtr->stake, their_last_vote->slot, their_block_id );
   update_metrics_vote_slot( ctx, votes_err );
   if( FD_LIKELY( votes_err==FD_VOTES_SUCCESS ) ) publish_slot_confirmed( ctx, their_last_vote->slot, their_block_id, total_stake );
 
@@ -1114,8 +920,13 @@ count_vote_txn( fd_tower_tile_t * ctx,
 
      https://github.com/anza-xyz/agave/blob/v2.3.7/core/src/cluster_info_vote_listener.rs#L483-L487 */
 
-  if( FD_UNLIKELY( !fd_tower_blocks_query( ctx->tower, their_last_vote->slot ) ) ) { ctx->metrics.gate_int[ FD_METRICS_ENUM_VOTE_INTERMEDIATE_GATE_V_UNKNOWN_SLOT_IDX ]++; return; }; /* we haven't replayed this block yet */
-  fd_hash_t const * our_block_id = fd_tower_blocks_canonical_block_id( ctx->tower, their_last_vote->slot );
+  fd_tower_blk_t const * our_blk = fd_tower_blocks_query( ctx->tower, their_last_vote->slot );
+  if( FD_UNLIKELY( !our_blk ) ) {
+     /* we haven't replayed this block yet */
+    ctx->metrics.gate_int[ FD_METRICS_ENUM_VOTE_INTERMEDIATE_GATE_V_UNKNOWN_SLOT_IDX ]++;
+    return;
+  };
+  fd_hash_t const * our_block_id = fd_tower_blk_canonical_block_id( our_blk );
   if( FD_UNLIKELY( 0!=memcmp( our_block_id, their_block_id, sizeof(fd_hash_t) ) ) ) { ctx->metrics.gate_int[ FD_METRICS_ENUM_VOTE_INTERMEDIATE_GATE_V_UNKNOWN_BLOCK_ID_IDX ]++; return; } /* we don't recognize this block id */
 
   /* At this point, we know we have replayed the same slot and also have
@@ -1151,7 +962,7 @@ count_vote_txn( fd_tower_tile_t * ctx,
 
     if( FD_UNLIKELY( their_intermediate_vote->slot <= ctx->tower->root ) ) { ctx->metrics.vote_slots[ FD_METRICS_ENUM_VOTE_SLOT_RESULT_V_TOO_OLD_IDX ]++; continue; }
 
-    fd_tower_blk_t * tower_blk = fd_tower_blocks_query( ctx->tower, their_intermediate_vote->slot );
+    fd_tower_blk_t const * tower_blk = fd_tower_blocks_query( ctx->tower, their_intermediate_vote->slot );
     if( FD_UNLIKELY( !tower_blk ) ) { ctx->metrics.vote_slots[ FD_METRICS_ENUM_VOTE_SLOT_RESULT_V_UNKNOWN_SLOT_IDX ]++; continue; }
 
     /* Otherwise, we count the vote using our own block id for that slot
@@ -1162,8 +973,8 @@ count_vote_txn( fd_tower_tile_t * ctx,
 
        https://github.com/anza-xyz/agave/blob/v2.3.7/core/src/cluster_info_vote_listener.rs#L500 */
 
-    fd_hash_t const * intermediate_block_id = fd_tower_blocks_canonical_block_id( ctx->tower, their_intermediate_vote->slot );
-    int votes_err = fd_votes_count_vote( ctx->votes, vote_acc, vtr->stake, their_intermediate_vote->slot, intermediate_block_id );
+    fd_hash_t const * intermediate_block_id = fd_tower_blk_canonical_block_id( tower_blk );
+    int votes_err = fd_votes_count_vote_vtr( ctx->votes, votes_vtr, vtr->stake, their_intermediate_vote->slot, intermediate_block_id );
     update_metrics_vote_slot( ctx, votes_err );
     if( FD_LIKELY( votes_err==FD_VOTES_SUCCESS ) ) publish_slot_confirmed( ctx, their_intermediate_vote->slot, intermediate_block_id, total_stake );
   }
@@ -1608,7 +1419,7 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
   l = FD_LAYOUT_APPEND( l, fd_tower_align(),         fd_tower_footprint( slot_max, VTR_MAX )                       );
   l = FD_LAYOUT_APPEND( l, fd_tower_vote_align(),    fd_tower_vote_footprint()                                     );
   l = FD_LAYOUT_APPEND( l, publishes_align(),        publishes_footprint( pub_max )                                );
-  l = FD_LAYOUT_APPEND( l, fd_accdb_align(),         fd_accdb_footprint( tile->tower.max_live_slots )              );
+  l = FD_LAYOUT_APPEND( l, fd_accdb_align(),         fd_accdb_footprint( tile->tower.max_live_slots, 0 )              );
   ulong epoch_vtr_chain_cnt = epoch_vtr_map_chain_cnt_est( VTR_MAX );
   l = FD_LAYOUT_APPEND( l, epoch_vtr_pool_align(),         epoch_vtr_pool_footprint( VTR_MAX )                     );
   l = FD_LAYOUT_APPEND( l, epoch_vtr_map_align(),          epoch_vtr_map_footprint( epoch_vtr_chain_cnt )          );
@@ -1646,7 +1457,7 @@ init_choreo( void                 * scratch,
   void  * tower         = FD_SCRATCH_ALLOC_APPEND( l, fd_tower_align(),         fd_tower_footprint( slot_max, VTR_MAX )                       );
   void  * scratch_tower = FD_SCRATCH_ALLOC_APPEND( l, fd_tower_vote_align(),    fd_tower_vote_footprint()                                     );
   void  * publishes     = FD_SCRATCH_ALLOC_APPEND( l, publishes_align(),        publishes_footprint( pub_max )                                );
-  void  * accdb         = FD_SCRATCH_ALLOC_APPEND( l, fd_accdb_align(),         fd_accdb_footprint( tile->tower.max_live_slots )              );
+  void  * accdb         = FD_SCRATCH_ALLOC_APPEND( l, fd_accdb_align(),         fd_accdb_footprint( tile->tower.max_live_slots, 0 )              );
   ulong epoch_vtr_chain_cnt = epoch_vtr_map_chain_cnt_est( VTR_MAX );
   void  * root_epoch_vtr_pool   = FD_SCRATCH_ALLOC_APPEND( l, epoch_vtr_pool_align(),         epoch_vtr_pool_footprint( VTR_MAX )             );
   void  * root_epoch_vtr_map    = FD_SCRATCH_ALLOC_APPEND( l, epoch_vtr_map_align(),          epoch_vtr_map_footprint( epoch_vtr_chain_cnt )  );
@@ -1663,7 +1474,8 @@ init_choreo( void                 * scratch,
   ctx->tower              = fd_tower_join              ( fd_tower_new              ( tower, slot_max, VTR_MAX, ctx->seed )                       );
   ctx->scratch_tower      = fd_tower_vote_join         ( fd_tower_vote_new         ( scratch_tower )                                             );
   ctx->publishes          = publishes_join             ( publishes_new             ( publishes, pub_max )                                        );
-  ctx->accdb              = fd_accdb_join              ( fd_accdb_new              ( accdb, _accdb_shmem, FD_ACCDB_FD_RW, 0UL, NULL )            );
+  fd_sleep_t * accdb_sleep = topo->sleep_obj_id!=ULONG_MAX ? fd_sleep_join( fd_topo_obj_laddr( topo, topo->sleep_obj_id ) ) : NULL;
+  ctx->accdb              = fd_accdb_join              ( fd_accdb_new              ( accdb, _accdb_shmem, FD_ACCDB_FD_RW, 0UL, NULL, accdb_sleep, fd_topo_find_tile( topo, "accdb", 0UL ), 0 ) );
   ctx->mleaders           = fd_multi_epoch_leaders_join( fd_multi_epoch_leaders_new( ctx->mleaders_mem )                                         );
   ctx->root_epoch_vtr_pool = epoch_vtr_pool_join( epoch_vtr_pool_new( root_epoch_vtr_pool, VTR_MAX ) );
   ctx->root_epoch_vtr_map  = epoch_vtr_map_join ( epoch_vtr_map_new ( root_epoch_vtr_map,  epoch_vtr_chain_cnt, ctx->seed ) );
@@ -1713,7 +1525,7 @@ during_housekeeping( fd_tower_tile_t * ctx ) {
     if( FD_LIKELY( param==FD_KEYSWITCH_PARAM_AV_ADD ) ) {
       fd_pubkey_t pubkey = *(fd_pubkey_t const *)fd_type_pun_const( ctx->auth_vtr_keyswitch->bytes );
       if( FD_UNLIKELY( auth_vtr_query( ctx->auth_vtr, pubkey, NULL ) ) ) FD_LOG_CRIT(( "keyswitch: duplicate authorized voter key, keys not synced up with sign tile" ));
-      if( FD_UNLIKELY( ctx->auth_vtr_path_cnt==AUTH_VOTERS_MAX ) ) FD_LOG_CRIT(( "keyswitch: too many authorized voters, keys not synced up with sign tile" ));
+      if( FD_UNLIKELY( ctx->auth_vtr_path_cnt==FD_KEYGUARD_AUTH_VOTERS_MAX ) ) FD_LOG_CRIT(( "keyswitch: too many authorized voters, keys not synced up with sign tile" ));
 
       auth_vtr_t * auth_vtr = auth_vtr_insert( ctx->auth_vtr, pubkey );
       auth_vtr->paths_idx = ctx->auth_vtr_path_cnt;
@@ -1751,13 +1563,18 @@ during_housekeeping( fd_tower_tile_t * ctx ) {
   }
 
   if( FD_UNLIKELY( fd_keyswitch_state_query( ctx->identity_keyswitch )==FD_KEYSWITCH_STATE_SWITCH_PENDING ) ) {
-    FD_LOG_DEBUG(( "keyswitch: halting signing" ));
+    ulong seq_must_complete = fd_keyswitch_param_query( ctx->identity_keyswitch );
+    if( FD_UNLIKELY( fd_seq_lt( ctx->replay_in_seq, seq_must_complete ) ) ) return;
+
+    if( FD_LIKELY( !ctx->halt_signing ) ) FD_LOG_DEBUG(( "keyswitch: halting signing" ));
+    ctx->halt_signing = 1;
+    if( FD_UNLIKELY( !publishes_empty( ctx->publishes ) ) ) return;
+
     memcpy( ctx->identity_key, ctx->identity_keyswitch->bytes, 32UL );
     FD_BASE58_ENCODE_32_BYTES( ctx->identity_key->uc, pubkey_str );
     FD_LOG_INFO(( "my identity key: %s (key switched)", pubkey_str ));
-    fd_keyswitch_state( ctx->identity_keyswitch, FD_KEYSWITCH_STATE_COMPLETED );
-    ctx->halt_signing               = 1;
     ctx->identity_keyswitch->result = ctx->out_seq;
+    fd_keyswitch_state( ctx->identity_keyswitch, FD_KEYSWITCH_STATE_COMPLETED );
   }
 }
 
@@ -1815,9 +1632,26 @@ after_credit( fd_tower_tile_t *   ctx,
 }
 
 static inline int
+before_frag( fd_tower_tile_t * ctx,
+             ulong             in_idx,
+             ulong             seq,
+             ulong             sig ) {
+  switch( ctx->in_kind[ in_idx ] ) {
+  case IN_KIND_GOSSIP: return sig!=FD_GOSSIP_UPDATE_TAG_DUPLICATE_SHRED;
+  case IN_KIND_REPLAY: {
+    int filter = sig!=REPLAY_SIG_SLOT_COMPLETED && sig!=REPLAY_SIG_SLOT_DEAD && sig!=REPLAY_SIG_TXN_EXECUTED;
+    if( filter ) ctx->replay_in_seq = seq+1UL;
+    return filter;
+  }
+  case IN_KIND_SHRED:  return fd_shred_sig_src( sig )!=SHRED_SIG_SRC_TURBINE && fd_shred_sig_src( sig )!=SHRED_SIG_SRC_REPAIR;
+  default:             return 0;
+  }
+}
+
+static inline int
 returnable_frag( fd_tower_tile_t *   ctx,
                  ulong               in_idx,
-                 ulong               seq FD_PARAM_UNUSED,
+                 ulong               seq,
                  ulong               sig,
                  ulong               chunk,
                  ulong               sz,
@@ -1884,7 +1718,7 @@ returnable_frag( fd_tower_tile_t *   ctx,
       break;
     case REPLAY_SIG_SLOT_DEAD:;
       fd_replay_slot_dead_t * slot_dead = (fd_replay_slot_dead_t *)fd_chunk_to_laddr( ctx->in[ in_idx ].mem, chunk );
-      if( FD_UNLIKELY( slot_dead->slot < ctx->tower->root ) ) return 0; /* ignore dead slots before root */
+      if( FD_UNLIKELY( slot_dead->slot < ctx->tower->root ) ) break; /* ignore dead slots before root */
       fd_epoch_leaders_t const * lsched = fd_multi_epoch_leaders_get_lsched_for_slot( ctx->mleaders, slot_dead->slot );
       FD_TEST( lsched );
       FD_TEST( lsched->epoch==ctx->root_epoch || lsched->epoch==ctx->root_epoch + 1 );
@@ -1895,12 +1729,13 @@ returnable_frag( fd_tower_tile_t *   ctx,
     case REPLAY_SIG_TXN_EXECUTED:;
       FD_TEST( ctx->init ); /* replay_txn_executed should never be received before replay_slot_completed, which sets init to 1. */
       fd_replay_txn_executed_t * txn_executed = fd_type_pun( fd_chunk_to_laddr( ctx->in[in_idx].mem, chunk ) );
-      if( FD_UNLIKELY( !txn_executed->is_committable || txn_executed->is_fees_only || txn_executed->txn_err ) ) return 0;
+      if( FD_UNLIKELY( !txn_executed->is_committable || txn_executed->is_fees_only || txn_executed->txn_err ) ) break;
       count_vote_txn( ctx, TXN(txn_executed->txn), txn_executed->txn->payload );
       break;
     default:
       break;
     }
+    ctx->replay_in_seq = seq+1UL;
     return 0;
   }
   case IN_KIND_SHRED: {
@@ -2017,11 +1852,12 @@ unprivileged_init( fd_topo_t const *      topo,
     }
   }
 
-  ctx->out_mem    = topo->workspaces[ topo->objs[ topo->links[ tile->out_link_id[ 0 ] ].dcache_obj_id ].wksp_id ].wksp;
-  ctx->out_chunk0 = fd_dcache_compact_chunk0( ctx->out_mem, topo->links[ tile->out_link_id[ 0 ] ].dcache );
-  ctx->out_wmark  = fd_dcache_compact_wmark ( ctx->out_mem, topo->links[ tile->out_link_id[ 0 ] ].dcache, topo->links[ tile->out_link_id[ 0 ] ].mtu );
-  ctx->out_chunk  = ctx->out_chunk0;
-  ctx->out_seq    = 0UL;
+  ctx->out_mem       = topo->workspaces[ topo->objs[ topo->links[ tile->out_link_id[ 0 ] ].dcache_obj_id ].wksp_id ].wksp;
+  ctx->out_chunk0    = fd_dcache_compact_chunk0( ctx->out_mem, topo->links[ tile->out_link_id[ 0 ] ].dcache );
+  ctx->out_wmark     = fd_dcache_compact_wmark ( ctx->out_mem, topo->links[ tile->out_link_id[ 0 ] ].dcache, topo->links[ tile->out_link_id[ 0 ] ].mtu );
+  ctx->out_chunk     = ctx->out_chunk0;
+  ctx->out_seq       = 0UL;
+  ctx->replay_in_seq = 0UL;
 
   FD_BASE58_ENCODE_32_BYTES( ctx->vote_account->uc, vote_account_b58 );
   FD_BASE58_ENCODE_32_BYTES( ctx->identity_key->uc, identity_key_b58 );
@@ -2072,6 +1908,7 @@ populate_allowed_fds( fd_topo_t const *      topo,
 #define STEM_CALLBACK_DURING_HOUSEKEEPING during_housekeeping
 #define STEM_CALLBACK_METRICS_WRITE       metrics_write
 #define STEM_CALLBACK_AFTER_CREDIT        after_credit
+#define STEM_CALLBACK_BEFORE_FRAG         before_frag
 #define STEM_CALLBACK_RETURNABLE_FRAG     returnable_frag
 
 #include "../../disco/stem/fd_stem.c"

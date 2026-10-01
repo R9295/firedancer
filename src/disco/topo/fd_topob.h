@@ -126,6 +126,14 @@ fd_topob_tile( fd_topo_t *    topo,
 void
 fd_topob_waker( fd_topo_t * topo );
 
+void
+fd_topob_sleep( fd_topo_t *  topo,
+                char const * metrics_wksp,
+                ulong        mwaitx_cpu_idx );
+
+void
+fd_topob_sleep_finish( fd_topo_t * topo );
+
 /* Add an input link to the tile.  If the tile is created with fd_stem,
    it will automatically poll the in link and forward fragments to the
    user code (unless the link is specified as unpolled).
@@ -183,9 +191,9 @@ fd_topob_finish( fd_topo_t *                topo,
                  fd_topo_obj_callbacks_t ** callbacks );
 
 
-/* Classify a tile name into one of the FD_TOPOB_PRIORITY_* categories. */
+/* Classify a tile into one of the FD_TOPOB_PRIORITY_* categories. */
 int
-fd_topob_tile_priority_type( char const * name );
+fd_topob_tile_priority_type( fd_topo_tile_t const * tile );
 
 void
 fd_topob_validate_cpu_overlaps( fd_topo_t const * topo );

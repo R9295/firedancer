@@ -3,7 +3,6 @@
 
 #include "../../util/fd_util.h"
 #include "../../third_party/blst/bindings/blst.h"
-#include "fd_bls_err.h"
 
 #define FD_BLS_SEC_SZ            (32UL)
 #define FD_BLS_PUB_SZ            (96UL)
@@ -17,7 +16,6 @@
 typedef blst_scalar fd_bls_sec_t;
 typedef blst_p1     fd_bls_pub_t;
 typedef blst_p2     fd_bls_sig_t;
-
 
 #define SET_NAME fd_bls_set
 #define SET_MAX  FD_BLS_SET_MAX
@@ -59,6 +57,9 @@ int
 fd_bls_pub_de( fd_bls_pub_t * pub,
                uchar const *  buf,
                ulong          buf_sz );
+
+fd_bls_agg_t *
+fd_bls_agg_null( fd_bls_agg_t * agg );
 
 fd_bls_agg_t *
 fd_bls_agg_construct( fd_bls_agg_t *       agg,

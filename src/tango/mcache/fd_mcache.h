@@ -185,10 +185,7 @@ FD_FN_PURE uchar *       fd_mcache_app_laddr      ( fd_frag_meta_t *       mcach
 
 static inline ulong
 fd_mcache_seq_query( ulong const * _seq ) {
-  FD_COMPILER_MFENCE();
-  ulong seq = FD_VOLATILE_CONST( *_seq );
-  FD_COMPILER_MFENCE();
-  return seq;
+  return __atomic_load_n( _seq, __ATOMIC_ACQUIRE );
 }
 
 /* fd_mcache_seq_update updates the mcache's seq[0] (e.g. from
@@ -208,9 +205,7 @@ fd_mcache_seq_query( ulong const * _seq ) {
 static inline void
 fd_mcache_seq_update( ulong * _seq,
                       ulong   seq ) {
-  FD_COMPILER_MFENCE();
-  FD_VOLATILE( *_seq ) = seq;
-  FD_COMPILER_MFENCE();
+  __atomic_store_n( _seq, seq, __ATOMIC_RELEASE );
 }
 
 /* fd_mcache_line_idx returns the index of the cache line in a depth
@@ -307,7 +302,7 @@ fd_mcache_publish( fd_frag_meta_t * mcache,   /* Assumed a current local join */
                    ulong            tsorig,   /* Assumed in [0,UINT_MAX] */
                    ulong            tspub ) { /* Assumed in [0,UINT_MAX] */
   fd_frag_meta_t * meta = mcache + fd_mcache_line_idx( seq, depth );
-#if FD_HAS_ARM
+#if FD_HAS_ARM || FD_HAS_RISCV
   __atomic_store_n( &meta->seq, fd_seq_dec( seq, 1UL ), __ATOMIC_RELAXED );
   FD_HW_MFENCE_ST();
   meta->sig    =         sig;
