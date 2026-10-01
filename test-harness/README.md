@@ -106,12 +106,6 @@ Seeds in `seeds/` are `arbitrary` encodings of that `Vec<Action>`, so changing
 an `Action` field type changes their byte layout. Account indices, offsets, and
 amounts are two bytes each; owners and CPI destinations are one byte.
 
-Three seeds currently diverge: `36_five_hellos_cpi_chain`,
-`41_write_assign_then_cpi`, and `52_five_hellos_write_assign_cpi_chain`. Each
-fails a CPI with the same result in both clients, but Firedancer reports 1,065
-more remaining compute units than Agave. Ziggy may reject these as crashing
-seeds until the divergence is resolved.
-
 Observed on `x86_64-unknown-linux-gnu` with Agave master `7953e4d`; both clients
 agree on these results:
 
