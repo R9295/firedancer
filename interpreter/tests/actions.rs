@@ -146,22 +146,22 @@ fn lamport_actions_use_wrapping_arithmetic_and_shared_accounts() {
     assert_eq!(accounts[0].lamports(), 13);
     run(
         &accounts,
-        &[Action::CreditLamports {
-            account: 1,
-            amount: u64::MAX,
-        }],
-    )
-    .unwrap();
-    assert_eq!(accounts[0].lamports(), 12);
-    run(
-        &accounts,
         &[Action::DebitLamports {
             account: 0,
-            amount: 13,
+            amount: 14,
         }],
     )
     .unwrap();
     assert_eq!(accounts[1].lamports(), u64::MAX);
+    run(
+        &accounts,
+        &[Action::CreditLamports {
+            account: 1,
+            amount: 13,
+        }],
+    )
+    .unwrap();
+    assert_eq!(accounts[0].lamports(), 12);
     run(
         &accounts,
         &[Action::ZeroLamports {
@@ -312,8 +312,8 @@ fn calldata_is_a_borsh_vector() {
     }];
     let mut expected = 1u32.to_le_bytes().to_vec();
     expected.push(0); // WriteData tag.
-    expected.extend_from_slice(&2u64.to_le_bytes());
-    expected.extend_from_slice(&3u64.to_le_bytes());
+    expected.extend_from_slice(&2u16.to_le_bytes());
+    expected.extend_from_slice(&3u16.to_le_bytes());
     expected.extend_from_slice(&2u32.to_le_bytes());
     expected.extend_from_slice(&[0xaa, 0xbb]);
     assert_eq!(borsh::to_vec(&actions).unwrap(), expected);

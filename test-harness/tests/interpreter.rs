@@ -96,14 +96,14 @@ fn write_data_runs_in_agave() {
         features: None,
     };
 
-    let effects = execute_instruction(&context).expect("compatibility API failed");
+    let effects = execute_instruction(&context);
     assert_eq!(effects.result, 0, "instruction failed: {effects:?}");
     let account = effects
         .modified_accounts
         .iter()
         .find(|account| account.address == account_id)
         .expect("target account missing from instruction effects");
-    // Protosol v15 effects carry XXH64(seed=0), including the untouched bytes.
+    // Protosol v17 effects carry XXH64(seed=0), including the untouched bytes.
     let expected_hash = xxh64(b"\0\0hello\0", 0);
     assert_eq!(account.data_repr, Some(DataRepr::DataHash(expected_hash)));
     assert_eq!(account.lamports, lamports);
@@ -152,7 +152,7 @@ fn five_interpreter_deployments_assign_cpi_then_write() {
     let mut actions: Vec<Action> = (0..DEPTH)
         .map(|level| Action::WriteData {
             account: 0,
-            offset: (level * b"hello".len()) as u64,
+            offset: (level * b"hello".len()) as u16,
             bytes: b"hello".to_vec(),
         })
         .collect();
@@ -185,7 +185,7 @@ fn five_interpreter_deployments_assign_cpi_then_write() {
         features: None,
     };
 
-    let effects = execute_instruction(&context).expect("compatibility API failed");
+    let effects = execute_instruction(&context);
     assert_eq!(
         effects.result, 0,
         "assign owner -> CPI -> write failed (custom_err={}, remaining CU={})",

@@ -122,7 +122,7 @@ impl RuntimeHarness {
         let mut context = self.base_context.clone();
         let actions: Vec<InterpreterAction> = actions.into_iter().map(resolve).collect();
         context.data = borsh::to_vec(&actions)?;
-        crate::execute_instruction(&context)
+        Ok(crate::execute_instruction(&context))
     }
 }
 

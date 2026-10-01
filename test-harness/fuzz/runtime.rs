@@ -7,10 +7,10 @@ fn main() {
         let Ok(actions) = Arbitrary::arbitrary(&mut Unstructured::new(data)) else {
             return;
         };
-        let effects = harness.execute(actions).expect("compatibility API failed");
+        let effects = harness.execute(actions).expect("could not encode actions");
         println!("{:#?}", effects);
-        // Instruction errors are runtime outcomes. Panics, crashes, and ABI
-        // failures remain visible to Ziggy; no action sequence is filtered.
+        // Instruction errors are runtime outcomes. Panics and crashes remain
+        // visible to Ziggy; no action sequence is filtered.
         std::hint::black_box(effects);
     });
 }

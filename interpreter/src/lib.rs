@@ -2,7 +2,7 @@
 //!
 //! Calldata is a Borsh-encoded `Vec<Action>`: a little-endian u32 action count,
 //! followed by actions with u8 tags in declaration order. Account indices,
-//! offsets, and amounts are little-endian u64 values; public keys are 32 bytes.
+//! offsets, and amounts are little-endian u16 values; public keys are 32 bytes.
 //! Encode it with `borsh::to_vec(&actions)`.
 //!
 //! Actions run in order without ownership, signer, writable, rent, balance, or
@@ -37,47 +37,47 @@ solana_program::entrypoint!(process_instruction);
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum Action<P = Pubkey> {
     WriteData {
-        account: u64,
-        offset: u64,
+        account: u16,
+        offset: u16,
         bytes: Vec<u8>,
     },
     /// Increase data length by `amount`, preserving the underlying bytes.
     ResizeGrow {
-        account: u64,
-        amount: u64,
+        account: u16,
+        amount: u16,
     },
     /// Decrease data length by `amount`, preserving the underlying bytes.
     ResizeShrink {
-        account: u64,
-        amount: u64,
+        account: u16,
+        amount: u16,
     },
     /// Set data length to zero. `amount` is encoded but ignored.
     ResizeZero {
-        account: u64,
-        amount: u64,
+        account: u16,
+        amount: u16,
     },
     CreditLamports {
-        account: u64,
-        amount: u64,
+        account: u16,
+        amount: u16,
     },
     DebitLamports {
-        account: u64,
-        amount: u64,
+        account: u16,
+        amount: u16,
     },
     /// Set lamports to zero. `amount` is encoded but ignored.
     ZeroLamports {
-        account: u64,
-        amount: u64,
+        account: u16,
+        amount: u16,
     },
     AssignOwner {
-        account: u64,
+        account: u16,
         owner: P,
     },
     MarkExecutable {
-        account: u64,
+        account: u16,
     },
     RemoveExecutable {
-        account: u64,
+        account: u16,
     },
     CPI {
         address: P,
@@ -176,11 +176,11 @@ pub fn process_instruction(
             }
             Action::CreditLamports { account, amount } => {
                 let mut lamports = accounts[account as usize].lamports.borrow_mut();
-                **lamports = (**lamports).wrapping_add(amount);
+                **lamports = (**lamports).wrapping_add(u64::from(amount));
             }
             Action::DebitLamports { account, amount } => {
                 let mut lamports = accounts[account as usize].lamports.borrow_mut();
-                **lamports = (**lamports).wrapping_sub(amount);
+                **lamports = (**lamports).wrapping_sub(u64::from(amount));
             }
             Action::ZeroLamports { account, .. } => {
                 **accounts[account as usize].lamports.borrow_mut() = 0;
