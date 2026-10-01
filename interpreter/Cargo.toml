@@ -11,11 +11,19 @@ no-entrypoint = []
 custom-heap = []
 custom-panic = []
 arbitrary = ["dep:arbitrary"]
+autarkie-fuzzer = ["dep:autarkie", "dep:serde", "no-entrypoint"]
 
 [dependencies]
 arbitrary = { version = "1.4.2", features = ["derive"], optional = true }
+autarkie = { git = "https://github.com/R9295/autarkie.git", branch = "master", features = ["afl", "derive"], optional = true }
 borsh = { version = "1.8.1", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"], optional = true }
 solana-program = "4.1.0"
+
+[[bin]]
+name = "interpreter-autarkie"
+path = "fuzz/autarkie.rs"
+required-features = ["autarkie-fuzzer"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }
