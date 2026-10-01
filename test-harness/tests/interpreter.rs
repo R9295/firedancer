@@ -120,9 +120,10 @@ fn write_data_runs_in_agave() {
 }
 
 #[test]
-fn five_interpreter_deployments_write_assign_then_cpi() {
+fn five_interpreter_deployments_assign_cpi_then_write() {
     // Stack depth counts the top-level invocation: P0 -> P1 -> P2 -> P3 -> P4.
-    // Each deployment writes, assigns ownership to the next program, then CPIs.
+    // Each deployment assigns ownership to the next program, then CPIs. Agave
+    // only changes the owner of zeroed data, so P4 writes after the handoffs.
     const DEPTH: usize = 5;
     let elf = interpreter_elf();
     let program_ids: Vec<_> = (0..DEPTH).map(|i| vec![50 + i as u8; 32]).collect();
@@ -148,25 +149,25 @@ fn five_interpreter_deployments_write_assign_then_cpi() {
     accounts.extend(sysvar_accounts());
 
     // Build nested calldata from the deepest invocation back to the first.
-    let mut actions: Vec<Action> = Vec::new();
-    for level in (0..DEPTH).rev() {
-        let write = Action::WriteData {
+    let mut actions: Vec<Action> = (0..DEPTH)
+        .map(|level| Action::WriteData {
             account: 0,
             offset: (level * b"hello".len()) as u64,
             bytes: b"hello".to_vec(),
-        };
-        let mut current = vec![write];
-        if level + 1 < DEPTH {
-            current.push(Action::AssignOwner {
+        })
+        .collect();
+    for level in (0..DEPTH - 1).rev() {
+        let next = program_ids[level + 1].as_slice().try_into().unwrap();
+        actions = vec![
+            Action::AssignOwner {
                 account: 0,
-                owner: program_ids[level + 1].as_slice().try_into().unwrap(),
-            });
-            current.push(Action::CPI {
-                address: program_ids[level + 1].as_slice().try_into().unwrap(),
+                owner: next,
+            },
+            Action::CPI {
+                address: next,
                 actions: Box::new(actions),
-            });
-        }
-        actions = current;
+            },
+        ];
     }
 
     let context = InstrContext {
@@ -187,7 +188,7 @@ fn five_interpreter_deployments_write_assign_then_cpi() {
     let effects = execute_instruction(&context).expect("compatibility API failed");
     assert_eq!(
         effects.result, 0,
-        "write -> assign owner -> CPI failed (custom_err={}, remaining CU={})",
+        "assign owner -> CPI -> write failed (custom_err={}, remaining CU={})",
         effects.custom_err, effects.cu_avail,
     );
     let account = effects
