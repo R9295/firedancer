@@ -24,6 +24,8 @@ solana-rent = { version = "=4.5.0", features = ["serde"] }
 solana-sdk-ids = "=3.1.0"
 ziggy = { version = "=1.7.1", default-features = false }
 # Agave master's instruction conformance harness, as of 2026-10-01.
+solana-program-runtime = { git = "https://github.com/anza-xyz/agave", rev = "7953e4d6984eeb9a4caf9f8b20b6dadd6cad4f8b" }
+solana-svm = { git = "https://github.com/anza-xyz/agave", rev = "7953e4d6984eeb9a4caf9f8b20b6dadd6cad4f8b", features = ["conformance"] }
 solana-svm-conformance = { git = "https://github.com/anza-xyz/agave", rev = "7953e4d6984eeb9a4caf9f8b20b6dadd6cad4f8b", default-features = false, features = ["ffi"] }
 
 [dev-dependencies]

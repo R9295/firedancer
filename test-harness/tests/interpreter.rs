@@ -4,7 +4,7 @@ use solana_clock::Clock;
 use solana_epoch_schedule::EpochSchedule;
 use solana_rent::Rent;
 use std::{fs, path::PathBuf};
-use test_harness::{execute_instruction, firedancer};
+use test_harness::{agave, execute_instruction, firedancer};
 use xxhash_rust::xxh64::xxh64;
 
 fn interpreter_elf() -> Vec<u8> {
@@ -196,6 +196,8 @@ fn five_interpreter_deployments_assign_cpi_then_write() {
     };
 
     let effects = execute_instruction(&context);
+    // The fuzzer reuses Agave's loaded programs; they must not change effects.
+    assert_eq!(agave::Programs::new(&context).execute(&context), effects);
     assert_eq!(
         effects.result, 0,
         "assign owner -> CPI -> write failed (custom_err={}, remaining CU={})",

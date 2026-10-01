@@ -11,8 +11,8 @@ requires identical instruction effects. Each fixture is a
   built from this repository by `build.rs`.
 
 `execute_instruction` runs both and panics if their effects differ, including
-compute units, account hashes, and error codes. `execute_agave` and
-`firedancer::execute_instruction` run one client.
+compute units, account hashes, and error codes. `agave::execute_instruction`
+and `firedancer::execute_instruction` run one client.
 
 This project pins Agave `master` at commit
 `7953e4d6984eeb9a4caf9f8b20b6dadd6cad4f8b`, as observed on 2026-10-01. That
@@ -90,12 +90,19 @@ instruction errors as harness failures; it leaves runtime validation to the
 clients. Any difference between Agave and Firedancer effects panics, so Ziggy
 records it as a crash.
 
-Build or run the target from `test-harness`:
+Build or run the target from `test-harness`. Ziggy builds without
+optimization unless given `--release`; use `-j` to run several instances:
 
 ```sh
-cargo ziggy build runtime-fuzz
-cargo ziggy fuzz runtime-fuzz
+cargo ziggy build --release
+cargo ziggy fuzz --release -j <instances>
 ```
+
+`execute_instr_proto` loads and verifies every program account on each call,
+so the fuzzer loads Agave's programs once with `agave::Programs` and gives each
+input a fresh copy. Inputs change only instruction data, so the loaded programs
+match each input's accounts. Firedancer initializes its session once per AFL
+child, which takes about 600 ms.
 
 Use `--no-afl` or `--no-honggfuzz` to select one backend. The harness loads
 `../interpreter/target/deploy/interpreter.so` once at startup and restores a

@@ -49,6 +49,8 @@ pub fn resolve(action: Action) -> InterpreterAction {
 
 pub struct RuntimeHarness {
     base_context: InstrContext,
+    // Inputs change only instruction data, so Agave loads the programs once.
+    programs: crate::agave::Programs,
 }
 
 impl RuntimeHarness {
@@ -92,10 +94,14 @@ impl RuntimeHarness {
                 executable: false,
             },
             AcctState {
-                address: solana_sdk_ids::sysvar::epoch_schedule::id().to_bytes().to_vec(),
+                address: solana_sdk_ids::sysvar::epoch_schedule::id()
+                    .to_bytes()
+                    .to_vec(),
                 owner: solana_sdk_ids::sysvar::id().to_bytes().to_vec(),
                 lamports: 1,
-                data_repr: Some(DataRepr::Data(bincode::serialize(&EpochSchedule::default())?)),
+                data_repr: Some(DataRepr::Data(bincode::serialize(
+                    &EpochSchedule::default(),
+                )?)),
                 executable: false,
             },
             AcctState {
@@ -106,21 +112,23 @@ impl RuntimeHarness {
                 executable: false,
             },
         ]);
+        let base_context = InstrContext {
+            program_id: PROGRAM_IDS[0].to_vec(),
+            accounts,
+            instr_accounts: (0..=PROGRAM_IDS.len())
+                .map(|index| InstrAcct {
+                    index: index as u32,
+                    is_writable: index == 0,
+                    is_signer: false,
+                })
+                .collect(),
+            data: Vec::new(),
+            cu_avail: 1_400_000,
+            features: Some(crate::firedancer::hardcoded_features()),
+        };
         Ok(Self {
-            base_context: InstrContext {
-                program_id: PROGRAM_IDS[0].to_vec(),
-                accounts,
-                instr_accounts: (0..=PROGRAM_IDS.len())
-                    .map(|index| InstrAcct {
-                        index: index as u32,
-                        is_writable: index == 0,
-                        is_signer: false,
-                    })
-                    .collect(),
-                data: Vec::new(),
-                cu_avail: 1_400_000,
-                features: Some(crate::firedancer::hardcoded_features()),
-            },
+            programs: crate::agave::Programs::new(&base_context),
+            base_context,
         })
     }
 
@@ -130,7 +138,7 @@ impl RuntimeHarness {
         let mut context = self.base_context.clone();
         let actions: Vec<InterpreterAction> = actions.into_iter().map(resolve).collect();
         context.data = borsh::to_vec(&actions)?;
-        Ok(crate::execute_instruction(&context))
+        Ok(crate::compare(&context, self.programs.execute(&context)))
     }
 }
 
