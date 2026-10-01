@@ -1,9 +1,10 @@
 use interpreter::Action;
 use protosol::protos::{AcctState, InstrAcct, InstrContext, acct_state::DataRepr};
 use solana_clock::Clock;
+use solana_epoch_schedule::EpochSchedule;
 use solana_rent::Rent;
 use std::{fs, path::PathBuf};
-use test_harness::execute_instruction;
+use test_harness::{execute_instruction, firedancer};
 use xxhash_rust::xxh64::xxh64;
 
 fn interpreter_elf() -> Vec<u8> {
@@ -33,7 +34,7 @@ fn program_account(address: Vec<u8>, elf: &[u8]) -> AcctState {
     }
 }
 
-fn sysvar_accounts() -> [AcctState; 2] {
+fn sysvar_accounts() -> [AcctState; 3] {
     [
         AcctState {
             address: solana_sdk_ids::sysvar::clock::id().to_bytes().to_vec(),
@@ -45,6 +46,15 @@ fn sysvar_accounts() -> [AcctState; 2] {
                     ..Clock::default()
                 })
                 .unwrap(),
+            )),
+            executable: false,
+        },
+        AcctState {
+            address: solana_sdk_ids::sysvar::epoch_schedule::id().to_bytes().to_vec(),
+            owner: solana_sdk_ids::sysvar::id().to_bytes().to_vec(),
+            lamports: 1,
+            data_repr: Some(DataRepr::Data(
+                bincode::serialize(&EpochSchedule::default()).unwrap(),
             )),
             executable: false,
         },
@@ -93,7 +103,7 @@ fn write_data_runs_in_agave() {
         }],
         data: borsh::to_vec(&actions).unwrap(),
         cu_avail: 200_000,
-        features: None,
+        features: Some(firedancer::hardcoded_features()),
     };
 
     let effects = execute_instruction(&context);
@@ -182,7 +192,7 @@ fn five_interpreter_deployments_assign_cpi_then_write() {
             .collect(),
         data: borsh::to_vec(&actions).unwrap(),
         cu_avail: 200_000,
-        features: None,
+        features: Some(firedancer::hardcoded_features()),
     };
 
     let effects = execute_instruction(&context);

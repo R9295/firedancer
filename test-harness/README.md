@@ -1,14 +1,39 @@
 # Interpreter test harness
 
-Runs the interpreter's compiled SBF ELF through Agave's instruction conformance
-harness, `solana_svm_conformance::instr::execute_instr_proto`: the function
-behind Agave's `sol_compat_instr_execute_v1` C ABI and `test_exec_instr` binary.
-It takes a `protosol::protos::InstrContext` and returns `InstrEffects`.
+Runs the interpreter's compiled SBF ELF through Agave and Firedancer and
+requires identical instruction effects. Each fixture is a
+`protosol::protos::InstrContext`; each client returns `InstrEffects`.
+
+- Agave: `solana_svm_conformance::instr::execute_instr_proto`, the function
+  behind Agave's `sol_compat_instr_execute_v1` C ABI and `test_exec_instr`
+  binary.
+- Firedancer: `sol_compat_instr_execute_v1` from `libfd_exec_sol_compat.so`,
+  built from this repository by `build.rs`.
+
+`execute_instruction` runs both and panics if their effects differ, including
+compute units, account hashes, and error codes. `execute_agave` and
+`firedancer::execute_instruction` run one client.
 
 This project pins Agave `master` at commit
 `7953e4d6984eeb9a4caf9f8b20b6dadd6cad4f8b`, as observed on 2026-10-01. That
 revision uses protosol 17; the sysvar crate pins match its `dev-bins/Cargo.lock`.
 Build with that revision's Rust toolchain, 1.98.1.
+
+`build.rs` runs `make libfd_exec_sol_compat.so` from the repository root, using
+Cargo's jobserver and Firedancer's default build parameters, so the library
+lands in `make --silent objdir`. It does not instrument Firedancer. It reruns
+when `Makefile`, `config/`, `src/`, or the `CC`, `MACHINE`, `EXTRAS`, and
+`BUILDDIR` environment variables change; make rebuilds only what changed.
+The library is loaded with `dlopen` because Agave's harness exports the same
+`sol_compat_*` symbol names. Its `sol_compat` session is process-global and
+thread-local, so one long-lived thread initializes it and runs every input.
+Firedancer writes boot and error logs to stderr.
+
+Fixtures must set `features` and include the Clock, EpochSchedule, and Rent
+sysvars; Firedancer aborts without them. The tests and fuzzer activate
+`firedancer::hardcoded_features()`, the features activated on every cluster.
+Firedancer has removed their inactive behavior, so both clients must run with
+them active.
 
 From the repository root, build the interpreter and run the tests:
 
@@ -25,7 +50,7 @@ after changing the interpreter; compiling this host project only builds its Rust
 action types.
 
 `write_data_runs_in_agave` creates an eight-byte zeroed account owned by the
-interpreter, supplies the executable program account and Clock/Rent sysvars,
+interpreter, supplies the executable program account and sysvars,
 then runs `WriteData { account: 0, offset: 2, bytes: b"hello".to_vec() }`.
 It asserts successful execution, the XXH64 hash of `b"\0\0hello\0"`, unchanged
 lamports/owner/executable metadata, and consumed compute units. Protosol v17
@@ -48,9 +73,9 @@ The success assertions require exactly `hellohellohellohellohello` in the shared
 account, final ownership by P4, unchanged lamports, and a non-executable data
 account.
 
-`execute_instruction` reports runtime instruction errors in `effects.result`
-rather than as a Rust error, and Agave's harness panics on malformed fixtures.
-Both tests explicitly require `effects.result == 0`.
+Both clients report runtime instruction errors in `effects.result` rather than
+as a Rust error. Agave panics and Firedancer aborts on malformed fixtures. Both
+tests explicitly require `effects.result == 0`.
 
 ## Fuzzing
 
@@ -61,7 +86,9 @@ normalized to an index from 0 through 4 and then translated to one of five
 distinct deployments of the same ELF. Index 0 targets the entrypoint
 deployment, so self-CPI, reentry, repeated programs, and arbitrary nested CPI
 sequences remain available to the fuzzer. The harness does not reject actions or treat
-instruction errors as harness failures; it leaves runtime validation to Agave.
+instruction errors as harness failures; it leaves runtime validation to the
+clients. Any difference between Agave and Firedancer effects panics, so Ziggy
+records it as a crash.
 
 Build or run the target from `test-harness`:
 
@@ -79,7 +106,14 @@ Seeds in `seeds/` are `arbitrary` encodings of that `Vec<Action>`, so changing
 an `Action` field type changes their byte layout. Account indices, offsets, and
 amounts are two bytes each; owners and CPI destinations are one byte.
 
-Observed on `x86_64-unknown-linux-gnu` with Agave master `7953e4d`:
+Three seeds currently diverge: `36_five_hellos_cpi_chain`,
+`41_write_assign_then_cpi`, and `52_five_hellos_write_assign_cpi_chain`. Each
+fails a CPI with the same result in both clients, but Firedancer reports 1,065
+more remaining compute units than Agave. Ziggy may reject these as crashing
+seeds until the divergence is resolved.
+
+Observed on `x86_64-unknown-linux-gnu` with Agave master `7953e4d`; both clients
+agree on these results:
 
 ```text
 WriteData passed: data hash 0x6b444591ed870d0f; consumed 721 CU

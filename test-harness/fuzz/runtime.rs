@@ -8,7 +8,7 @@ fn main() {
             return;
         };
         let effects = harness.execute(actions).expect("could not encode actions");
-        println!("{:#?}", effects);
+        println!("{:?}", effects.cu_avail);
         // Instruction errors are runtime outcomes. Panics and crashes remain
         // visible to Ziggy; no action sequence is filtered.
         std::hint::black_box(effects);

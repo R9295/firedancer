@@ -5,6 +5,7 @@ use arbitrary::{Arbitrary, Unstructured};
 use interpreter::Action as InterpreterAction;
 use protosol::protos::{AcctState, InstrAcct, InstrContext, InstrEffects, acct_state::DataRepr};
 use solana_clock::Clock;
+use solana_epoch_schedule::EpochSchedule;
 use solana_rent::Rent;
 use std::{error::Error, fs, path::PathBuf};
 
@@ -91,6 +92,13 @@ impl RuntimeHarness {
                 executable: false,
             },
             AcctState {
+                address: solana_sdk_ids::sysvar::epoch_schedule::id().to_bytes().to_vec(),
+                owner: solana_sdk_ids::sysvar::id().to_bytes().to_vec(),
+                lamports: 1,
+                data_repr: Some(DataRepr::Data(bincode::serialize(&EpochSchedule::default())?)),
+                executable: false,
+            },
+            AcctState {
                 address: solana_sdk_ids::sysvar::rent::id().to_bytes().to_vec(),
                 owner: solana_sdk_ids::sysvar::id().to_bytes().to_vec(),
                 lamports: 1,
@@ -110,8 +118,8 @@ impl RuntimeHarness {
                     })
                     .collect(),
                 data: Vec::new(),
-                cu_avail: 200_000,
-                features: None,
+                cu_avail: 1_400_000,
+                features: Some(crate::firedancer::hardcoded_features()),
             },
         })
     }
