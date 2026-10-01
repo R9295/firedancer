@@ -672,6 +672,13 @@ dynamic_port_range = "8900-9000"
     # not pinned and will float on the original core set that Firedancer
     # was started with.
     #
+    # A core preceded by an 's' like 's5' is shared.  The tile is homed
+    # at core 5, so its memory is placed on that core's NUMA node, but
+    # the kernel may schedule it on any shared core of that node.  A
+    # shared core is not claimed exclusively, so more than one tile may
+    # name it.  This is for tiles that are idle in your configuration
+    # and would otherwise hold a core a busy tile could use.
+    #
     # For example, if Firedancer has six tiles numbered 0..5, and the
     # affinity is specified as
     #
@@ -1805,13 +1812,6 @@ dynamic_port_range = "8900-9000"
         # including socket buffer sizes, the TLS buffer, the HTTP/2
         # frame buffer, and a Protobuf encode buffer.
         buffer_size_kib = 16384
-
-        # SSL library heap size in MiB.
-        #
-        # When connecting to an HTTPS bundle endpoint, the SSL library
-        # dynamic allocations in a fixed size heap region.  This option
-        # controls the size of that region.
-        ssl_heap_size_mib = 64
 
         # Log TLS encryption keys for block engine connection.  An empty
         # string (the default) disables key logging.

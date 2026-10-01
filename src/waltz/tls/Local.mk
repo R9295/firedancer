@@ -6,11 +6,7 @@ $(call add-hdrs,test_tls_helper.h)
 $(call make-unit-test,test_tls,test_tls,fd_tls fd_ballet fd_util)
 $(call run-unit-test,test_tls)
 ifdef FD_HAS_HOSTED
+$(call make-unit-test,test_tls_web,test_tls_web,fd_waltz fd_tls fd_ballet fd_util)
 $(call make-fuzz-test,fuzz_tls,fuzz_tls,fd_tls fd_ballet fd_util)
 $(call make-fuzz-test,fuzz_tls_msg_parser,fuzz_tls_msg_parser,fd_tls fd_ballet fd_util)
-endif
-
-ifdef FD_HAS_OPENSSL
-$(call make-unit-test,test_tls_openssl,test_tls_openssl,fd_quic fd_tls fd_ballet fd_util,-lssl -lcrypto)
-$(call run-unit-test,test_tls_openssl)
 endif

@@ -123,15 +123,16 @@ fd_topo_initialize( config_t * config ) {
   fd_topo_cpus_init( cpus );
 
   ulong affinity_tile_cnt = 0UL;
-  if( FD_LIKELY( !is_auto_affinity ) ) affinity_tile_cnt = fd_topob_parse_affinity_cstr( config->layout.affinity, parsed_tile_to_cpu, 0 );
+  if( FD_LIKELY( !is_auto_affinity ) ) affinity_tile_cnt = fd_topob_parse_affinity_cstr( config->layout.affinity, parsed_tile_to_cpu, 0, 1 );
 
   ulong tile_to_cpu[ FD_TILE_MAX ] = {0};
   for( ulong i=0UL; i<affinity_tile_cnt; i++ ) {
-    if( FD_UNLIKELY( parsed_tile_to_cpu[ i ]!=USHORT_MAX && parsed_tile_to_cpu[ i ]>=cpus->cpu_cnt ) )
+    ushort cpu_idx = (ushort)( parsed_tile_to_cpu[ i ] & ~FD_TOPOB_CPU_SHARED );
+    if( FD_UNLIKELY( parsed_tile_to_cpu[ i ]!=USHORT_MAX && cpu_idx>=cpus->cpu_cnt ) )
       FD_LOG_ERR(( "The CPU affinity string in the configuration file under [layout.affinity] specifies a CPU index of %hu, but the system "
                    "only has %lu CPUs. You should either change the CPU allocations in the affinity string, or increase the number of CPUs "
                    "in the system.",
-                   parsed_tile_to_cpu[ i ], cpus->cpu_cnt ));
+                   cpu_idx, cpus->cpu_cnt ));
     tile_to_cpu[ i ] = fd_ulong_if( parsed_tile_to_cpu[ i ]==USHORT_MAX, ULONG_MAX, (ulong)parsed_tile_to_cpu[ i ] );
   }
 
@@ -334,7 +335,7 @@ fd_topo_initialize( config_t * config ) {
 
     if( FD_LIKELY( strcmp( "", config->frankendancer.layout.agave_affinity ) ) ) {
       ushort agave_cpu[ FD_TILE_MAX ];
-      ulong agave_cpu_cnt = fd_topob_parse_affinity_cstr( config->frankendancer.layout.agave_affinity, agave_cpu, 0 );
+      ulong agave_cpu_cnt = fd_topob_parse_affinity_cstr( config->frankendancer.layout.agave_affinity, agave_cpu, 0, 0 );
 
       for( ulong i=0UL; i<agave_cpu_cnt; i++ ) {
         if( FD_UNLIKELY( agave_cpu[ i ]>=cpus->cpu_cnt ) )
@@ -358,7 +359,7 @@ fd_topo_initialize( config_t * config ) {
     }
   } else {
     ushort blocklist_cores[ FD_TILE_MAX ];
-    topo->blocklist_cores_cnt = fd_topob_parse_affinity_cstr( config->layout.blocklist_cores, blocklist_cores, 0 );
+    topo->blocklist_cores_cnt = fd_topob_parse_affinity_cstr( config->layout.blocklist_cores, blocklist_cores, 0, 0 );
     if( FD_UNLIKELY( topo->blocklist_cores_cnt>FD_TILE_MAX ) ) {
       FD_LOG_ERR(( "The CPU string in the configuration file under [layout.blocklist_cores] specifies more CPUs than Firedancer can use. "
                     "You should reduce the number of CPUs in the excluded cores string." ));
@@ -456,7 +457,6 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     fd_cstr_ncpy( tile->bundle.key_log_path, config->development.bundle.ssl_key_log_file, sizeof(tile->bundle.key_log_path) );
     tile->bundle.buf_sz = config->development.bundle.buffer_size_kib<<10;
     tile->bundle.out_depth = config->tiles.verify.receive_buffer_size;
-    tile->bundle.ssl_heap_sz = config->development.bundle.ssl_heap_size_mib<<20;
     tile->bundle.keepalive_interval_nanos = config->tiles.bundle.keepalive_interval_millis * (ulong)1e6;
     tile->bundle.tls_cert_verify = !!config->tiles.bundle.tls_cert_verify;
   } else if( FD_UNLIKELY( !strcmp( tile->name, "verify" ) ) ) {

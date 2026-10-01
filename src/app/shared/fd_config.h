@@ -8,7 +8,7 @@
 #include <net/if.h>
 
 #define NAME_SZ                     (256UL)
-#define AFFINITY_SZ                 (256UL)
+#define AFFINITY_SZ                 (2048UL) /* FD_TOPO_MAX_TILES entries of "s1023," */
 #define CONFIGURE_STAGE_COUNT       ( 24UL)
 #define GOSSIP_TILE_ENTRYPOINTS_MAX ( 16UL)
 #define IP4_PORT_STR_MAX            ( 22UL)
@@ -121,11 +121,7 @@ struct fd_configf {
   struct {
     ulong max_live_slots;
     ulong max_fork_width;
-
-    struct {
-      ulong heap_size_mib;
-      ulong mean_cache_entry_size;
-    } program_cache;
+    ulong program_cache_size_mib;
   } runtime;
 
   struct {
@@ -394,6 +390,7 @@ struct fd_config {
       uint  benchg_tile_count;
       uint  benchs_tile_count;
       char  affinity[ AFFINITY_SZ ];
+      char  transaction_mode[ 32 ];
       ulong max_cost_per_block;
       ulong max_shreds_per_block;
       ulong disable_blockstore_from_slot;
@@ -403,13 +400,12 @@ struct fd_config {
     struct {
       char ssl_key_log_file[ PATH_MAX ];
       uint buffer_size_kib;
-      uint ssl_heap_size_mib;
     } bundle;
 
     struct {
       int report_shreds;
       int report_transactions;
-      int report_transaction_diffs;
+      int report_runtime_diffs;
     } event;
 
     struct {

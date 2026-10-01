@@ -2,7 +2,7 @@
 #include <stdarg.h> /* for va_list */
 
 #include "fd_sched.h"
-#include "fd_block_marker.h"
+#include "../../flamenco/alpenglow/fd_block_marker_serde.h"
 #include "fd_execrp.h" /* for poh hash value */
 #include "../../ballet/sha256/fd_sha256.h"
 #include "../../disco/fd_disco_base.h" /* for FD_MAX_TXN_PER_SLOT_SHRED */
@@ -10,7 +10,6 @@
 #include "../../disco/metrics/fd_metrics.h" /* for fd_metrics_convert_seconds_to_ticks and etc. */
 #include "../../disco/pack/fd_chkdup.h"
 #include "../../disco/shred/fd_shredder.h" /* FD_SHREDDER_CHAINED_FEC_SET_PAYLOAD_SZ */
-#include "../../discof/poh/fd_poh.h" /* for MAX_SKIPPED_TICKS */
 #include "../../flamenco/runtime/fd_runtime.h" /* for fd_runtime_load_txn_address_lookup_tables */
 #include "../../flamenco/runtime/fd_system_ids.h"
 #include "../../flamenco/runtime/sysvar/fd_sysvar_slot_hashes.h" /* for ALUTs */
@@ -21,7 +20,6 @@
 #define FD_SCHED_MAX_PRINT_BUF_SZ          (2UL<<20)
 #define FD_SCHED_POISON_MAX_ACCT_PER_SLOT  (64UL)
 
-#define FD_SCHED_MAX_MBLK_PER_SLOT             (MAX_SKIPPED_TICKS)
 #define FD_SCHED_MAX_POH_HASHES_PER_TASK       (4096UL) /* This seems to be the sweet spot. */
 
 /* 64 ticks per slot, and a single gigantic microblock containing min
@@ -212,17 +210,31 @@ struct fd_sched_block {
                                                              parseable after the next FEC set is ingested. */
 
   /* Alpenglow block footer, deserialized out of the marker batch at
-     parse time.  footer_present is set if the block carries a footer
+     parse time.  footer_seen is set if the block carries a footer
      marker and it is seen by sched; footer is only meaningful in that
      case. */
-  int               footer_present;
   fd_block_footer_t footer;
+
+  /* Alpenglow block structure, mirroring agave's BlockComponentStage
+     as a set of "seen" flags.  Only maintained when sched->is_alpenglow.
+     Together with mblk_cnt they determine what may come next:
+
+       agave stage               header footer alpentick mblk_cnt
+       PreParentMarker             0      0       0        0
+       AcceptingGenesisOrEntries   1      0       0        0     (and no genesis cert yet)
+       AcceptingEntriesOrFooter    1      0       0        *
+       AcceptingAlpentick          1      1       0        *
+       Done                        1      1       1        *      */
+  int header_seen;
+  int genesis_cert_seen;
+  int footer_seen;
+  int alpentick_seen;
 };
 typedef struct fd_sched_block fd_sched_block_t;
 
 FD_STATIC_ASSERT( sizeof(fd_sched_mblk_t)==120UL, fd_sched_mblk );
 FD_STATIC_ASSERT( sizeof(fd_sched_txn_info_t)==192UL, fd_sched_txn_info );
-FD_STATIC_ASSERT( sizeof(fd_sched_block_t)==76096UL, fd_sched_block );
+FD_STATIC_ASSERT( sizeof(fd_sched_block_t)==75840UL, fd_sched_block );
 FD_STATIC_ASSERT( sizeof(fd_hash_t)==sizeof(((fd_microblock_hdr_t *)0)->hash), unexpected poh hash size );
 
 
@@ -284,6 +296,7 @@ struct fd_sched {
   ushort *              shred_sz;             /* Payload size of each ingested data shred, max_shreds_per_block per block pool idx. */
   ulong                 max_shreds_per_block; /* Immutable. */
   ulong                 max_txn_per_slot;     /* Immutable. */
+  ulong                 max_mblk_per_slot;    /* Immutable, FD_SCHED_MAX_MBLK_PER_SLOT scaled with max_shreds_per_block. */
   fd_chkdup_t           chkdup[ 1 ];
   fd_sched_metrics_t    metrics[ 1 ];
   int                   is_alpenglow; /* set if alpenglow is enabled. */
@@ -339,6 +352,9 @@ verify_ticks_eager( fd_sched_block_t * block );
 static int
 verify_ticks_final( fd_sched_block_t * block );
 
+static int
+ag_on_final( fd_sched_block_t * block );
+
 static void
 add_block( fd_sched_t * sched,
            ulong        bank_idx,
@@ -358,11 +374,14 @@ shred_split( fd_sched_t *       sched,
              fd_sched_block_t * block,
              uint               query );
 
-static int
+static void
 dispatch_poh( fd_sched_t * sched, fd_sched_block_t * block, ulong bank_idx, int exec_tile_idx, ulong max_cnt, fd_sched_task_t * out );
 
 static int
 poh_retire_mblk( fd_sched_t * sched, fd_sched_block_t * block, uint mblk_idx );
+
+static int
+poh_retire_ready_mblks( fd_sched_t * sched, fd_sched_block_t * block );
 
 static inline ulong
 poh_batch_max_cnt( fd_sched_t const * sched, ulong queued_cnt, ulong free_cnt, ulong threshold ) {
@@ -819,6 +838,7 @@ fd_sched_new( void *     mem,
   sched->block_cnt_max          = block_cnt_max;
   sched->max_shreds_per_block   = max_shreds_per_block;
   sched->max_txn_per_slot       = max_txn_per_slot;
+  sched->max_mblk_per_slot      = fd_ulong_min( FD_SCHED_MAX_MBLK_PER_SLOT*max_shreds_per_block/FD_SHRED_BLK_MAX, UINT_MAX ); /* mblk_cnt is uint */
   sched->exec_cnt               = exec_cnt;
   sched->poh_simd_max           = fd_sha256_simd_lane_max(); FD_CHECK_ERR( sched->poh_simd_max<=FD_SCHED_POH_PARA, "overly wide PoH SHA batch" );
   sched->poh_simd_min           = fd_sha256_simd_lane_min();
@@ -1210,6 +1230,14 @@ fd_sched_fec_ingest( fd_sched_t *     sched,
     return 0;
   }
 
+  if( FD_UNLIKELY( block->fec_eos && sched->is_alpenglow ) ) {
+    int dead_reason = ag_on_final( block );
+    if( FD_UNLIKELY( dead_reason!=FD_SCHED_DEAD_REASON_NONE ) ) {
+      handle_bad_block( sched, block, dead_reason );
+      return 0;
+    }
+  }
+
   /* We just received a FEC set, which may have made all transactions in
      a partially parsed microblock available.  If this were a malformed
      block that ends in a non-tick microblock, there's not going to be a
@@ -1318,17 +1346,10 @@ fd_sched_task_next_ready( fd_sched_t * sched, fd_sched_task_t * out ) {
       int   poh_threshold = fd_int_if( block->txn_exec_in_flight_cnt>0U, 0, 1 );
       if( FD_LIKELY( poh_hashing_queued_cnt>0UL && fd_ulong_popcnt( poh_ready_bitset )>poh_threshold ) ) {
         ulong max_cnt = poh_batch_max_cnt( sched, poh_hashing_queued_cnt, (ulong)fd_ulong_popcnt( poh_ready_bitset ), (ulong)poh_threshold );
-        int dead_reason = dispatch_poh( sched, block, bank_idx, fd_ulong_find_lsb( poh_ready_bitset ), max_cnt, out );
-        if( FD_UNLIKELY( dead_reason!=FD_SCHED_DEAD_REASON_NONE ) ) {
-          out->task_type = FD_SCHED_TT_MARK_DEAD;
-          out->mark_dead->bank_idx = bank_idx;
-        }
-        if( FD_LIKELY( out->task_type!=FD_SCHED_TT_NULL ) ) {
-          sched->next_ready_last_tick     = fd_tickcount();
-          sched->next_ready_last_bank_idx = bank_idx;
-          return 1UL;
-        }
-        /* Everything queued for hashing was retired inline. */
+        dispatch_poh( sched, block, bank_idx, fd_ulong_find_lsb( poh_ready_bitset ), max_cnt, out );
+        sched->next_ready_last_tick     = fd_tickcount();
+        sched->next_ready_last_bank_idx = bank_idx;
+        return 1UL;
       }
 
       /* Dispatch more sigverify tasks only if at least one exec tile is
@@ -1418,17 +1439,10 @@ fd_sched_task_next_ready( fd_sched_t * sched, fd_sched_task_t * out ) {
   int   poh_threshold = fd_int_if( block->fec_eos||block->txn_exec_in_flight_cnt>0U||sched->exec_cnt==1UL, 0, 1 );
   if( FD_LIKELY( poh_hashing_queued_cnt>0UL && fd_ulong_popcnt( poh_ready_bitset )>poh_threshold ) ) {
     ulong max_cnt = poh_batch_max_cnt( sched, poh_hashing_queued_cnt, (ulong)fd_ulong_popcnt( poh_ready_bitset ), (ulong)poh_threshold );
-    int dead_reason = dispatch_poh( sched, block, bank_idx, fd_ulong_find_lsb( poh_ready_bitset ), max_cnt, out );
-    if( FD_UNLIKELY( dead_reason!=FD_SCHED_DEAD_REASON_NONE ) ) {
-      out->task_type = FD_SCHED_TT_MARK_DEAD;
-      out->mark_dead->bank_idx = bank_idx;
-    }
-    if( FD_LIKELY( out->task_type!=FD_SCHED_TT_NULL ) ) {
-      sched->next_ready_last_tick     = fd_tickcount();
-      sched->next_ready_last_bank_idx = bank_idx;
-      return 1UL;
-    }
-    /* Everything queued for hashing was retired inline. */
+    dispatch_poh( sched, block, bank_idx, fd_ulong_find_lsb( poh_ready_bitset ), max_cnt, out );
+    sched->next_ready_last_tick     = fd_tickcount();
+    sched->next_ready_last_bank_idx = bank_idx;
+    return 1UL;
   }
 
   /* Try to dispatch a sigverify task, but leave one exec tile idle for
@@ -1644,7 +1658,7 @@ fd_sched_task_done( fd_sched_t * sched, ulong task_type, ulong txn_idx, ulong ex
         }
         dead_reason = poh_retire_mblk( sched, block, mblk_idx );
       }
-      if( FD_LIKELY( dead_reason==FD_SCHED_DEAD_REASON_NONE ) ) dead_reason = verify_ticks_eager( block );
+      if( FD_LIKELY( dead_reason==FD_SCHED_DEAD_REASON_NONE ) ) dead_reason = poh_retire_ready_mblks( sched, block );
       if( FD_UNLIKELY( dead_reason!=FD_SCHED_DEAD_REASON_NONE ) ) {
         handle_bad_block( sched, block, dead_reason );
         return dead_reason;
@@ -1969,60 +1983,12 @@ fd_sched_get_shred_cnt( fd_sched_t * sched, ulong bank_idx ) {
   return block->shred_cnt;
 }
 
-fd_hash_t const *
-fd_sched_get_footer_bank_hash( fd_sched_t * sched, ulong bank_idx ) {
+fd_block_footer_t const *
+fd_sched_get_footer( fd_sched_t * sched, ulong bank_idx ) {
   FD_TEST( sched->canary==FD_SCHED_MAGIC );
   FD_TEST( bank_idx<sched->block_cnt_max );
   fd_sched_block_t * block = block_pool_ele( sched, bank_idx );
-  return block->footer_present ? &block->footer.bank_hash : NULL;
-}
-
-ulong
-fd_sched_get_footer_producer_time_nanos( fd_sched_t * sched, ulong bank_idx ) {
-  FD_TEST( sched->canary==FD_SCHED_MAGIC );
-  FD_TEST( bank_idx<sched->block_cnt_max );
-  fd_sched_block_t * block = block_pool_ele( sched, bank_idx );
-  return block->footer_present ? block->footer.block_producer_time_nanos : 0UL;
-}
-
-fd_reward_cert_t const *
-fd_sched_get_skip_reward_cert( fd_sched_t * sched, ulong bank_idx ) {
-  FD_TEST( sched->canary==FD_SCHED_MAGIC );
-  FD_TEST( bank_idx<sched->block_cnt_max );
-  fd_sched_block_t * block = block_pool_ele( sched, bank_idx );
-  return ( block->footer_present && block->footer.has_skip_reward_cert ) ? &block->footer.skip_reward_cert : NULL;
-}
-
-fd_reward_cert_t const *
-fd_sched_get_notar_reward_cert( fd_sched_t * sched, ulong bank_idx ) {
-  FD_TEST( sched->canary==FD_SCHED_MAGIC );
-  FD_TEST( bank_idx<sched->block_cnt_max );
-  fd_sched_block_t * block = block_pool_ele( sched, bank_idx );
-  return ( block->footer_present && block->footer.has_notar_reward_cert ) ? &block->footer.notar_reward_cert : NULL;
-}
-
-ag_cert_fast_final_t const *
-fd_sched_get_fast_final_cert( fd_sched_t * sched, ulong bank_idx ) {
-  FD_TEST( sched->canary==FD_SCHED_MAGIC );
-  FD_TEST( bank_idx<sched->block_cnt_max );
-  fd_sched_block_t * block = block_pool_ele( sched, bank_idx );
-  return ( block->footer_present && block->footer.has_fast_final_cert ) ? &block->footer.fast_final_cert : NULL;
-}
-
-ag_cert_final_t const *
-fd_sched_get_final_cert( fd_sched_t * sched, ulong bank_idx ) {
-  FD_TEST( sched->canary==FD_SCHED_MAGIC );
-  FD_TEST( bank_idx<sched->block_cnt_max );
-  fd_sched_block_t * block = block_pool_ele( sched, bank_idx );
-  return ( block->footer_present && block->footer.has_final_cert ) ? &block->footer.final_cert : NULL;
-}
-
-ag_cert_notar_t const *
-fd_sched_get_final_notar_cert( fd_sched_t * sched, ulong bank_idx ) {
-  FD_TEST( sched->canary==FD_SCHED_MAGIC );
-  FD_TEST( bank_idx<sched->block_cnt_max );
-  fd_sched_block_t * block = block_pool_ele( sched, bank_idx );
-  return ( block->footer_present && block->footer.has_final_cert ) ? &block->footer.notar_cert : NULL;
+  return block->footer_seen ? &block->footer : NULL;
 }
 
 void
@@ -2147,7 +2113,10 @@ add_block( fd_sched_t * sched,
   block->inconsistent_hashes_per_tick = 0;
   block->zero_hash_tick               = 0;
 
-  block->footer_present = 0;
+  block->header_seen       = 0;
+  block->genesis_cert_seen = 0;
+  block->footer_seen       = 0;
+  block->alpentick_seen    = 0;
 
   block->mblks_rem        = 0UL;
   block->txns_rem         = 0UL;
@@ -2205,6 +2174,109 @@ add_block( fd_sched_t * sched,
     record_lineage_death( block, parent_block );
     block->dying = 1;
   }
+}
+
+/* Alpenglow block structure.  agave's BlockComponentProcessor rules
+   an Alpenglow block invalid unless its components are laid out as
+
+     header | [genesis cert] | entries* | footer | alpentick
+
+   with exactly one header and one footer, and the alpentick as the
+   final component.  The helpers below drive the same state machine off
+   the batches sched parses.
+
+   TODO feature gate FLH */
+
+static int
+ag_on_marker( fd_sched_t *              sched,
+              fd_sched_block_t *        block,
+              fd_block_marker_t const * marker ) {
+  (void)sched;
+  switch( marker->kind ) {
+
+  case FD_BLOCK_MARKER_KIND_HEADER:
+    if( FD_UNLIKELY( block->header_seen ) ) {
+      FD_LOG_INFO(( "bad block: MULTIPLE_BLOCK_HEADERS, slot %lu, parent slot %lu", block->slot, block->parent_slot ));
+      return FD_SCHED_DEAD_REASON_MULTIPLE_BLOCK_HEADERS;
+    }
+    /* Checking for shred header and parent_slot mismatch occurs at the
+       rotor level, so it does not need to be checked in sched.  We do
+       this because currently replay tile never sees shred headers. */
+    block->header_seen = 1;
+    return FD_SCHED_DEAD_REASON_NONE;
+
+  case FD_BLOCK_MARKER_KIND_GENESIS_CERT:
+    if( FD_UNLIKELY( !block->header_seen ) ) {
+      FD_LOG_INFO(( "bad block: MISSING_PARENT_MARKER, slot %lu, parent slot %lu, genesis cert before header", block->slot, block->parent_slot ));
+      return FD_SCHED_DEAD_REASON_MISSING_PARENT_MARKER;
+    }
+    if( FD_UNLIKELY( block->mblk_cnt || block->genesis_cert_seen || block->footer_seen ) ) {
+      FD_LOG_INFO(( "bad block: GENESIS_CERT_OUT_OF_ORDER, slot %lu, parent slot %lu", block->slot, block->parent_slot ));
+      return FD_SCHED_DEAD_REASON_GENESIS_CERT_OUT_OF_ORDER;
+    }
+    block->genesis_cert_seen = 1;
+    return FD_SCHED_DEAD_REASON_NONE;
+
+  case FD_BLOCK_MARKER_KIND_FOOTER:
+    if( FD_UNLIKELY( !block->header_seen ) ) {
+      FD_LOG_INFO(( "bad block: MISSING_PARENT_MARKER, slot %lu, parent slot %lu, footer before header", block->slot, block->parent_slot ));
+      return FD_SCHED_DEAD_REASON_MISSING_PARENT_MARKER;
+    }
+    if( FD_UNLIKELY( block->footer_seen ) ) {
+      FD_LOG_INFO(( "bad block: MULTIPLE_BLOCK_FOOTERS, slot %lu, parent slot %lu", block->slot, block->parent_slot ));
+      return FD_SCHED_DEAD_REASON_MULTIPLE_BLOCK_FOOTERS;
+    }
+    block->footer      = marker->footer;
+    block->footer_seen = 1;
+    return FD_SCHED_DEAD_REASON_NONE;
+
+  case FD_BLOCK_MARKER_KIND_UPDATE_PARENT:
+    if( FD_UNLIKELY( !block->header_seen || block->footer_seen ) ) {
+      FD_LOG_INFO(( "bad block: SPURIOUS_UPDATE_PARENT, slot %lu, parent slot %lu, header %d footer %d", block->slot, block->parent_slot, block->header_seen, block->footer_seen ));
+      return FD_SCHED_DEAD_REASON_SPURIOUS_UPDATE_PARENT;
+    }
+    FD_LOG_INFO(( "bad block: SPURIOUS_UPDATE_PARENT, FLH not activated, slot %lu, parent slot %lu, new_parent_slot %lu", block->slot, block->parent_slot, marker->update_parent.new_parent_slot ));
+    return FD_SCHED_DEAD_REASON_SPURIOUS_UPDATE_PARENT;
+
+  default:
+    FD_LOG_INFO(( "bad block: slot %lu, parent slot %lu, unknown block marker kind %u", block->slot, block->parent_slot, marker->kind ));
+    return FD_SCHED_DEAD_REASON_BAD_BLOCK_MARKER;
+  }
+}
+
+/* Called when a batch header declares one or more microblocks. */
+
+static int
+ag_on_entry_batch( fd_sched_block_t * block ) {
+  if( FD_UNLIKELY( !block->header_seen ) ) {
+    FD_LOG_INFO(( "bad block: MISSING_PARENT_MARKER, slot %lu, parent slot %lu, entries before header", block->slot, block->parent_slot ));
+    return FD_SCHED_DEAD_REASON_MISSING_PARENT_MARKER;
+  }
+  if( FD_UNLIKELY( block->alpentick_seen ) ) {
+    FD_LOG_INFO(( "bad block: ENTRY_AFTER_BLOCK_FOOTER, slot %lu, parent slot %lu, batch after alpentick", block->slot, block->parent_slot ));
+    return FD_SCHED_DEAD_REASON_ENTRY_AFTER_BLOCK_FOOTER;
+  }
+  /* Only the alpentick may follow the footer: a batch of exactly one
+     microblock which must turn out to be a tick (checked when its
+     header parses). */
+  if( FD_UNLIKELY( block->footer_seen && block->mblks_rem!=1UL ) ) {
+    FD_LOG_INFO(( "bad block: ENTRY_AFTER_BLOCK_FOOTER, slot %lu, parent slot %lu, batch of %lu microblocks after footer", block->slot, block->parent_slot, block->mblks_rem ));
+    return FD_SCHED_DEAD_REASON_ENTRY_AFTER_BLOCK_FOOTER;
+  }
+  return FD_SCHED_DEAD_REASON_NONE;
+}
+
+static int
+ag_on_final( fd_sched_block_t * block ) {
+  if( FD_UNLIKELY( !block->footer_seen ) ) {
+    FD_LOG_INFO(( "bad block: MISSING_BLOCK_FOOTER, slot %lu, parent slot %lu", block->slot, block->parent_slot ));
+    return FD_SCHED_DEAD_REASON_MISSING_BLOCK_FOOTER;
+  }
+  if( FD_UNLIKELY( !block->alpentick_seen ) ) {
+    FD_LOG_INFO(( "bad block: INVALID_ALPENTICK_POSITION, slot %lu, parent slot %lu, block ended after footer without alpentick", block->slot, block->parent_slot ));
+    return FD_SCHED_DEAD_REASON_INVALID_ALPENTICK_POSITION;
+  }
+  return FD_SCHED_DEAD_REASON_NONE;
 }
 
 /* Agave invokes verify_ticks() anywhere between once per slot and once
@@ -2325,15 +2397,15 @@ fd_sched_parse( fd_sched_t * sched, fd_sched_block_t * block, fd_sched_alut_ctx_
     }
 
     if( block->txns_rem==0UL && block->mblks_rem>0UL ) {
-      if( FD_UNLIKELY( block->mblk_cnt>=FD_SCHED_MAX_MBLK_PER_SLOT ) ) {
+      if( FD_UNLIKELY( block->mblk_cnt>=sched->max_mblk_per_slot ) ) {
         /* Microblock count is enforced as invariant
-           mblk_cnt+mblks_rem<=FD_SCHED_MAX_MBLK_PER_SLOT
+           mblk_cnt+mblks_rem<=max_mblk_per_slot
            when we read the declared count in a batch header.  So we
            shouldn't get here. */
         sched->print_buf_sz = 0UL;
         print_all( sched, block );
         FD_LOG_NOTICE(( "%s", sched->print_buf ));
-        FD_LOG_CRIT(( "invariant violation: slot %lu, parent slot %lu, mblks_rem %lu, mblk_cnt %u (%u ticks) >= %lu", block->slot, block->parent_slot, block->mblks_rem, block->mblk_cnt, block->mblk_tick_cnt, FD_SCHED_MAX_MBLK_PER_SLOT ));
+        FD_LOG_CRIT(( "invariant violation: slot %lu, parent slot %lu, mblks_rem %lu, mblk_cnt %u (%u ticks) >= %lu", block->slot, block->parent_slot, block->mblks_rem, block->mblk_cnt, block->mblk_tick_cnt, sched->max_mblk_per_slot ));
       }
 
       CHECK_LEFT( sizeof(fd_microblock_hdr_t) );
@@ -2347,6 +2419,17 @@ fd_sched_parse( fd_sched_t * sched, fd_sched_block_t * block, fd_sched_alut_ctx_
       if( FD_UNLIKELY( hdr->hash_cnt>fd_ulong_sat_sub( FD_RUNTIME_MAX_HASHES_PER_TICK, block->curr_tick_hashcnt ) ) ) {
         FD_LOG_INFO(( "bad block: TICK_HASHES_OVERFLOW_INGEST, slot %lu, parent slot %lu, curr_tick_hashcnt %lu, hdr->hash_cnt %lu", block->slot, block->parent_slot, block->curr_tick_hashcnt, hdr->hash_cnt ));
         return FD_SCHED_DEAD_REASON_TICK_HASHES_OVERFLOW_INGEST;
+      }
+      if( FD_UNLIKELY( sched->is_alpenglow && hdr->hash_cnt!=1UL ) ) {
+        FD_LOG_INFO(( "bad block: ALPENGLOW_HASH_CNT, slot %lu, parent slot %lu, mblk idx %u declared hash_cnt %lu", block->slot, block->parent_slot, block->mblk_cnt, hdr->hash_cnt ));
+        return FD_SCHED_DEAD_REASON_ALPENGLOW_HASH_CNT;
+      }
+      if( FD_UNLIKELY( sched->is_alpenglow && block->footer_seen ) ) {
+        if( FD_UNLIKELY( hdr->txn_cnt ) ) {
+          FD_LOG_INFO(( "bad block: ENTRY_AFTER_BLOCK_FOOTER, slot %lu, parent slot %lu, transaction microblock after footer", block->slot, block->parent_slot ));
+          return FD_SCHED_DEAD_REASON_ENTRY_AFTER_BLOCK_FOOTER;
+        }
+        block->alpentick_seen = 1;
       }
 
       block->mblks_rem--;
@@ -2458,26 +2541,26 @@ fd_sched_parse( fd_sched_t * sched, fd_sched_block_t * block, fd_sched_alut_ctx_
       block->mblks_rem     = FD_LOAD( ulong, block->fec_buf );
       block->fec_buf_soff += (uint)sizeof(ulong);
 
-      if( FD_UNLIKELY( block->mblks_rem>fd_ulong_sat_sub( FD_SCHED_MAX_MBLK_PER_SLOT, block->mblk_cnt ) ) ) {
-        FD_LOG_INFO(( "bad block: TOO_MANY_MICROBLOCKS, slot %lu, parent slot %lu, mblk_cnt %u (%u ticks) + hdr->mblk_cnt %lu >= %lu", block->slot, block->parent_slot, block->mblk_cnt, block->mblk_tick_cnt, block->mblks_rem, FD_SCHED_MAX_MBLK_PER_SLOT ));
+      if( FD_UNLIKELY( block->mblks_rem>fd_ulong_sat_sub( sched->max_mblk_per_slot, block->mblk_cnt ) ) ) {
+        FD_LOG_INFO(( "bad block: TOO_MANY_MICROBLOCKS, slot %lu, parent slot %lu, mblk_cnt %u (%u ticks) + hdr->mblk_cnt %lu >= %lu", block->slot, block->parent_slot, block->mblk_cnt, block->mblk_tick_cnt, block->mblks_rem, sched->max_mblk_per_slot ));
         return FD_SCHED_DEAD_REASON_TOO_MANY_MICROBLOCKS;
       }
 
       block->fec_sob = 0;
 
       if( FD_UNLIKELY( !block->mblks_rem && sched->is_alpenglow ) ) {
+        /* A zero-microblock batch is a block marker */
         fd_block_marker_t marker[1];
-        int err = fd_block_marker_de( marker, block->fec_buf, (ulong)block->fec_buf_sz, NULL );
+        int err = fd_block_marker_de( marker, block->fec_buf, (ulong)block->fec_buf_sz );
         if( FD_UNLIKELY( err ) ) {
-          FD_LOG_INFO(( "bad block: slot %lu, unable to parse footer marker (err %d)", block->slot, err ));
-          return FD_SCHED_DEAD_REASON_BAD_FOOTER;
+          FD_LOG_INFO(( "bad block: slot %lu, unable to parse block marker (err %d)", block->slot, err ));
+          return FD_SCHED_DEAD_REASON_BAD_BLOCK_MARKER;
         }
-        if( marker->variant==FOOTER ) {
-          block->footer         = marker->footer;
-          block->footer_present = 1;
-        } else if( marker->variant==UPDATE_PARENT ) {
-          FD_LOG_CRIT(( "UNHANDLED alpenglow update parent: slot %lu, new_parent_slot %lu", block->slot, marker->update_parent.new_parent_slot ));
-        }
+        int dead_reason = ag_on_marker( sched, block, marker );
+        if( FD_UNLIKELY( dead_reason!=FD_SCHED_DEAD_REASON_NONE ) ) return dead_reason;
+      } else if( FD_UNLIKELY( block->mblks_rem && sched->is_alpenglow ) ) {
+        int dead_reason = ag_on_entry_batch( block );
+        if( FD_UNLIKELY( dead_reason!=FD_SCHED_DEAD_REASON_NONE ) ) return dead_reason;
       } else if( FD_UNLIKELY( !block->mblks_rem && !sched->is_alpenglow ) ) {
         FD_LOG_INFO(( "bad block: ZERO_MICROBLOCKS, slot %lu, parent slot %lu, mblk_cnt %u (%u ticks)", block->slot, block->parent_slot, block->mblk_cnt, block->mblk_tick_cnt ));
         return FD_SCHED_DEAD_REASON_ZERO_MICROBLOCKS;
@@ -2741,7 +2824,7 @@ fd_sched_parse_txn( fd_sched_t * sched, fd_sched_block_t * block, fd_sched_alut_
   sched->metrics->txn_parsed_cnt++;
   sched->txn_pool_free_cnt--;
   fd_txn_p_t * txn_p = sched->txn_pool + txn_idx;
-  txn_p->payload_sz  = pay_sz;
+  txn_p->payload_sz  = (ushort)pay_sz;
 
   txn_p->start_shred_idx = (ushort)fd_uint_min( shred_split( sched, block, block->fec_buf_boff+block->fec_buf_soff ), USHORT_MAX ); /* monitoring-only ushorts; saturate under bench shred counts */
   txn_p->start_shred_idx = fd_ushort_if( txn_p->start_shred_idx>0U, (ushort)(txn_p->start_shred_idx-1U), txn_p->start_shred_idx );
@@ -2841,25 +2924,36 @@ poh_retire_mblk( fd_sched_t * sched, fd_sched_block_t * block, uint mblk_idx ) {
   return FD_SCHED_DEAD_REASON_NONE;
 }
 
-/* Assembles a PoH task for the given exec tile.  Assumes there is a
-   PoH task available for dispatching.  Queued microblocks with nothing
-   left to hash are retired inline, as they would otherwise truncate the
-   batch and cost a round trip to an exec tile for no work.  Returns
-   FD_SCHED_DEAD_REASON_NONE on success, in which case out is left
-   untouched if every queued microblock was retired inline.  Otherwise
-   the block is bad, handle_bad_block has been called, and the dead
-   reason is returned. */
+/* Retires microblocks at the head of the unhashed queue that have
+   nothing left for PoH to hash.  Returns FD_SCHED_DEAD_REASON_NONE on
+   success, else the dead reason. */
 static int
+poh_retire_ready_mblks( fd_sched_t * sched, fd_sched_block_t * block ) {
+  while( block->mblk_unhashed_cnt ) {
+    uint mblk_idx = (uint)mblk_slist_idx_peek_head( block->mblks_unhashed, sched->mblk_pool );
+    fd_sched_mblk_t * mblk = sched->mblk_pool+mblk_idx;
+    if( FD_LIKELY( mblk->curr_hashcnt!=mblk->hashcnt ) ) break;
+    mblk_slist_idx_pop_head( block->mblks_unhashed, sched->mblk_pool );
+    block->mblk_unhashed_cnt--;
+    int dead_reason = poh_retire_mblk( sched, block, mblk_idx );
+    if( FD_UNLIKELY( dead_reason!=FD_SCHED_DEAD_REASON_NONE ) ) return dead_reason;
+  }
+  return verify_ticks_eager( block );
+}
+
+/* Assembles a PoH task for the given exec tile.  Assumes there is a
+   PoH task available for dispatching.  A microblock with nothing left
+   to hash is dispatched as a degenerate zero-hashcnt task, so that it
+   retires through fd_sched_task_done like any other PoH task. */
+static void
 dispatch_poh( fd_sched_t * sched, fd_sched_block_t * block, ulong bank_idx, int exec_tile_idx, ulong max_cnt, fd_sched_task_t * out ) {
   FD_TEST( max_cnt>=1UL && max_cnt<=FD_SCHED_POH_PARA );
   /* Every element of a batch advances by the same hashcnt, so the
      batch hashcnt is the smallest remaining hashcnt of its elements.
      Elements with more work left are re-queued on completion. */
   fd_sched_poh_hash_t * poh = out->poh_hash;
-  ulong cnt         = 0UL;
-  ulong hashcnt     = ULONG_MAX;
-  int   retired     = 0;
-  int   dead_reason = FD_SCHED_DEAD_REASON_NONE;
+  ulong cnt     = 0UL;
+  ulong hashcnt = ULONG_MAX;
   while( cnt<max_cnt ) {
     mblk_slist_t * list;
     if( FD_LIKELY( !mblk_slist_is_empty( block->mblks_hashing_in_progress, sched->mblk_pool ) ) ) {
@@ -2871,33 +2965,23 @@ dispatch_poh( fd_sched_t * sched, fd_sched_block_t * block, ulong bank_idx, int 
       break; /* Nothing more to batch. */
     }
     uint mblk_idx = (uint)mblk_slist_idx_pop_head( list, sched->mblk_pool );
-    if( list==block->mblks_unhashed ) block->mblk_unhashed_cnt--;
     fd_sched_mblk_t * mblk = sched->mblk_pool+mblk_idx;
     ulong hashcnt_todo = mblk->hashcnt-mblk->curr_hashcnt;
-    if( FD_UNLIKELY( !hashcnt_todo ) ) {
-      retired     = 1;
-      dead_reason = poh_retire_mblk( sched, block, mblk_idx );
-      if( FD_UNLIKELY( dead_reason!=FD_SCHED_DEAD_REASON_NONE ) ) break;
-      continue;
+    /* A microblock with nothing left to hash can't share a batch with
+       one that has work left.  The batch hashcnt would be zero, and the
+       latter would never make progress. */
+    if( FD_UNLIKELY( cnt && (!hashcnt_todo)!=(!hashcnt) ) ) {
+      mblk_slist_idx_push_head( list, mblk_idx, sched->mblk_pool );
+      break;
     }
+    if( list==block->mblks_unhashed ) block->mblk_unhashed_cnt--;
     hashcnt = fd_ulong_min( hashcnt, hashcnt_todo );
     poh->mblk_idx[ cnt ] = mblk_idx;
     memcpy( poh->hash+cnt, mblk->curr_hash, sizeof(fd_hash_t) );
     cnt++;
-    block->poh_mblk_in_flight_cnt++; /* Eager, so that inline retirement sees the batch as in progress. */
+    block->poh_mblk_in_flight_cnt++;
   }
-  if( FD_UNLIKELY( retired && dead_reason==FD_SCHED_DEAD_REASON_NONE ) ) dead_reason = verify_ticks_eager( block );
-  if( FD_UNLIKELY( dead_reason!=FD_SCHED_DEAD_REASON_NONE ) ) {
-    /* Put the batch assembled so far back on a list, so that it gets
-       freed along with the block. */
-    for( ulong i=0UL; i<cnt; i++ ) {
-      block->poh_mblk_in_flight_cnt--;
-      mblk_slist_idx_push_tail( block->mblks_hashing_in_progress, (uint)poh->mblk_idx[ i ], sched->mblk_pool );
-    }
-    handle_bad_block( sched, block, dead_reason );
-    return dead_reason;
-  }
-  if( FD_UNLIKELY( !cnt ) ) return FD_SCHED_DEAD_REASON_NONE; /* Everything queued was retired inline. */
+  FD_TEST( cnt ); /* poh_hashing_queued_cnt>0 implies at least one queued microblock. */
 
   /* See FD_SCHED_MAX_POH_HASHES_PER_TASK. */
   hashcnt = fd_ulong_min( hashcnt, fd_ulong_if( cnt>=sched->poh_simd_min, sched->poh_simd_iters_max, FD_SCHED_MAX_POH_HASHES_PER_TASK ) );
@@ -2912,7 +2996,6 @@ dispatch_poh( fd_sched_t * sched, fd_sched_block_t * block, ulong bank_idx, int 
   sched->tile_to_bank_idx[ exec_tile_idx ] = bank_idx;
   block->poh_hashing_in_flight_cnt++;
   if( FD_UNLIKELY( (~sched->txn_exec_ready_bitset[ 0 ])&(~sched->sigverify_ready_bitset[ 0 ])&(~sched->poh_ready_bitset[ 0 ])&fd_ulong_mask_lsb( (int)sched->exec_cnt ) ) ) FD_LOG_CRIT(( "invariant violation: txn_exec_ready_bitset 0x%lx sigverify_ready_bitset 0x%lx poh_ready_bitset 0x%lx", sched->txn_exec_ready_bitset[ 0 ], sched->sigverify_ready_bitset[ 0 ], sched->poh_ready_bitset[ 0 ] ));
-  return FD_SCHED_DEAD_REASON_NONE;
 }
 
 /* Does up to one transaction mixin.  Returns 1 if one mixin was done, 2

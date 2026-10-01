@@ -191,6 +191,12 @@ typedef struct {
      Monotonically decreasing over the slot lifetime. */
   ulong slot_dynamic_max_microblocks;
 
+  /* PoH mixin positions per tick (0 when PoH has no hash budget) and
+     tick length for the leader slot, the rate at which PoH can absorb
+     microblocks. */
+  ulong slot_mixin_per_tick;
+  ulong slot_tick_duration_ns;
+
   /* Set by during_housekeeping when the dynamic bound drops below
      slot_max_microblocks.  Consumed by after_credit which publishes
      the updated bound to POH over the pack_poh link. */
@@ -383,9 +389,11 @@ log_end_block_metrics( fd_pack_ctx_t * ctx,
 
 static inline void
 get_done_packing( fd_pack_ctx_t * ctx, fd_done_packing_t * done_packing, int reason ) {
-    done_packing->microblocks_in_slot = ctx->slot_microblock_cnt;
-    done_packing->end_slot_reason = reason;
-    fd_pack_get_block_limits( ctx->pack, done_packing->limits_usage, done_packing->limits );
+  fd_pack_metrics_write( ctx->pack );
+
+  done_packing->microblocks_in_slot = ctx->slot_microblock_cnt;
+  done_packing->end_slot_reason = reason;
+  fd_pack_get_block_limits( ctx->pack, done_packing->limits_usage, done_packing->limits );
 
 #define DELTA( mem, m ) (fd_metrics_tl[ MIDX(COUNTER, PACK, TXN_SCHEDULED_##m) ] - ctx->mem->sched_results[ FD_METRICS_ENUM_PACK_TXN_SCHEDULE_V_##m##_IDX ])
     done_packing->block_results[ FD_METRICS_ENUM_PACK_TXN_SCHEDULE_V_TAKEN_IDX       ] = DELTA( start_block_sched_metrics, TAKEN       );
@@ -412,7 +420,6 @@ get_done_packing( fd_pack_ctx_t * ctx, fd_done_packing_t * done_packing, int rea
   done_packing->bundle_txn_count = ctx->slot_bundle_txn_cnt;
   done_packing->pack_start_ns    = ctx->slot_pack_start_ns;
   done_packing->pack_end_ns      = fd_clock_tile_now( ctx->clock );
-
 }
 
 static inline void
@@ -429,7 +436,7 @@ metrics_write( fd_pack_ctx_t * ctx ) {
 }
 
 /* compute_dynamic_max_microblocks: Computes the upper bound on total
-   microblocks based on remaining time and bank count.
+   microblocks based on remaining time, bank count and PoH hash rate.
 
    The basic idea here is that if there is 1ms left in the slot, we
    don't expect to schedule 130k microblocks.  We can reduce our
@@ -438,7 +445,14 @@ metrics_write( fd_pack_ctx_t * ctx ) {
 
    The fastest we can execute a transaction is about 1us.  With n
    execle tiles, that means we can execute at most n txn/us.  If we have
-   k ms left in the block, only reserve up to k*n*1000 microblocks. */
+   k ms left in the block, only reserve up to k*n*1000 microblocks.
+
+   PoH mixes each microblock into one hash position and has
+   hashcnt_per_tick-1 of them per tick, so with k ns left it can absorb
+   at most k*(hashcnt_per_tick-1)/tick_duration_ns more microblocks.
+   Bounding by that keeps PoH on its wall clock schedule however large
+   the slot maximum is: the reserve tracks the time left instead of
+   piling up as a hash wall at the end of the slot. */
 
 static inline ulong
 compute_dynamic_max_microblocks( fd_pack_ctx_t * ctx ) {
@@ -450,16 +464,18 @@ compute_dynamic_max_microblocks( fd_pack_ctx_t * ctx ) {
 
   /* remaining_ns * n / 1000 = (remaining_ns/1e6 ms) * n * 1000.
 
-     Overflow: remaining_ns is at most ~4e8, n at most 64, so
-     remaining_ns * n is at most ~2.6e10 << 1.8e19. */
+     Overflow: remaining_ns is at most ~4e8, n at most 64 and
+     mixin_per_tick at most 62,499 (FD_RUNTIME_MAX_HASHES_PER_TICK), so
+     the products are < 3e13. */
 
   ulong remaining_ns = (ulong)(end - now);
   ulong n            = ctx->execle_cnt;
   ulong cnt          = ctx->slot_microblock_cnt;
   ulong R            = ctx->slot_max_microblocks - cnt;
   ulong can_execute  = remaining_ns * n / 1000UL;
+  ulong can_mixin    = fd_ulong_if( !!ctx->slot_mixin_per_tick, remaining_ns * ctx->slot_mixin_per_tick / ctx->slot_tick_duration_ns, ULONG_MAX );
 
-  return cnt + fd_ulong_min( R, can_execute );
+  return cnt + fd_ulong_min( R, fd_ulong_min( can_execute, can_mixin ) );
 }
 
 static inline void
@@ -630,6 +646,7 @@ after_credit( fd_pack_ctx_t *     ctx,
 
     fd_done_packing_t * done_packing = fd_chunk_to_laddr( ctx->poh_out.mem, ctx->poh_out.chunk );
     get_done_packing( ctx, done_packing, FD_PACK_END_SLOT_REASON_TIME ); /* needs to be called before fd_pack_end_block */
+    log_end_block_metrics( ctx, now, "time", done_packing->limits_usage->block_cost ); /* reads gauges fd_pack_end_block resets */
     fd_pack_end_block( ctx->pack );
     fd_pack_get_top_writers( ctx->pack, done_packing->limits_usage->top_writers ); /* needs to be called after fd_pack_end_block */
 
@@ -637,7 +654,6 @@ after_credit( fd_pack_ctx_t *     ctx,
     ctx->poh_out.chunk = fd_dcache_compact_next( ctx->poh_out.chunk, sizeof(fd_done_packing_t), ctx->poh_out.chunk0, ctx->poh_out.wmark );
     ctx->pack_idx++;
 
-    log_end_block_metrics( ctx, now, "time", done_packing->limits_usage->block_cost );
     ctx->drain_execle        = 1;
     ctx->leader_slot         = ULONG_MAX;
     ctx->slot_microblock_cnt = 0UL;
@@ -879,6 +895,7 @@ after_credit( fd_pack_ctx_t *     ctx,
 
     fd_done_packing_t * done_packing = fd_chunk_to_laddr( ctx->poh_out.mem, ctx->poh_out.chunk );
     get_done_packing( ctx, done_packing, FD_PACK_END_SLOT_REASON_MICROBLOCK );
+    log_end_block_metrics( ctx, now, "microblock", done_packing->limits_usage->block_cost );
     fd_pack_end_block( ctx->pack );
     fd_pack_get_top_writers( ctx->pack, done_packing->limits_usage->top_writers );
 
@@ -886,7 +903,6 @@ after_credit( fd_pack_ctx_t *     ctx,
     ctx->poh_out.chunk = fd_dcache_compact_next( ctx->poh_out.chunk, sizeof(fd_done_packing_t), ctx->poh_out.chunk0, ctx->poh_out.wmark );
     ctx->pack_idx++;
 
-    log_end_block_metrics( ctx, now, "microblock", done_packing->limits_usage->block_cost );
     ctx->drain_execle        = 1;
     ctx->leader_slot         = ULONG_MAX;
     ctx->slot_microblock_cnt = 0UL;
@@ -1042,7 +1058,7 @@ during_frag( fd_pack_ctx_t * ctx,
     fd_memcpy( ctx->cur_spot->alt_accts,     fd_txn_m_alut( txnm ),    addr_table_sz );
     ctx->cur_spot->txnp->scheduler_arrival_time_nanos = fd_clock_tile_now( ctx->clock );
     ctx->cur_spot->txnp->first_seen_nanos = txnm->first_seen_nanos;
-    ctx->cur_spot->txnp->payload_sz  = payload_sz;
+    ctx->cur_spot->txnp->payload_sz  = (ushort)payload_sz;
     ctx->cur_spot->txnp->source_ipv4 = source_ipv4;
     ctx->cur_spot->txnp->source_tpu  = source_tpu;
 
@@ -1087,6 +1103,7 @@ after_frag( fd_pack_ctx_t *     ctx,
       if( FD_UNLIKELY( sig==REPLAY_SIG_RESET && ctx->leader_slot!=ULONG_MAX ) ) {
         fd_done_packing_t * done_packing = fd_chunk_to_laddr( ctx->poh_out.mem, ctx->poh_out.chunk );
         get_done_packing( ctx, done_packing, FD_PACK_END_SLOT_REASON_ABANDONED );
+        log_end_block_metrics( ctx, now, "reset", done_packing->limits_usage->block_cost );
         fd_pack_end_block( ctx->pack );
         fd_pack_get_top_writers( ctx->pack, done_packing->limits_usage->top_writers );
 
@@ -1095,7 +1112,6 @@ after_frag( fd_pack_ctx_t *     ctx,
         ctx->pack_idx++;
 
         FD_LOG_WARNING(( "consensus reset while packing for slot %lu, ending block early", ctx->leader_slot ));
-        log_end_block_metrics( ctx, now, "reset", done_packing->limits_usage->block_cost );
         ctx->drain_execle        = 1;
         ctx->leader_slot         = ULONG_MAX;
         ctx->slot_microblock_cnt = 0UL;
@@ -1129,6 +1145,7 @@ after_frag( fd_pack_ctx_t *     ctx,
     if( FD_UNLIKELY( ctx->leader_slot!=ULONG_MAX ) ) {
       fd_done_packing_t * done_packing = fd_chunk_to_laddr( ctx->poh_out.mem, ctx->poh_out.chunk );
       get_done_packing( ctx, done_packing, FD_PACK_END_SLOT_REASON_ABANDONED );
+      log_end_block_metrics( ctx, now_ticks, "switch", done_packing->limits_usage->block_cost );
       fd_pack_end_block( ctx->pack );
       fd_pack_get_top_writers( ctx->pack, done_packing->limits_usage->top_writers );
 
@@ -1137,7 +1154,6 @@ after_frag( fd_pack_ctx_t *     ctx,
       ctx->pack_idx++;
 
       FD_LOG_WARNING(( "switching to slot %lu while packing for slot %lu. Draining execle tiles.", leader_slot, ctx->leader_slot ));
-      log_end_block_metrics( ctx, now_ticks, "switch", done_packing->limits_usage->block_cost );
       ctx->drain_execle        = 1;
       ctx->leader_slot         = ULONG_MAX;
       ctx->slot_microblock_cnt = 0UL;
@@ -1195,6 +1211,8 @@ after_frag( fd_pack_ctx_t *     ctx,
 
     ctx->slot_end_ns = ctx->_became_leader->slot_end_ns;
     ctx->slot_dynamic_max_microblocks  = ctx->slot_max_microblocks;
+    ctx->slot_mixin_per_tick           = fd_ulong_if( ctx->_became_leader->hashcnt_per_tick>1UL, ctx->_became_leader->hashcnt_per_tick-1UL, 0UL ); /* 0: low power / alpenglow, no hash budget */
+    ctx->slot_tick_duration_ns         = ctx->_became_leader->tick_duration_ns;
     ctx->pending_reduce_mb_bound       = 0;
     fd_pack_limits_t limits[ 1 ];
     limits->max_cost_per_block = ctx->limits.slot_max_cost;
@@ -1383,7 +1401,8 @@ unprivileged_init( fd_topo_t const *      topo,
             sign_out->dcache,
             sign_in->mcache,
             sign_in->dcache,
-            sign_out->mtu ) ) ) ) {
+            sign_out->mtu,
+            sign_in->mtu ) ) ) ) {
       FD_LOG_ERR(( "failed to construct keyguard" ));
     }
     /* Initialize enough of the prev config that it produces a

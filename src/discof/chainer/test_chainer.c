@@ -75,6 +75,23 @@ slotv_at( fd_chainer_t * chainer, ulong slot, ulong ord ) {
   return list[ n-1UL-ord ]; /* reverse iteration -> creation order */
 }
 
+/* slotv_shred_cnt returns the number of data shreds slotv has, summed
+   over the FECs it owns. */
+
+static ulong
+slotv_shred_cnt( fd_chainer_t *             chainer,
+                 fd_chainer_slotv_t const * slotv ) {
+  fd_chainer_fec_t * fec_pool = chainer->fec_pool;
+  uint const *       fecs     = fd_chainer_slotv_fecs( chainer, slotv );
+  ulong              cnt      = 0UL;
+  for( ulong k=0UL; k<chainer->fec_blk_max; k++ ) {
+    uint idx = fecs[ k ];
+    if( idx==UINT_MAX ) continue;
+    cnt += (ulong)fd_uint_popcnt( fd_fec_pool_ele( fec_pool, (ulong)idx )->data_idxs );
+  }
+  return cnt;
+}
+
 /* fec_at returns the FEC the ord-th (creation-order) version of slot owns
    at fec_set_idx, or NULL. */
 
@@ -217,7 +234,7 @@ test_basic( fd_wksp_t * wksp ) {
     fd_chainer_slotv_t * slotv = slotv_at( chainer, 11UL, 0UL );
     FD_TEST( slotv );                                          /* created on the first shred */
     FD_TEST( fd_chainer_shred_test( chainer, slotv, i  ) );
-    FD_TEST( fd_chainer_slotv_shred_cnt( chainer, slotv )==i+1UL );
+    FD_TEST( slotv_shred_cnt( chainer, slotv )==i+1UL );
     FD_TEST( slotv->buffered_idx==i );                         /* contiguous from 0 */
     FD_TEST( slotv->complete_idx==UINT_MAX );                  /* tip still unknown */
   }
@@ -259,7 +276,7 @@ test_basic( fd_wksp_t * wksp ) {
   FD_TEST( s11->buffered_idx    ==63U );
   FD_TEST( s11->buffered_fec_idx==63U );
   FD_TEST( s11->delivered_idx   ==63U );
-  FD_TEST( fd_chainer_slotv_shred_cnt( chainer, s11 )==64UL );
+  FD_TEST( slotv_shred_cnt( chainer, s11 )==64UL );
   FD_TEST( !fd_chainer_in_repair( chainer, s11 ) ); /* whole block -> off the repair worklist */
   FD_TEST( fd_chainer_highest_repaired_slot( chainer )==11UL );
 
@@ -322,7 +339,7 @@ test_shared_prefix( fd_wksp_t * wksp ) {
   /* a notar-fallback cert names a different block for slot 21 */
 
   fd_hash_t bidX = mkhash( 200UL );
-  fd_chainer_notar_fallback( chainer, 21UL, bidX );
+  fd_chainer_verified_block_insert( chainer, 21UL, bidX );
   FD_TEST( !fd_chainer_verify( chainer ) );
 
   fd_chainer_slotv_t * v1 = slotv_at( chainer, 21UL, 1UL );
@@ -332,7 +349,7 @@ test_shared_prefix( fd_wksp_t * wksp ) {
 
   /* getParentAndFecCount response: three FEC sets, parent is the root */
 
-  FD_TEST( fd_chainer_verified_parent_fec_count( chainer, 21UL, &bidX, 3U, 20UL, &bid0 )==v1 );
+  FD_TEST( fd_chainer_verified_parent_fec_count( chainer, 21UL, &bidX, 3U, 20UL, &bid0 )==fd_chainer_slot_version_query( chainer, 20UL, &bid0 ) ); /* returns the parent version */
   FD_TEST( !fd_chainer_verify( chainer ) );
   FD_TEST( v1->complete_idx==95U );
   FD_TEST( v1->parent_slot ==20UL );
@@ -364,15 +381,12 @@ test_shared_prefix( fd_wksp_t * wksp ) {
   FD_TEST( v1->buffered_fec_idx==63U );
   FD_TEST( v1->delivered_idx   ==63U );
 
-  /* ShredForBlockId responses are admitted against the version's
-     established roots */
+  /* the version's roots are recorded at exactly the expected positions */
 
-  FD_TEST(  fd_chainer_shred_for_block_id_verify( chainer, 21UL, 0U,  &bidX,    &r0  ) );
-  FD_TEST(  fd_chainer_shred_for_block_id_verify( chainer, 21UL, 32U, &bidX,    &r1  ) );
-  FD_TEST( !fd_chainer_shred_for_block_id_verify( chainer, 21UL, 0U,  &bidX,    &r1  ) ); /* wrong root */
-  FD_TEST( !fd_chainer_shred_for_block_id_verify( chainer, 21UL, 64U, &bidX,    &r2b ) ); /* no root yet */
-  FD_TEST( !fd_chainer_shred_for_block_id_verify( chainer, 21UL, 0U,  &r0,      &r0  ) ); /* unknown version */
-  FD_TEST(  fd_chainer_shred_for_block_id_verify( chainer, 21UL, 64U, &bid_v0,  &r2a ) ); /* version 0 */
+  FD_TEST( !fd_chainer_fec_query( chainer, 21UL, 64U, &bidX ) ); /* no root yet */
+  FD_TEST( !fd_chainer_fec_query( chainer, 21UL, 0U,  &r0   ) ); /* unknown version */
+  fd_chainer_fec_t * v0f2 = fd_chainer_fec_query( chainer, 21UL, 64U, &bid_v0 );
+  FD_TEST( v0f2 && fd_hash_eq( &v0f2->merkle_root, &r2a ) );     /* version 0 */
 
   /* getFecRoot response for the diverging set: no version holds this
      root, so a sentinel is created and its shreds must be repaired */
@@ -435,7 +449,7 @@ test_notar_fallback_in_flight( fd_wksp_t * wksp ) {
   FD_TEST( fd_hash_check_zero( &v0->block_id ) ); /* so no block_id yet */
 
   fd_hash_t bidY = mkhash( 200UL );
-  fd_chainer_notar_fallback( chainer, 31UL, bidY );
+  fd_chainer_verified_block_insert( chainer, 31UL, bidY );
   FD_TEST( !fd_chainer_verify( chainer ) );
 
   fd_chainer_slotv_t * v1 = slotv_at( chainer, 31UL, 1UL );
@@ -453,7 +467,7 @@ test_notar_fallback_in_flight( fd_wksp_t * wksp ) {
   FD_TEST( v1->parent_slot     ==AG_UNKNOWN_SLOT );
   FD_TEST( !v1->connected );
   FD_TEST( fd_chainer_in_repair( chainer, v1 ) && fd_chainer_in_orphan( chainer, v1 ) ); /* needs shreds and ancestry */
-  FD_TEST( fd_chainer_slotv_shred_cnt( chainer, v1 )==0UL );
+  FD_TEST( slotv_shred_cnt( chainer, v1 )==0UL );
   FD_TEST( !fec_at( chainer, 31UL, 0U, 1UL ) );
 
   /* version 0 keeps its data but is abandoned: off the worklists, and
@@ -467,7 +481,7 @@ test_notar_fallback_in_flight( fd_wksp_t * wksp ) {
   /* a repeat of the same cert is a no-op -- no third version */
 
   ulong slotv_free = fd_slotv_pool_free( slotv_pool );
-  fd_chainer_notar_fallback( chainer, 31UL, bidY );
+  fd_chainer_verified_block_insert( chainer, 31UL, bidY );
   FD_TEST( !fd_chainer_verify( chainer ) );
   FD_TEST( fd_slotv_pool_free( slotv_pool )==slotv_free );
   FD_TEST( !slotv_at( chainer, 31UL, 2UL ) );
@@ -503,7 +517,7 @@ test_sentinel_before_turbine( fd_wksp_t * wksp ) {
      FEC set) */
 
   fd_hash_t bidZ = mkhash( 200UL );
-  fd_chainer_notar_fallback( chainer, 41UL, bidZ );
+  fd_chainer_verified_block_insert( chainer, 41UL, bidZ );
   FD_TEST( !fd_chainer_verify( chainer ) );
   FD_TEST( fd_chainer_verified_parent_fec_count( chainer, 41UL, &bidZ, 2U, 40UL, &bid0 ) );
   FD_TEST( !fd_chainer_verify( chainer ) );
@@ -579,7 +593,7 @@ test_turbine_shred_after_notar_fallback( fd_wksp_t * wksp ) {
      has arrived for set 1 */
 
   fd_hash_t bidY = mkhash( 200UL );
-  fd_chainer_notar_fallback( chainer, 51UL, bidY );
+  fd_chainer_verified_block_insert( chainer, 51UL, bidY );
   FD_TEST( !fd_chainer_verify( chainer ) );
   FD_TEST( slotv_at( chainer, 51UL, 1UL ) );
 
@@ -773,7 +787,7 @@ test_publish_noncanonical_v0( fd_wksp_t * wksp ) {
   /* a notar-fallback cert names a different block for slot 61 */
 
   fd_hash_t bidX = mkhash( 200UL );
-  fd_chainer_notar_fallback( chainer, 61UL, bidX );
+  fd_chainer_verified_block_insert( chainer, 61UL, bidX );
   FD_TEST( !fd_chainer_verify( chainer ) );
   fd_chainer_slotv_t * v1 = slotv_at( chainer, 61UL, 1UL );
   FD_TEST( v1 );
@@ -832,7 +846,7 @@ test_versions_full( fd_wksp_t * wksp ) {
 
   for( ulong v=1UL; v<FD_CHAINER_SLOT_VER_MAX; v++ ) {
     fd_hash_t bid = mkhash( 200UL+v );
-    fd_chainer_notar_fallback( chainer, 81UL, bid );
+    fd_chainer_verified_block_insert( chainer, 81UL, bid );
     FD_TEST( !fd_chainer_verify( chainer ) );
 
     fd_chainer_slotv_t * slotv = slotv_at( chainer, 81UL, v );
@@ -844,6 +858,93 @@ test_versions_full( fd_wksp_t * wksp ) {
   FD_TEST( !fd_chainer_verify( chainer ) );
   teardown( chainer );
   FD_LOG_NOTICE(( "pass: all %d versions of a slot", FD_CHAINER_SLOT_VER_MAX ));
+}
+
+/* (f) A getFecRoot sentinel is keyed by the zero-padded 20-byte root
+   prefix.  When a shred carrying the full root arrives, shred_insert
+   must re-key the sentinel itself -- nothing tells it which version the
+   shred was repaired for.  Two cases: no FEC holds the full root yet
+   (re-key in place), and one already does (merge the sentinel into it,
+   replaying its completion for the versions that pointed at the
+   sentinel). */
+
+static void
+test_sentinel_rekey( fd_wksp_t * wksp ) {
+  fd_chainer_t * chainer = setup( wksp );
+
+  fd_hash_t bid0 = mkhash( 100UL );
+  fd_chainer_init( chainer, 40UL, &bid0 );
+
+  /* full roots with a non-zero tail, so the padded prefix differs */
+  fd_hash_t r0 = mkhash( 1UL ); r0.uc[ 24 ] = 0x5a;
+  fd_hash_t r1 = mkhash( 2UL ); r1.uc[ 25 ] = 0x3c;
+  fd_hash_t p0 = {0}; memcpy( p0.uc, r0.uc, FD_SHRED_MERKLE_NODE_SZ );
+  fd_hash_t p1 = {0}; memcpy( p1.uc, r1.uc, FD_SHRED_MERKLE_NODE_SZ );
+
+  /* a notar-fallback version of slot 41 learns both roots by prefix */
+  fd_hash_t bidZ = mkhash( 200UL );
+  fd_chainer_verified_block_insert( chainer, 41UL, bidZ );
+  FD_TEST( fd_chainer_verified_parent_fec_count( chainer, 41UL, &bidZ, 2U, 40UL, &bid0 ) );
+  fd_chainer_verified_hash_insert( chainer, 41UL, &bidZ, 0U,  &p0 );
+  fd_chainer_verified_hash_insert( chainer, 41UL, &bidZ, 32U, &p1 );
+  FD_TEST( !fd_chainer_verify( chainer ) );
+
+  fd_chainer_slotv_t * vZ = fd_chainer_slot_version_query( chainer, 41UL, &bidZ );
+  fd_chainer_fec_t *   s0 = fd_chainer_fec_query( chainer, 41UL, 0U,  &bidZ );
+  fd_chainer_fec_t *   s1 = fd_chainer_fec_query( chainer, 41UL, 32U, &bidZ );
+  FD_TEST( vZ && s0 && s1 );
+  FD_TEST( fd_hash_eq( &s0->merkle_root, &p0 ) && !s0->complete );
+  FD_TEST( fd_hash_eq( &s1->merkle_root, &p1 ) && !s1->complete );
+  ulong fec_used = fd_fec_pool_used( chainer->fec_pool );
+
+  /* Case 1: repaired shreds arrive with the full root, no version named.
+     Set 0 completes; set 1 gets a single shred.  Both sentinels are
+     re-keyed in place: same entries, full roots, no new FEC. */
+
+  FD_TEST( !feed_fec( chainer, 41UL, 0U, 0, &r0, 40UL, &bid0 ) );
+  fd_chainer_shred_insert( chainer, 41UL, 35U, 0, &r1, AG_UNKNOWN_SLOT, NULL );
+  FD_TEST( !fd_chainer_verify( chainer ) );
+
+  FD_TEST( fd_chainer_fec_query( chainer, 41UL, 0U,  &bidZ )==s0 );
+  FD_TEST( fd_chainer_fec_query( chainer, 41UL, 32U, &bidZ )==s1 );
+  FD_TEST( fd_hash_eq( &s0->merkle_root, &r0 ) && s0->complete );
+  FD_TEST( fd_hash_eq( &s1->merkle_root, &r1 ) );
+  for( uint i=0U; i<32U; i++ ) FD_TEST( fd_chainer_shred_test( chainer, vZ, i ) );
+  FD_TEST(  fd_chainer_shred_test( chainer, vZ, 35U ) );
+  FD_TEST( !fd_chainer_shred_test( chainer, vZ, 36U ) );
+  FD_TEST( vZ->buffered_idx==31U );
+  FD_TEST( fd_fec_pool_used( chainer->fec_pool )==fec_used ); /* turbine version joined the same entries */
+
+  /* Case 2: a second notar-fallback version learns set 0 by prefix
+     after the full root is already keyed.  Its getFecRoot creates a
+     fresh sentinel (the padded key no longer exists); the next full-root
+     shred for that set merges the sentinel into the complete FEC, and
+     the version gets the set (complete) without any further shreds. */
+
+  fd_hash_t bidY = mkhash( 300UL );
+  fd_chainer_verified_block_insert( chainer, 41UL, bidY );
+  FD_TEST( fd_chainer_verified_parent_fec_count( chainer, 41UL, &bidY, 2U, 40UL, &bid0 ) );
+  fd_chainer_verified_hash_insert( chainer, 41UL, &bidY, 0U, &p0 );
+  FD_TEST( !fd_chainer_verify( chainer ) );
+
+  fd_chainer_slotv_t * vY  = fd_chainer_slot_version_query( chainer, 41UL, &bidY );
+  fd_chainer_fec_t *   sY0 = fd_chainer_fec_query( chainer, 41UL, 0U, &bidY );
+  FD_TEST( vY && sY0 && sY0!=s0 && fd_hash_eq( &sY0->merkle_root, &p0 ) && !sY0->complete );
+  FD_TEST( fd_fec_pool_used( chainer->fec_pool )==fec_used+1UL );
+  FD_TEST( !fd_chainer_shred_test( chainer, vY, 3U ) );
+
+  fd_chainer_shred_insert( chainer, 41UL, 3U, 0, &r0, AG_UNKNOWN_SLOT, NULL ); /* a duplicate of a shred we hold */
+  FD_TEST( !fd_chainer_verify( chainer ) );
+
+  FD_TEST( fd_chainer_fec_query( chainer, 41UL, 0U, &bidY )==s0 );  /* merged onto the full-root FEC */
+  FD_TEST( fd_chainer_fec_query( chainer, 41UL, 0U, &bidZ )==s0 );  /* Z still owns it */
+  FD_TEST( fd_fec_pool_used( chainer->fec_pool )==fec_used );       /* sentinel released */
+  for( uint i=0U; i<32U; i++ ) FD_TEST( fd_chainer_shred_test( chainer, vY, i ) );
+  FD_TEST( vY->buffered_idx==31U );
+
+  FD_TEST( !fd_chainer_verify( chainer ) );
+  teardown( chainer );
+  FD_LOG_NOTICE(( "pass: getFecRoot sentinel re-keyed on shred insert" ));
 }
 
 /* Turbine equivocation without a sentinel: a second root for a FEC set
@@ -874,7 +975,7 @@ test_equivocation_drop( fd_wksp_t * wksp ) {
   FD_TEST( fd_hash_eq( &fec_at( chainer, 91UL, 0U, 0UL )->merkle_root, &r0 ) );
   FD_TEST( !fec_at( chainer, 91UL, 0U, 1UL ) );
   FD_TEST( v0->buffered_idx==31U );
-  FD_TEST( fd_chainer_slotv_shred_cnt( chainer, v0 )==32UL );
+  FD_TEST( slotv_shred_cnt( chainer, v0 )==32UL );
 
   /* a duplicate completion of the same root is idempotent */
 
@@ -920,13 +1021,15 @@ test_verify_detects( fd_wksp_t * wksp ) {
   s->delivered_idx = 95U; FD_TEST( fd_chainer_verify( chainer ) ); s->delivered_idx = 63U;
   FD_TEST( !fd_chainer_verify( chainer ) );
 
-  /* worklist flags vs. treap membership (flags now live on the sched
+  /* worklist flags vs. treap membership (flags now live on the work
      ele, not the slotv) */
 
-  fd_chainer_repair_add( chainer, s );                   /* creates a sched ele in the repair treap */
-  fd_sched_ele_t * se = fd_chainer_sched_ele( chainer, s );
-  se->in_repair = 0; FD_TEST( fd_chainer_verify( chainer ) ); se->in_repair = 1; /* in neither treap / count mismatch */
-  se->in_orphan = 1; FD_TEST( fd_chainer_verify( chainer ) ); se->in_orphan = 0; /* orphan flag set but not in orphan treap */
+  fd_chainer_repair_add( chainer, s );                   /* creates a work ele in the repair treap */
+  ulong               s_idx = fd_slotv_pool_idx( chainer->slotv_pool, s );
+  fd_chainer_work_t * we    = fd_work_map_ele_query( chainer->work_map, &s_idx, NULL, chainer->work_pool );
+  FD_TEST( we );
+  we->in_repair = 0; FD_TEST( fd_chainer_verify( chainer ) ); we->in_repair = 1; /* in neither treap / count mismatch */
+  we->in_orphan = 1; FD_TEST( fd_chainer_verify( chainer ) ); we->in_orphan = 0; /* orphan flag set but not in orphan treap */
   fd_chainer_repair_remove( chainer, s );                /* restore: gc's the ele */
   FD_TEST( !fd_chainer_verify( chainer ) );
 
@@ -940,8 +1043,8 @@ test_verify_detects( fd_wksp_t * wksp ) {
 
   fd_hash_t bidA = mkhash( 200UL );
   fd_hash_t bidB = mkhash( 201UL );
-  fd_chainer_notar_fallback( chainer, 111UL, bidA );
-  fd_chainer_notar_fallback( chainer, 111UL, bidB );
+  fd_chainer_verified_block_insert( chainer, 111UL, bidA );
+  fd_chainer_verified_block_insert( chainer, 111UL, bidB );
   FD_TEST( !fd_chainer_verify( chainer ) );
 
   fd_chainer_slotv_t * v1 = fd_chainer_slot_version_query( chainer, 111UL, &bidA );
@@ -1007,7 +1110,7 @@ test_output_order_redeliver( fd_wksp_t * wksp ) {
 
   /* a notar-fallback cert names a different block for slot 51 */
   fd_hash_t bidX = mkhash( 200UL );
-  fd_chainer_notar_fallback( chainer, 51UL, bidX );
+  fd_chainer_verified_block_insert( chainer, 51UL, bidX );
   FD_TEST( fd_chainer_verified_parent_fec_count( chainer, 51UL, &bidX, 5U, 50UL, &bid0 ) );
 
   /* shared prefix: sets 0,32 match version 0 and deliver without repair */
@@ -1070,7 +1173,7 @@ test_output_order_out_of_order( fd_wksp_t * wksp ) {
 
   /* notar-fallback version 1 shares 0,32 and diverges at 64,96 */
   fd_hash_t bidX = mkhash( 200UL );
-  fd_chainer_notar_fallback( chainer, 61UL, bidX );
+  fd_chainer_verified_block_insert( chainer, 61UL, bidX );
   FD_TEST( fd_chainer_verified_parent_fec_count( chainer, 61UL, &bidX, 4U, 60UL, &bid0 ) );
 
   fd_hash_t mr;
@@ -1123,18 +1226,17 @@ test_shred_limit( fd_wksp_t * wksp ) {
   FD_TEST(  fd_chainer_shred_test( chainer, v0, shred_max-1U ) );
   FD_TEST( !fd_chainer_shred_test( chainer, v0, shred_max    ) ); /* beyond the limit: never present */
   FD_TEST( !fd_chainer_shred_test( chainer, v0, UINT_MAX     ) );
-  FD_TEST( fd_chainer_slotv_shred_cnt( chainer, v0 )==FD_FEC_SHRED_CNT );
+  FD_TEST( slotv_shred_cnt( chainer, v0 )==FD_FEC_SHRED_CNT );
   FD_TEST( !fd_chainer_fec_query( chainer, 11UL, shred_max, &v0->block_id ) );
-  FD_TEST( !fd_chainer_shred_for_block_id_verify( chainer, 11UL, shred_max, &v0->block_id, &rL ) );
   FD_TEST( !fd_chainer_verify( chainer ) );
-  FD_TEST( fd_chainer_slotv_shred_cnt( chainer, v0 )==FD_FEC_SHRED_CNT );
+  FD_TEST( slotv_shred_cnt( chainer, v0 )==FD_FEC_SHRED_CNT );
 
   /* a getParentAndFecCount naming exactly the limit connects the version */
   fd_hash_t bidX = mkhash( 200UL );
-  fd_chainer_notar_fallback( chainer, 11UL, bidX );
+  fd_chainer_verified_block_insert( chainer, 11UL, bidX );
   fd_chainer_slotv_t * v1 = fd_chainer_slot_version_query( chainer, 11UL, &bidX );
   FD_TEST( v1 && v1->complete_idx==UINT_MAX && v1->parent_slot==AG_UNKNOWN_SLOT );
-  FD_TEST( fd_chainer_verified_parent_fec_count( chainer, 11UL, &bidX, (uint)FD_FEC_BLK_MAX, 10UL, &bid0 )==v1 );
+  FD_TEST( fd_chainer_verified_parent_fec_count( chainer, 11UL, &bidX, (uint)FD_FEC_BLK_MAX, 10UL, &bid0 )==fd_chainer_slot_version_query( chainer, 10UL, &bid0 ) ); /* returns the parent version */
   FD_TEST( v1->complete_idx==shred_max-1U && v1->connected );
   FD_TEST( !fd_chainer_verify( chainer ) );
 
@@ -1168,7 +1270,7 @@ test_bench_shred_limit( fd_wksp_t * wksp ) {
   FD_TEST( !feed_fec( chainer, 11UL, last, 1, &rA, AG_UNKNOWN_SLOT, NULL  ) );
   fd_chainer_slotv_t * v0 = slotv_at( chainer, 11UL, 0UL );
   FD_TEST( v0->complete_idx==shred_max-1U && v0->buffered_idx==31U );
-  FD_TEST( fd_chainer_slotv_shred_cnt( chainer, v0 )==2UL*FD_FEC_SHRED_CNT );
+  FD_TEST( slotv_shred_cnt( chainer, v0 )==2UL*FD_FEC_SHRED_CNT );
   for( uint i=last; i<shred_max; i++ ) FD_TEST( fd_chainer_shred_test( chainer, v0, i ) );
   FD_TEST( !fd_chainer_shred_test( chainer, v0, shred_max ) );
   FD_TEST( fd_hash_eq( &fec_at( chainer, 11UL, last, 0UL )->merkle_root, &rA ) );
@@ -1178,7 +1280,7 @@ test_bench_shred_limit( fd_wksp_t * wksp ) {
      each version's row holds its own root at the high position */
   fd_hash_t bidX = mkhash( 200UL );
   fd_hash_t rB   = mkhash( 3UL );
-  fd_chainer_notar_fallback( chainer, 11UL, bidX );
+  fd_chainer_verified_block_insert( chainer, 11UL, bidX );
   FD_TEST( fd_chainer_verified_parent_fec_count( chainer, 11UL, &bidX, shred_max/(uint)FD_FEC_SHRED_CNT, 10UL, &bid0 ) );
   fd_hash_t mr;
   mr = r0; fd_chainer_verified_hash_insert( chainer, 11UL, &bidX, 0U,   &mr );
@@ -1226,6 +1328,7 @@ main( int argc, char ** argv ) {
   test_notar_fallback_in_flight          ( wksp );
   test_sentinel_before_turbine           ( wksp );
   test_turbine_shred_after_notar_fallback( wksp );
+  test_sentinel_rekey                    ( wksp );
   test_output_order_redeliver            ( wksp );
   test_output_order_out_of_order         ( wksp );
   test_publish                           ( wksp );

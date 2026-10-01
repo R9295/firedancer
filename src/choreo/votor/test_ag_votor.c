@@ -1,4 +1,5 @@
 #include "ag_votor.c"
+#include "test_ag_cert_builder.h"
 
 #define NV                 (2UL)
 #define TEST_SLOT_MAX      (64UL)
@@ -13,11 +14,11 @@
     FD_TEST( !try_recv( (votor), &unused_ ) ); \
   } while( 0 )
 
-#define SCRATCH_MAX (1UL<<18) /* 256 KiB */
+#define SCRATCH_MAX (1UL<<19) /* 512 KiB */
 
 static uchar scratch[ SCRATCH_MAX ] __attribute__((aligned(128)));
 
-static ag_bls_sec_t      g_sk  [ NV ];
+static fd_bls_sec_t      g_sk  [ NV ];
 static ag_validator_info_t g_info[ NV ];
 static ulong               g_hash_ctr = 0UL;
 
@@ -48,11 +49,11 @@ random_block_id( ulong slot ) {
 static void
 create_validators( void ) {
   for( ulong i=0UL; i<NV; i++ ) {
-    fd_memset( g_sk[i], (int)(i*7UL+1UL), AG_BLS_SEC_SZ );
+    fd_memset( &g_sk[i], (int)(i*7UL+1UL), FD_BLS_SEC_SZ );
     memset( &g_info[i], 0, sizeof(ag_validator_info_t) );
     g_info[i].id    = i;
     g_info[i].stake = 1UL;
-    ag_bls_sec_to_pub( g_sk[i], g_info[i].bls_key );
+    fd_bls_sec_to_pub( &g_sk[i], &g_info[i].bls_key );
   }
 }
 
@@ -121,10 +122,8 @@ setup_votor( long now ) {
   FD_TEST( ag_votor_footprint( TEST_SLOT_MAX )<=sizeof(scratch) );
   ag_votor_t * votor = ag_votor_join( ag_votor_new( scratch, TEST_SLOT_MAX, 42UL ) );
   FD_TEST( votor );
-  ag_votor_init            ( votor, 0UL, now );
-  ag_votor_advance_epoch    ( votor, 0UL, 0UL );
-  ag_votor_set_bls_key      ( votor, g_sk[0] );
-  ag_votor_set_shred_version( votor, TEST_SHRED_VERSION );
+  ag_votor_init         ( votor, 0UL, now, TEST_SHRED_VERSION, sec_sign_fn, &g_sk[0] );
+  ag_votor_advance_epoch( votor, 0UL, 0UL );
 
   g_epoch_info = &epoch_info_mem;
   ag_epoch_info( g_epoch_info, g_info, NV );
@@ -194,7 +193,7 @@ test_notar_and_final( void ) {
   ag_vote_t vote = send_block_and_expect_notar( votor, slot, &parent );
 
   /* vote finalize after seeing branch-certified */
-  ag_cert_t cert = ag_cert_construct_notar( &vote.notar, 1UL, g_epoch_info );
+  ag_cert_t cert = cert_build_notar( &vote.notar, 1UL, g_epoch_info );
   ag_event_pool_t event = { .kind = AG_EVENT_POOL_CERT_CREATED, .cert_created = cert };
   ag_votor_handle_pool_event( votor, &event, 0L );
 
@@ -314,7 +313,7 @@ test_safe_to_notar( void ) {
   ag_vote_t msg = recv( votor );
   FD_TEST( msg.kind==AG_VOTE_KIND_NOTAR_FALLBACK );
   FD_TEST( ag_vote_slot( &msg )==block.slot );
-  FD_TEST( !memcmp( ag_vote_notar_fallback_block_hash( &msg.notar_fallback ), block.hash, sizeof(ag_block_hash_t) ) );
+  FD_TEST( !memcmp( msg.notar_fallback.block_hash, block.hash, sizeof(ag_block_hash_t) ) );
 
   teardown_votor( votor );
 }
@@ -365,21 +364,22 @@ test_prunes_to_finalized_window( void ) {
 
   /* finalizing a mid-window slot should drop only the slots before its
      window */
-  ag_vote_t fv; fv = ag_vote_construct_final( finalized, g_sk[1], (ushort)1, TEST_SHRED_VERSION );
-  ag_cert_t cert = ag_cert_construct_final( &fv.final, 1UL, g_epoch_info );
+  ag_vote_t fv; fv = ag_vote_construct_final( sec_sign_fn, &g_sk[1], finalized, (ushort)1, TEST_SHRED_VERSION );
+  ag_cert_t cert = cert_build_final( &fv.final, 1UL, g_epoch_info );
   ag_event_pool_t event = { .kind = AG_EVENT_POOL_CERT_CREATED, .cert_created = cert };
   ag_votor_handle_pool_event( votor, &event, 0L );
   FD_TEST( votor->highest_final_cert_slot==finalized );
 
-  /* the whole finalized window is kept */
-  FD_TEST( min_live_slot( votor )>=window_start );
+  /* the finalized window and the reward buffer before it are kept */
+  ulong kept_start = ag_first_slot_in_window( fd_ulong_sat_sub( finalized, AG_REWARD_SLOT_DELTA ) );
+  FD_TEST( min_live_slot( votor )>=kept_start );
   for( ulong slot=window_start; slot<window_start+AG_SLOTS_PER_WINDOW; slot++ ) {
     FD_TEST( contains_slot( votor, slot ) );
   }
 
   /* earlier windows are dropped */
-  FD_TEST( !contains_slot( votor, 0UL              ) );
-  FD_TEST( !contains_slot( votor, window_start-1UL ) );
+  for( ulong slot=0UL; slot<kept_start; slot++ ) FD_TEST( !contains_slot( votor, slot ) );
+  for( ulong slot=kept_start; slot<=highest; slot++ ) FD_TEST( contains_slot( votor, slot ) );
 
   teardown_votor( votor );
 }

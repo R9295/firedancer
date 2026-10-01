@@ -32,6 +32,13 @@
 #include "../../flamenco/runtime/fd_slot_params.h"
 #include "../../discof/tower/fd_tower_slot_rooted.h"
 #include "../../discof/votor/fd_votor_rooted.h"
+#if FD_HAS_AVX
+#include "../../util/simd/fd_nt_memcpy.h"
+#else
+#define fd_memcpy_tn         fd_memcpy
+#define fd_memcpy_nt_nofence fd_memcpy
+#define _mm_sfence()         do {} while( 0 )
+#endif
 
 /* The shred tile handles shreds from two data sources: shreds generated
    from microblocks from the leader pipeline, and shreds retransmitted
@@ -227,6 +234,7 @@ typedef struct {
   fd_store_t    * store;
   fd_store_map_t  map_join[1];
   int             disk_fd;
+  int             store_maintenance;
 
   fd_gossip_update_message_t gossip_upd_buf[1];
 
@@ -385,6 +393,16 @@ metrics_write( fd_shred_ctx_t * ctx ) {
   FD_MCNT_SET  ( SHRED, SHRED_UNCHAINED_REJECTED,   ctx->metrics->shred_rejected_unchained_cnt );
 
   FD_MCNT_ENUM_COPY( SHRED, SHRED_PROCESSED, ctx->metrics->shred_processing_result             );
+}
+
+static void
+after_credit( fd_shred_ctx_t *    ctx,
+              fd_stem_context_t * stem FD_PARAM_UNUSED,
+              int *               opt_poll_in FD_PARAM_UNUSED,
+              int *               charge_busy ) {
+  if( FD_UNLIKELY( ctx->store_maintenance && ctx->disk_fd>=0 &&
+                   fd_store_disk_maintain( ctx->store, ctx->disk_fd ) ) )
+    *charge_busy = 1;
 }
 
 static inline void
@@ -757,7 +775,7 @@ during_frag( fd_shred_ctx_t * ctx,
       if( FD_LIKELY( include_in_current_batch ) ) {
         if( FD_UNLIKELY( SHOULD_PROCESS_THESE_SHREDS ) ) {
           /* Ugh, yet another memcpy */
-          fd_memcpy( ctx->pending_batch.payload + ctx->pending_batch.pos, entry, entry_sz );
+          fd_memcpy_tn( ctx->pending_batch.payload + ctx->pending_batch.pos, entry, entry_sz );
         }
         ctx->pending_batch.pos            += entry_sz;
         ctx->pending_batch.microblock_cnt += 1UL;
@@ -834,7 +852,7 @@ alpenglow_marker:
            need to be removed (or adjusted). */
         if( FD_UNLIKELY( SHOULD_PROCESS_THESE_SHREDS ) ) {
           /* Ugh, yet another memcpy */
-          fd_memcpy( is_marker ? ctx->pending_batch.raw : ctx->pending_batch.payload + 0UL /* verbose */, entry, entry_sz );
+          fd_memcpy_tn( is_marker ? ctx->pending_batch.raw : ctx->pending_batch.payload + 0UL /* verbose */, entry, entry_sz );
         }
         ctx->pending_batch.slot           = target_slot;
         ctx->pending_batch.pos            = fd_ulong_if( is_marker, entry_sz-sizeof(ulong), entry_sz );
@@ -928,27 +946,9 @@ send_shred( fd_shred_ctx_t                 * ctx,
      to use non-temporal writes here.  We need to make sure we don't
      touch the cache line containing the network headers that we just
      wrote to though.  We know the destination is 64 byte aligned.  */
-  FD_STATIC_ASSERT( sizeof(*hdr)<64UL, non_temporal );
-  /* src[0:sizeof(hdrs)] is invalid, but now we want to copy
-     dest[i]=src[i] for i>=sizeof(hdrs), so it simplifies the code. */
-  uchar const * src = (uchar const *)((ulong)shred - sizeof(fd_ip4_udp_hdrs_t));
-  memcpy( packet+sizeof(fd_ip4_udp_hdrs_t), src+sizeof(fd_ip4_udp_hdrs_t), 64UL-sizeof(fd_ip4_udp_hdrs_t) );
-
-  ulong end_offset = shred_sz + sizeof(fd_ip4_udp_hdrs_t);
-  ulong i;
-  for( i=64UL; end_offset-i<64UL; i+=64UL ) {
-#  if FD_HAS_AVX512
-    _mm512_stream_si512( (void *)(packet+i     ), _mm512_loadu_si512( (void const *)(src+i     ) ) );
-#  else
-    _mm256_stream_si256( (void *)(packet+i     ), _mm256_loadu_si256( (void const *)(src+i     ) ) );
-    _mm256_stream_si256( (void *)(packet+i+32UL), _mm256_loadu_si256( (void const *)(src+i+32UL) ) );
-#  endif
-  }
-  _mm_sfence();
-  fd_memcpy( packet+i, src+i, end_offset-i ); /* Copy the last partial cache line */
-
+  fd_memcpy_nt( packet+sizeof(fd_ip4_udp_hdrs_t), shred, shred_sz );
 #else
-  fd_memcpy( packet+sizeof(fd_ip4_udp_hdrs_t), shred, shred_sz );
+  fd_memcpy   ( packet+sizeof(fd_ip4_udp_hdrs_t), shred, shred_sz );
 #endif
 
   ulong pkt_sz = shred_sz + sizeof(fd_ip4_udp_hdrs_t);
@@ -1232,31 +1232,42 @@ after_frag( fd_shred_ctx_t *    ctx,
 
             FD_LOG_CRIT(( "Shred tile %lu: completed FEC set %lu %u data_sz: %lu exceeds data_max: %lu", ctx->round_robin_id, data_shred->slot, data_shred->fec_set_idx, fec->data_sz + payload_sz, ctx->store->fec_data_max ));
           }
-          fd_memcpy( fec_data + fec->data_sz, fd_shred_data_payload( data_shred ), payload_sz );
+          fd_memcpy_nt_nofence( fec_data + fec->data_sz, fd_shred_data_payload( data_shred ), payload_sz );
           fec->data_sz += payload_sz;
           if( FD_LIKELY( i<32UL ) ) fec->shred_offs[ i ] = (uint)payload_sz +  (i==0UL ? 0U : fec->shred_offs[ i-1UL ]);
         }
+        _mm_sfence();
         fd_store_fec_data_publish( ctx->store, fec );
       }
     }
 
     if( FD_LIKELY( ctx->shred_out_idx!=ULONG_MAX && replay_fwd ) ) { /* firedancer-only */
 
-      /* Send all of the data shred headers we recovered (weren't received) */
+      /* Send all of the data shreds we recovered (weren't received).
+         The chunks are all written before any is published, so the
+         link burst must cover them or a chunk could be reused while
+         an unreliable consumer still sees its old seq. */
+      FD_STATIC_ASSERT( FD_SHRED_STEM_BURST>=32UL, shred_out_burst );
+      ulong missing_chunk[ 32 ];
+      ulong missing_cnt = 0UL;
       for( int i=0; i<32; i++ ) {
         if( fd_uint_extract_bit( set->data_shred_rcvd, i )==0 ) {
           fd_shred_t * const missing = &set->data_shreds[ i ].s[0];
 
-          ulong sig = ((ulong)FD_FEC_RESOLVER_SHRED_COMPLETES << 32UL) | SHRED_SIG_SRC_RECONSTRUCTED;
-
           fd_shred_base_t * shred_msg = (fd_shred_base_t *)fd_chunk_to_laddr( ctx->shred_out_mem, ctx->shred_out_chunk );
-          memcpy(  shred_msg->shred_, missing, fd_shred_sz( missing ) );
+          fd_memcpy_nt_nofence( shred_msg->shred_, missing, fd_shred_sz( missing ) );
           memcpy( &shred_msg->merkle_root, ctx->out_merkle_roots[fset_k].hash, sizeof(fd_hash_t) );
 
-          ulong tspub = fd_frag_meta_ts_comp( fd_tickcount() );
-          fd_stem_publish( stem, ctx->shred_out_idx, sig, ctx->shred_out_chunk, sizeof(fd_shred_base_t), 0UL, ctx->tsorig, tspub );
+          missing_chunk[ missing_cnt++ ] = ctx->shred_out_chunk;
           ctx->shred_out_chunk = fd_dcache_compact_next( ctx->shred_out_chunk, sizeof(fd_shred_base_t), ctx->shred_out_chunk0, ctx->shred_out_wmark );
         }
+      }
+
+      if( FD_LIKELY( missing_cnt ) ) {
+        _mm_sfence();
+        ulong sig   = ((ulong)FD_FEC_RESOLVER_SHRED_COMPLETES << 32UL) | SHRED_SIG_SRC_RECONSTRUCTED;
+        ulong tspub = fd_frag_meta_ts_comp( fd_tickcount() );
+        for( ulong i=0UL; i<missing_cnt; i++ ) fd_stem_publish( stem, ctx->shred_out_idx, sig, missing_chunk[ i ], sizeof(fd_shred_base_t), 0UL, ctx->tsorig, tspub );
       }
 
       /* Replay requires the FEC payload before this notification.
@@ -1403,6 +1414,10 @@ unprivileged_init( fd_topo_t const *      topo,
     FD_TEST( ctx->store->magic==FD_STORE_MAGIC );
     FD_TEST( fd_store_map_ljoin( ctx->store, ctx->map_join ) );
   }
+  /* With rserve disabled, shred:0 remains responsible for punching
+     reclaimed spill pages, and will charge busy. */
+  ctx->store_maintenance = !!ctx->store && !ctx->round_robin_id &&
+                           fd_topo_find_tile( topo, "rserve", 0UL )==ULONG_MAX;
 
   /* If the default partial_depth is ever changed, correspondingly
      change the size of the fd_fec_intra_pool in fd_fec_repair. */
@@ -1503,7 +1518,8 @@ unprivileged_init( fd_topo_t const *      topo,
                                                             sign_out->dcache,
                                                             sign_in->mcache,
                                                             sign_in->dcache,
-                                                            sign_out->mtu ) ) );
+                                                            sign_out->mtu,
+                                                            sign_in->mtu ) ) );
 
   ctx->bench_max_shred_idx           = tile->shred.bench_max_shreds_per_block;
   ulong shred_limit                  = tile->shred.max_shreds_per_block;
@@ -1593,6 +1609,9 @@ unprivileged_init( fd_topo_t const *      topo,
     ctx->shred_out_wmark       = fd_dcache_compact_wmark ( ctx->shred_out_mem, shred_out->dcache, shred_out->mtu );
     ctx->shred_out_chunk       = ctx->shred_out_chunk0;
     FD_TEST( fd_dcache_compact_is_safe( ctx->shred_out_mem, shred_out->dcache, shred_out->mtu, shred_out->depth ) );
+    /* An unreliable consumer ignores credits, so the dcache must hold
+       a full STEM_BURST beyond the mcache depth. */
+    FD_TEST( shred_out->burst>=FD_SHRED_STEM_BURST );
   }
 
   if( FD_LIKELY( ctx->store_out_idx!=ULONG_MAX ) ) { /* frankendancer-only */
@@ -1708,11 +1727,16 @@ populate_allowed_fds( fd_topo_t const *      topo,
 /* See explanation in fd_pack */
 #define STEM_LAZY  (128L*3000L)
 
+/* When leader, poh_shred carries a stream of one microblock per frag
+   and the other links are near empty; keep draining it. */
+#define STEM_STICKY_POLL_MAX (16UL)
+
 #define STEM_CALLBACK_CONTEXT_TYPE  fd_shred_ctx_t
 #define STEM_CALLBACK_CONTEXT_ALIGN alignof(fd_shred_ctx_t)
 
 #define STEM_CALLBACK_DURING_HOUSEKEEPING during_housekeeping
 #define STEM_CALLBACK_METRICS_WRITE       metrics_write
+#define STEM_CALLBACK_AFTER_CREDIT        after_credit
 #define STEM_CALLBACK_BEFORE_FRAG         before_frag
 #define STEM_CALLBACK_DURING_FRAG         during_frag
 #define STEM_CALLBACK_AFTER_FRAG          after_frag

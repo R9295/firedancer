@@ -535,7 +535,6 @@ FD_UNIT_TEST( bundle_client_reset ) {
   FD_TEST( state->rtt->is_rtt_valid==0 );
   FD_TEST( state->auther.state==FD_BUNDLE_AUTH_STATE_DONE_WAIT );
   FD_TEST( state->auther.needs_poll==0 );
-  FD_TEST( state->grpc_client->ssl_hs_done==0 );
   FD_TEST( state->grpc_client->h2_hs_done==1 );
   FD_TEST( state->grpc_client->stream_cnt==2 );
 
@@ -553,7 +552,6 @@ FD_UNIT_TEST( bundle_client_reset ) {
   FD_TEST( state->rtt->is_rtt_valid==0 );
   FD_TEST( state->auther.state==FD_BUNDLE_AUTH_STATE_REQ_CHALLENGE );
   FD_TEST( state->auther.needs_poll==1 );
-  FD_TEST( state->grpc_client->ssl_hs_done==0 );
   FD_TEST( state->grpc_client->h2_hs_done==0 );
   FD_TEST( state->grpc_client->stream_cnt==0 );
 
@@ -1492,7 +1490,8 @@ FD_UNIT_TEST( deque_overflow_guard ) {
 }
 
 /* Verify that an HTTP error on each request type clears the
-   corresponding wait flag so that step_reconnect can retry. */
+   corresponding wait flag, restarts authentication, and resets the
+   connection. */
 
 FD_UNIT_TEST( request_failed_clears_wait ) {
   test_bundle_env_t env[1];
@@ -1507,22 +1506,34 @@ FD_UNIT_TEST( request_failed_clears_wait ) {
 
   /* GetBlockBuilderFeeInfo: builder_info_wait should be cleared */
   state->builder_info_wait = 1;
+  state->auther.state      = FD_BUNDLE_AUTH_STATE_DONE_WAIT;
+  state->defer_reset       = 0;
   fd_bundle_client_grpc_rx_end( state, FD_BUNDLE_CLIENT_REQ_Bundle_GetBlockBuilderFeeInfo, &hdrs );
   FD_TEST( state->builder_info_wait==0 );
+  FD_TEST( state->auther.state==FD_BUNDLE_AUTH_STATE_REQ_CHALLENGE );
+  FD_TEST( state->defer_reset==1 );
 
   /* SubscribePackets: packet_subscription_wait should be cleared */
   state->packet_subscription_wait = 1;
   state->packet_subscription_live = 1;
+  state->auther.state             = FD_BUNDLE_AUTH_STATE_DONE_WAIT;
+  state->defer_reset              = 0;
   fd_bundle_client_grpc_rx_end( state, FD_BUNDLE_CLIENT_REQ_Bundle_SubscribePackets, &hdrs );
   FD_TEST( state->packet_subscription_wait==0 );
   FD_TEST( state->packet_subscription_live==0 );
+  FD_TEST( state->auther.state==FD_BUNDLE_AUTH_STATE_REQ_CHALLENGE );
+  FD_TEST( state->defer_reset==1 );
 
   /* SubscribeBundles: bundle_subscription_wait should be cleared */
   state->bundle_subscription_wait = 1;
   state->bundle_subscription_live = 1;
+  state->auther.state             = FD_BUNDLE_AUTH_STATE_DONE_WAIT;
+  state->defer_reset              = 0;
   fd_bundle_client_grpc_rx_end( state, FD_BUNDLE_CLIENT_REQ_Bundle_SubscribeBundles, &hdrs );
   FD_TEST( state->bundle_subscription_wait==0 );
   FD_TEST( state->bundle_subscription_live==0 );
+  FD_TEST( state->auther.state==FD_BUNDLE_AUTH_STATE_REQ_CHALLENGE );
+  FD_TEST( state->defer_reset==1 );
 
   test_bundle_env_destroy( env );
 }

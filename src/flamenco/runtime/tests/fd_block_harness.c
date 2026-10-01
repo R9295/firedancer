@@ -140,7 +140,7 @@ static void
 fd_solfuzz_pb_block_ctx_destroy( fd_solfuzz_runner_t * runner ) {
   fd_banks_stake_delegations_evict_bank_fork( runner->banks, runner->bank );
 
-  runner->bank->stake_rewards_fork_id = UCHAR_MAX;
+  runner->bank->stake_rewards_fork_id = USHORT_MAX;
   fd_stake_rewards_clear( fd_bank_stake_rewards_modify( runner->bank ) );
 
   fd_progcache_reset( runner->progcache->join );
@@ -152,9 +152,6 @@ fd_solfuzz_pb_block_ctx_destroy( fd_solfuzz_runner_t * runner ) {
   int charge_busy = 0;
   fd_accdb_background( runner->accdb, &charge_busy );
 
-  /* Compact the progcache allocator so empty superblocks are returned
-     to the workspace.  Required for the leak check to pass. */
-  fd_alloc_compact( runner->progcache->join->alloc );
 }
 
 /* Sets up block execution context from an input test case to execute
@@ -388,7 +385,7 @@ fd_solfuzz_pb_block_ctx_create( fd_solfuzz_runner_t *                runner,
     if( FD_UNLIKELY( msg_sz==ULONG_MAX ) ) {
       return NULL;
     }
-    txn->payload_sz = msg_sz;
+    txn->payload_sz = (ushort)msg_sz;
 
     // Reject any transactions that cannot be parsed
     if( FD_UNLIKELY( !fd_txn_parse( txn->payload, msg_sz, TXN( txn ), NULL ) ) ) {
@@ -468,13 +465,13 @@ fd_solfuzz_block_ctx_exec( fd_solfuzz_runner_t * runner,
       txn_out->err.exec_err = res;
 
       if( FD_UNLIKELY( !txn_out->err.is_committable ) ) {
-        fd_runtime_cancel_txn( runtime, NULL, NULL, txn_out, 0 );
+        fd_runtime_cancel_txn( runtime, NULL, NULL, txn_out );
         has_err = 1;
         continue;
       }
 
       /* Finalize the transaction */
-      fd_runtime_commit_txn( runtime, runner->bank, NULL, txn_out, 0 );
+      fd_runtime_commit_txn( runtime, runner->bank, NULL, txn_out );
 
       if( FD_UNLIKELY( !txn_out->err.is_committable ) ) {
         has_err = 1;
@@ -486,7 +483,7 @@ fd_solfuzz_block_ctx_exec( fd_solfuzz_runner_t * runner,
        updated in the blockhash queue. */
     runner->bank->f.poh = *poh;
     /* Finalize the block */
-    fd_runtime_block_execute_finalize( runner->bank, runner->accdb, capture_ctx, NULL, 0UL );
+    fd_runtime_block_execute_finalize( runner->bank, runner->accdb, capture_ctx, NULL, (ushort)0 );
 
     return !has_err;
   } FD_SPAD_FRAME_END;

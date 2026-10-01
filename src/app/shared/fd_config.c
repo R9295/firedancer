@@ -339,7 +339,7 @@ fd_config_fill( fd_config_t * config,
 
   if( FD_UNLIKELY( !strcmp( config->paths.identity_key, "" ) ) ) {
     /* Development binaries generate an identity key on boot. */
-    if( FD_UNLIKELY( config->is_live_cluster && !dev ) ) FD_LOG_ERR(( "configuration file must specify [consensus.identity_path] when joining a live cluster" ));
+    if( FD_UNLIKELY( config->is_live_cluster && !dev ) ) FD_LOG_ERR(( "configuration file must specify [paths.identity_key] when joining a live cluster" ));
 
     FD_TEST( fd_cstr_printf_check( config->paths.identity_key,
                                    sizeof(config->paths.identity_key),
@@ -531,10 +531,7 @@ fd_config_validatef( fd_configf_t const * config ) {
     FD_LOG_ERR(( "`development.genesis.max_file_size_mib` must be at most %lu", FD_GENESIS_MAX_FILE_SIZE_MIB ));
   }
 
-  CFG_HAS_NON_ZERO( runtime.program_cache.mean_cache_entry_size );
-  CFG_HAS_NON_ZERO( runtime.program_cache.heap_size_mib );
-  if( config->runtime.program_cache.mean_cache_entry_size < 4096 ) { FD_LOG_ERR(( "`%s` must be >= 4096", "runtime.program_cache.mean_cache_entry_size" )); }
-  if( config->runtime.program_cache.heap_size_mib < 32 ) { FD_LOG_ERR(( "`%s` must be >= 32", "runtime.program_cache.heap_size_mib" )); }
+  CFG_HAS_NON_ZERO( runtime.program_cache_size_mib );
 }
 
 static void
@@ -679,8 +676,6 @@ fd_config_validate( fd_config_t const * config ) {
   CFG_HAS_NON_ZERO ( development.bench.benchg_tile_count );
   CFG_HAS_NON_ZERO ( development.bench.benchs_tile_count );
   CFG_HAS_NON_EMPTY( development.bench.affinity );
-
-  CFG_HAS_NON_ZERO( development.bundle.ssl_heap_size_mib );
 }
 
 #undef CFG_HAS_NON_EMPTY

@@ -159,9 +159,10 @@ src/flamenco/runtime/tests/run_ledger_backtest.sh -l programdata-poison -m 10000
 src/flamenco/runtime/tests/run_ledger_backtest.sh -l double_disinflation_rate -m 2000000 -e 840
 src/flamenco/runtime/tests/run_ledger_backtest.sh -l double_disinflation_rate_snapshot -m 2000000 -e 840
 src/flamenco/runtime/tests/run_ledger_backtest.sh -l relax_fee_payer_constraint -m 2000000 -e 400
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l snapshot-hard-fork -m 2000000 -e 162
 
 # Alpenglow
-src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-legacy-vote-ixs --alpenglow -m 2000000 -e 126
-src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-deactivated-stake --alpenglow -m 2000000 -e 810
-src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-leader-credits --alpenglow -m 2000000 -e 3915
-src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-alpenclock-lamports --alpenglow -m 2000000 -e 280
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-legacy-vote-ixs --alpenglow --shred-version 40081 -m 2000000 -e 126
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-deactivated-stake --alpenglow --shred-version 14972 -m 2000000 -e 810
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-leader-credits --alpenglow --shred-version 49885 -m 2000000 -e 3915
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-alpenclock-lamports --alpenglow --shred-version 27708 -m 2000000 -e 280

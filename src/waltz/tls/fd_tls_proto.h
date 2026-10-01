@@ -58,7 +58,9 @@ typedef struct fd_tls_ext_supported_groups fd_tls_ext_supported_groups_t;
    Type: FD_TLS_EXT_TYPE_SIGNATURE_ALGORITHMS */
 
 struct fd_tls_ext_signature_algorithms {
-  uchar ed25519 : 1;
+  uchar ed25519                : 1;
+  uchar ecdsa_secp256r1_sha256 : 1;
+  uchar ecdsa_secp384r1_sha384 : 1;
 };
 
 typedef struct fd_tls_ext_signature_algorithms fd_tls_ext_signature_algorithms_t;
@@ -76,7 +78,7 @@ typedef struct fd_tls_key_share fd_tls_key_share_t;
 
    This structure can have 3 subtly different meanings:
      (!!buf) & (!!bufsz)   Extension present, non-zero sz
-     (!!buf) & ( !bufsz)   Extension present, zero sz
+     (!!buf) & ( !bufsz)   Extension present, zero sz
      ( !buf) & ( !bufsz)   Extension absent
 
    Notably,
@@ -126,6 +128,7 @@ struct fd_tls_client_hello {
   fd_tls_ext_server_name_t          server_name;
   fd_tls_ext_supported_groups_t     supported_groups;
   fd_tls_ext_signature_algorithms_t signature_algorithms;
+  fd_tls_ext_signature_algorithms_t signature_algorithms_cert;
   fd_tls_key_share_t                key_share;
   fd_tls_ext_quic_tp_t              quic_tp;
   fd_tls_ext_alpn_t                 alpn;
@@ -152,17 +155,19 @@ typedef struct fd_tls_server_hello fd_tls_server_hello_t;
 struct fd_tls_enc_ext {
   fd_tls_ext_quic_tp_t quic_tp;
   fd_tls_ext_alpn_t    alpn;
+  uint                 server_name:1;
 };
 
 typedef struct fd_tls_enc_ext fd_tls_enc_ext_t;
 
 /* fd_tls_cert_verify_t describes a CertificateVerify (RFC 8446, Section
-   4.4.3).  Only supports TLS signature algorithms with 64 byte
-   signature size (e.g. Ed25519). */
+   4.4.3).  Supports Ed25519 (64 byte sig) and ECDSA-P256 (DER encoded,
+   up to 73 bytes). */
 
 struct fd_tls_cert_verify {
-  ushort sig_alg;  /* FD_TLS_SIGNATURE_{...} */
-  uchar  sig[ 64 ];
+  ushort algorithm;      /* FD_TLS_SIGNATURE_{...} */
+  ushort signature_len;
+  uchar  signature[ 73 ];
 };
 
 typedef struct fd_tls_cert_verify fd_tls_cert_verify_t;
@@ -190,19 +195,20 @@ typedef struct fd_tls_finished fd_tls_finished_t;
 
 /* TLS extension IDs */
 
-#define FD_TLS_EXT_SERVER_NAME           ((ushort) 0)
-#define FD_TLS_EXT_SUPPORTED_GROUPS      ((ushort)10)
-#define FD_TLS_EXT_SIGNATURE_ALGORITHMS  ((ushort)13)
-#define FD_TLS_EXT_ALPN                  ((ushort)16)
-#define FD_TLS_EXT_CLIENT_CERT_TYPE      ((ushort)19)
-#define FD_TLS_EXT_SERVER_CERT_TYPE      ((ushort)20)
-#define FD_TLS_EXT_SUPPORTED_VERSIONS    ((ushort)43)
-#define FD_TLS_EXT_KEY_SHARE             ((ushort)51)
-#define FD_TLS_EXT_KEY_SHARE             ((ushort)51)
-#define FD_TLS_EXT_QUIC_TRANSPORT_PARAMS ((ushort)57)
+#define FD_TLS_EXT_SERVER_NAME               ((ushort) 0)
+#define FD_TLS_EXT_SUPPORTED_GROUPS          ((ushort)10)
+#define FD_TLS_EXT_SIGNATURE_ALGORITHMS      ((ushort)13)
+#define FD_TLS_EXT_ALPN                      ((ushort)16)
+#define FD_TLS_EXT_CLIENT_CERT_TYPE          ((ushort)19)
+#define FD_TLS_EXT_SERVER_CERT_TYPE          ((ushort)20)
+#define FD_TLS_EXT_SUPPORTED_VERSIONS        ((ushort)43)
+#define FD_TLS_EXT_SIGNATURE_ALGORITHMS_CERT ((ushort)50)
+#define FD_TLS_EXT_KEY_SHARE                 ((ushort)51)
+#define FD_TLS_EXT_QUIC_TRANSPORT_PARAMS     ((ushort)57)
 
 /* TLS Alert Protocol */
 
+#define FD_TLS_ALERT_CLOSE_NOTIFY                    ((uchar)  0)
 #define FD_TLS_ALERT_UNEXPECTED_MESSAGE              ((uchar) 10)
 #define FD_TLS_ALERT_BAD_RECORD_MAC                  ((uchar) 20)
 #define FD_TLS_ALERT_RECORD_OVERFLOW                 ((uchar) 22)
@@ -236,7 +242,9 @@ typedef struct fd_tls_finished fd_tls_finished_t;
 
 /* TLS signature scheme IDs */
 
-#define FD_TLS_SIGNATURE_ED25519 ((ushort)0x0807)
+#define FD_TLS_SIGNATURE_ECDSA_SECP256R1_SHA256 ((ushort)0x0403)
+#define FD_TLS_SIGNATURE_ECDSA_SECP384R1_SHA384 ((ushort)0x0503)
+#define FD_TLS_SIGNATURE_ED25519                ((ushort)0x0807)
 
 /* TLS supported_groups extension */
 
@@ -261,6 +269,7 @@ typedef struct fd_tls_finished fd_tls_finished_t;
 #define FD_TLS_MSG_CERT_REQ           ((uchar) 13)
 #define FD_TLS_MSG_CERT_VERIFY        ((uchar) 15)
 #define FD_TLS_MSG_FINISHED           ((uchar) 20)
+#define FD_TLS_MSG_KEY_UPDATE            ((uchar) 24)
 
 /* Serialization related **********************************************/
 
@@ -306,9 +315,9 @@ FD_PROTOTYPES_BEGIN
 
 #define STATIC_SERDE( NAME, TYPE_T )                                   \
   static inline long                                                   \
-  fd_tls_decode_##NAME ( TYPE_T *     out,                             \
-                         uchar const * wire,                            \
-                         ulong        wire_sz ) {                      \
+  fd_tls_decode_##NAME( TYPE_T *      out,                             \
+                        uchar const * wire,                            \
+                        ulong         wire_sz ) {                      \
     if( FD_UNLIKELY( wire_sz < sizeof(TYPE_T) ) )                      \
       return -(long)FD_TLS_ALERT_DECODE_ERROR;                         \
     memcpy( out, wire, sizeof(TYPE_T) );                               \
@@ -404,13 +413,13 @@ fd_tls_encode_hello_retry_request( fd_tls_server_hello_t const * in,
 
 long
 fd_tls_decode_enc_ext( fd_tls_enc_ext_t * out,
-                       uchar const *      wire,
-                       ulong              wire_sz );
+                       uchar const *            wire,
+                       ulong                    wire_sz );
 
 long
 fd_tls_encode_enc_ext( fd_tls_enc_ext_t const * in,
-                       uchar *                  wire,
-                       ulong                    wire_sz );
+                       uchar *                        wire,
+                       ulong                          wire_sz );
 
 long
 fd_tls_encode_cert_x509( uchar const * x509,
@@ -418,6 +427,10 @@ fd_tls_encode_cert_x509( uchar const * x509,
                          uchar *       wire,
                          ulong         wire_sz );
 
+long
+fd_tls_decode_cert_req( fd_tls_ext_signature_algorithms_t * out,
+                        uchar const *                       wire,
+                        ulong                               wire_sz );
 
 long
 fd_tls_decode_cert_verify( fd_tls_cert_verify_t * out,
@@ -431,7 +444,7 @@ fd_tls_encode_cert_verify( fd_tls_cert_verify_t const * in,
 
 static inline void
 fd_tls_cert_verify_bswap( fd_tls_cert_verify_t * x ) {
-  x->sig_alg = fd_ushort_bswap( x->sig_alg );
+  x->algorithm = fd_ushort_bswap( x->algorithm );
 }
 
 long
@@ -490,11 +503,16 @@ fd_tls_encode_ext_alpn( fd_tls_ext_alpn_t const * in,
                         uchar *                   wire,
                         ulong                     wire_sz );
 
-/* fd_tls_extract_cert_pubkey extracts the public key of a TLS cert
-   message. */
+/* fd_tls_extract_cert_pubkey validates the initial-handshake Certificate
+   envelope and extracts its leaf public key.  Requires an empty request
+   context and a nonempty, exactly framed certificate_list.  Rejects
+   CertificateEntry extensions, which our CH and CR do not solicit.
+   Does not authenticate the X.509 chain or establish trust. */
 
 struct fd_tls_extract_cert_pubkey_res {
   uchar const * pubkey;
+  ulong         pubkey_len;  /* 32 for Ed25519, 65 for ECDSA P-256 uncompressed */
+  uchar         key_type;    /* FD_TLS_KEY_ED25519 or FD_TLS_KEY_ECDSA_P256 */
   uint          alert;
   ushort        reason;
 };

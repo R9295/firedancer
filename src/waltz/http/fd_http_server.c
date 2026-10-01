@@ -19,11 +19,9 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 
-#if FD_HAS_ZSTD
 #define FD_HTTP_ZSTD_COMPRESSION_LEVEL 3
 #define ZSTD_STATIC_LINKING_ONLY
 #include <zstd.h>
-#endif
 
 #define POOL_NAME       ws_conn_pool
 #define POOL_T          struct fd_http_server_ws_connection
@@ -123,9 +121,7 @@ fd_http_server_footprint( fd_http_server_params_t params ) {
   l = FD_LAYOUT_APPEND( l, 1UL,                                       params.max_ws_recv_frame_len*params.max_ws_connection_cnt                                          );
   l = FD_LAYOUT_APPEND( l, alignof( struct fd_http_server_ws_frame ), params.max_ws_send_frame_cnt*params.max_ws_connection_cnt*sizeof( struct fd_http_server_ws_frame ) );
   l = FD_LAYOUT_APPEND( l, 1UL,                                       params.outgoing_buffer_sz                                                                          );
-#if FD_HAS_ZSTD
   l = FD_LAYOUT_APPEND( l, 16UL,                                      ZSTD_estimateCCtxSize( FD_HTTP_ZSTD_COMPRESSION_LEVEL )                                            );
-#endif
   return FD_LAYOUT_FINI( l, fd_http_server_align() );
 }
 
@@ -165,9 +161,7 @@ fd_http_server_new( void *                     shmem,
   uchar * _ws_recv_bytes  = FD_SCRATCH_ALLOC_APPEND( l,  1UL,                                          params.max_ws_recv_frame_len*params.max_ws_connection_cnt                            );
   struct fd_http_server_ws_frame * _ws_send_frames = FD_SCRATCH_ALLOC_APPEND( l, alignof(struct fd_http_server_ws_frame), params.max_ws_send_frame_cnt*params.max_ws_connection_cnt*sizeof(struct fd_http_server_ws_frame) );
   http->oring             = FD_SCRATCH_ALLOC_APPEND( l,  1UL,                                          params.outgoing_buffer_sz                                                            );
-#if FD_HAS_ZSTD
   uchar * _zstd_ctx       = FD_SCRATCH_ALLOC_APPEND( l,  16UL,                                         ZSTD_estimateCCtxSize( FD_HTTP_ZSTD_COMPRESSION_LEVEL )                              );
-#endif
   http->oring_sz       = params.outgoing_buffer_sz;
   http->stage_err      = 0;
   http->stage_off      = 0UL;
@@ -187,13 +181,11 @@ fd_http_server_new( void *                     shmem,
   http->send_buffer_sz        = params.send_buffer_sz;
   http->compress_websocket    = params.compress_websocket;
 
-#if FD_HAS_ZSTD
   http->zstd_ctx = ZSTD_initStaticCCtx( _zstd_ctx, ZSTD_estimateCCtxSize( FD_HTTP_ZSTD_COMPRESSION_LEVEL ) );
   FD_TEST( http->zstd_ctx );
   ulong err = ZSTD_CCtx_setParameter( http->zstd_ctx, 100, FD_HTTP_ZSTD_COMPRESSION_LEVEL );
   if( FD_UNLIKELY( ZSTD_isError( err ) ) )
       FD_LOG_ERR(( "ZSTD_CCtx_setParameter failed (%s)", ZSTD_getErrorName( err ) ) );
-#endif
 
   http->conns = conn_pool_join( conn_pool_new( conn_pool, params.max_connection_cnt ) );
   conn_treap_join( conn_treap_new( http->conn_treap, params.max_connection_cnt ) );
@@ -413,6 +405,41 @@ fd_http_server_etag_matches( char const * if_none_match,
   return matched;
 }
 
+int
+fd_http_server_accept_encoding_q( char const * accept_encoding,
+                                  char const * coding ) {
+  ulong coding_len = strlen( coding );
+  char const * p = accept_encoding;
+  while( *p ) {
+    while( *p==' ' || *p=='\t' || *p==',' ) p++;
+    if( !*p ) break;
+    char const * tok = p;
+    while( *p && *p!=',' && *p!=';' && *p!=' ' && *p!='\t' ) p++;
+    ulong tok_len = (ulong)(p-tok);
+    char const * end = strchr( p, ',' );
+    if( !end ) end = p+strlen( p );
+    if( tok_len==coding_len && !strncasecmp( tok, coding, coding_len ) ) {
+      char const * q = p;
+      while( q<end ) { /* ;name=value parameters */
+        if( *q++!=';' ) continue;
+        while( q<end && (*q==' ' || *q=='\t') ) q++;
+        if( end-q<2L || (*q!='q' && *q!='Q') || q[ 1 ]!='=' ) continue;
+        q += 2;
+        /* qvalue = ( "0" [ "." 0*3DIGIT ] ) / ( "1" [ "." 0*3"0" ] ) */
+        int weight = 0;
+        if(      q<end && *q=='1' ) { weight = 1000; q++; }
+        else if( q<end && *q=='0' ) q++;
+        else return 0;
+        if( q<end && *q=='.' ) for( int scale=100; ++q<end && *q>='0' && *q<='9' && scale; scale/=10 ) weight += (*q-'0')*scale;
+        return fd_int_min( weight, 1000 );
+      }
+      return 1000;
+    }
+    p = end;
+  }
+  return 0;
+}
+
 static void
 close_conn( fd_http_server_t * http,
             ulong              conn_idx,
@@ -574,6 +601,7 @@ accept_conns( fd_http_server_t * http ) {
     http->conns[ conn_id ].state                  = FD_HTTP_SERVER_CONNECTION_STATE_READING;
     http->conns[ conn_id ].request_bytes_read     = 0UL;
     http->conns[ conn_id ].request_bytes_off      = 0UL;
+    http->conns[ conn_id ].request_expected_len   = 0UL;
     http->conns[ conn_id ].response_bytes_written = 0UL;
 
     if( FD_UNLIKELY( http->callbacks.open ) ) {
@@ -586,6 +614,10 @@ accept_conns( fd_http_server_t * http ) {
 #endif
   }
 }
+
+/* last_len is the request length at the previous parse that returned
+   incomplete, or 0: picohttpparser then only scans the new bytes for
+   the end of the headers (its slowloris countermeasure). */
 
 static void
 parse_conn_http( fd_http_server_t * http,
@@ -669,11 +701,13 @@ parse_conn_http( fd_http_server_t * http,
 
 
   if( FD_UNLIKELY( conn->request_bytes_read-conn->request_bytes_off<(ulong)result+content_len ) ) {
-    return; /* Request still partial, wait for more data */
+    conn->request_expected_len = (ulong)result+content_len; /* body pending, no need to reparse until it is all here */
+    return;
   }
 
   char content_type_nul_terminated[ 128 ] = {0};
   char accept_encoding_nul_terminated[ 128 ] = {0};
+  ulong accept_encoding_len = 0UL;
   for( ulong i=0UL; i<num_headers; i++ ) {
     if( FD_LIKELY( headers[ i ].name_len==12UL && !strncasecmp( headers[ i ].name, "Content-Type", 12UL ) ) ) {
       if( FD_UNLIKELY( headers[ i ].value_len>(sizeof(content_type_nul_terminated)-1UL) ) ) {
@@ -681,15 +715,17 @@ parse_conn_http( fd_http_server_t * http,
         return;
       }
       memcpy( content_type_nul_terminated, headers[ i ].value, headers[ i ].value_len );
-      break;
-    }
-
-    if( FD_LIKELY( headers[ i ].name_len==15UL && !strncasecmp( headers[ i ].name, "Accept-Encoding", 15UL ) ) ) {
-      if( FD_UNLIKELY( headers[ i ].value_len>(sizeof(accept_encoding_nul_terminated)-1UL) ) ) {
+      content_type_nul_terminated[ headers[ i ].value_len ] = '\0';
+    } else if( FD_LIKELY( headers[ i ].name_len==15UL && !strncasecmp( headers[ i ].name, "Accept-Encoding", 15UL ) ) ) {
+      /* repeated list fields combine (RFC 9110 s5.3) */
+      ulong sep_len = accept_encoding_len ? 2UL : 0UL;
+      if( FD_UNLIKELY( accept_encoding_len+sep_len+headers[ i ].value_len>sizeof(accept_encoding_nul_terminated)-1UL ) ) {
         close_conn( http, conn_idx, FD_HTTP_SERVER_CONNECTION_CLOSE_BAD_REQUEST );
         return;
       }
-      memcpy( accept_encoding_nul_terminated, headers[ i ].value, headers[ i ].value_len );
+      if( FD_LIKELY( sep_len ) ) { memcpy( accept_encoding_nul_terminated+accept_encoding_len, ", ", 2UL ); accept_encoding_len += 2UL; }
+      memcpy( accept_encoding_nul_terminated+accept_encoding_len, headers[ i ].value, headers[ i ].value_len );
+      accept_encoding_len += headers[ i ].value_len;
     }
   }
 
@@ -729,14 +765,12 @@ parse_conn_http( fd_http_server_t * http,
     conn->request_bytes_len = conn->request_bytes_off+(ulong)result;
     conn->upgrade_websocket = 1;
 
-#if FD_HAS_ZSTD
     for( ulong i=0UL; i<num_headers; i++ ) {
       if( FD_LIKELY( headers[ i ].name_len==22UL && !strncasecmp( headers[ i ].name, "Sec-WebSocket-Protocol", 22UL ) &&
                      headers[ i ].value_len==13UL && !strncmp( headers[ i ].value, "compress-zstd", 13UL ) ) ) {
         compress_websocket = 1;
       }
     }
-#endif
 
     char const * sec_websocket_key = NULL;
     for( ulong i=0UL; i<num_headers; i++ ) {
@@ -805,8 +839,9 @@ parse_conn_http( fd_http_server_t * http,
     }
   }
 
-  conn->keep_alive       = minor_version==1 && !connection_close && !conn->upgrade_websocket;
-  conn->request_consumed = conn->request_bytes_off+(ulong)result+content_len;
+  conn->keep_alive           = minor_version==1 && !connection_close && !conn->upgrade_websocket;
+  conn->request_consumed     = conn->request_bytes_off+(ulong)result+content_len;
+  conn->request_expected_len = 0UL;
 
   fd_http_server_request_t request = {
     .connection_id             = conn_idx,
@@ -882,7 +917,14 @@ read_conn_http( fd_http_server_t * http,
   http->metrics.bytes_read += (ulong)sz;
   conn->request_bytes_read += (ulong)sz;
 
-  parse_conn_http( http, conn_idx, conn->request_bytes_read-(ulong)sz );
+  /* Once the headers parsed, a non-zero last_len would make
+     picohttpparser scan the body for their terminator and never finish */
+  if( conn->request_expected_len ) {
+    if( conn->request_bytes_read<conn->request_expected_len ) return;
+    parse_conn_http( http, conn_idx, 0UL );
+  } else {
+    parse_conn_http( http, conn_idx, conn->request_bytes_read-(ulong)sz );
+  }
 
   /* A full buffer may hold multiple valid pipelined requests, so it is
      only oversized if parsing left it full and still incomplete */
@@ -1157,6 +1199,11 @@ write_conn_http( fd_http_server_t * http,
         ulong content_encoding_len;
         FD_TEST( fd_cstr_printf_check( header_buf+response_len, sizeof( header_buf )-response_len, &content_encoding_len, "Content-Encoding: %s\r\n", conn->response.content_encoding ) );
         response_len += content_encoding_len;
+      }
+      if( FD_LIKELY( conn->response.vary ) ) {
+        ulong vary_len;
+        FD_TEST( fd_cstr_printf_check( header_buf+response_len, sizeof( header_buf )-response_len, &vary_len, "Vary: %s\r\n", conn->response.vary ) );
+        response_len += vary_len;
       }
       if( FD_LIKELY( conn->response.location[ 0 ] ) ) {
         ulong location_len;
@@ -1565,7 +1612,6 @@ fd_http_ws_compress_maybe( fd_http_server_t * http ) {
      disabled in the config */
   if( FD_LIKELY( !http->compress_websocket || http->stage_len <= 200 || http->stage_err ) ) return 0;
 
-#if FD_HAS_ZSTD
   ulong worst_case_compressed_sz = ZSTD_compressBound( http->stage_len );
   fd_http_server_reserve( http, worst_case_compressed_sz );
 
@@ -1582,9 +1628,6 @@ fd_http_ws_compress_maybe( fd_http_server_t * http ) {
   http->stage_comp_len = compressed_sz;
 
   return 1;
-#else
-  return 0;
-#endif
 }
 
 uchar *

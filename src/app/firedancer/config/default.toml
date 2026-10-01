@@ -725,16 +725,11 @@ telemetry = true
     # or test environments to decrease memory usage or test edge cases.
     max_fork_width = 32
 
+    # Total size of the program cache workspace in MiB.
+    #
     # The program cache pre-loads frequently executed programs for
     # faster transaction execution.
-    [runtime.program_cache]
-        # The size of the loaded program cache in MiB.
-        heap_size_mib = 768
-
-        # The mean expected heap utilization of a cache entry.  Controls
-        # the size of metadata structures (e.g. cache entry table).  It
-        # is not recommended to change this setting.
-        mean_cache_entry_size = 131072
+    program_cache_size_mib = 2048
 
 # CPU cores in Firedancer are carefully managed.  Where a typical
 # program lets the operating system scheduler determine which threads to
@@ -801,6 +796,13 @@ telemetry = true
     # preceded by a 'f' like 'f5' which means the next five tiles are
     # not pinned and will float on the original core set that Firedancer
     # was started with.
+    #
+    # A core preceded by an 's' like 's5' is shared.  The tile is homed
+    # at core 5, so its memory is placed on that core's NUMA node, but
+    # the kernel may schedule it on any shared core of that node.  A
+    # shared core is not claimed exclusively, so more than one tile may
+    # name it.  This is for tiles that are idle in your configuration
+    # and would otherwise hold a core a busy tile could use.
     #
     # For example, if Firedancer has six tiles numbered 0..5, and the
     # affinity is specified as
@@ -871,7 +873,10 @@ telemetry = true
     #
     # If snapshot production is disabled, the validator will have to
     # download a snapshot on every restart.
-    enable_snapshot_production = true
+    #
+    # WARNING: This feature is not currently supported and should not be
+    # enabled.  It may reduce the stability of the running validator.
+    enable_snapshot_production = false
 
     # How many net tiles to run.  This is configurable and designed to
     # scale out for future network conditions, but there is no need to
@@ -973,7 +978,7 @@ telemetry = true
     execrp_tile_count = 10
 
     # How many snapshot decompressor tiles to run.
-    snapdc_tile_count = 1
+    snapdc_tile_count = 2
 
     # How many snapshot compressor tiles to run.  These tiles do not
     # consume CPU when idle.  If set to 0, snapshot creation and all
@@ -2069,6 +2074,18 @@ telemetry = true
         # automatically.
         affinity = "auto"
 
+        # Which kind of transaction the benchg tiles generate.  One of,
+        #
+        #  "noop" (default)
+        #   Tiny transactions without instructions.
+        #
+        #  "sol-transfer"
+        #   Basic SOL transfers.
+        #
+        #  "ptoken-transfer"
+        #   SPL Token transfers using the p-token program.
+        transaction_mode = "noop"
+
         # Solana has a consensus-agreed maximum number of compute units
         # per block, on the order of 50,000,000, which works out to
         # around 83,000 transfers a second since each consumes about
@@ -2108,13 +2125,6 @@ telemetry = true
         # frame buffer, and a Protobuf encode buffer.
         buffer_size_kib = 2048
 
-        # SSL library heap size in MiB.
-        #
-        # When connecting to an HTTPS bundle endpoint, the SSL library
-        # dynamic allocations in a fixed size heap region.  This option
-        # controls the size of that region.
-        ssl_heap_size_mib = 64
-
         # Log TLS encryption keys for block engine connection.  An empty
         # string (the default) disables key logging.
         #
@@ -2140,16 +2150,12 @@ telemetry = true
         # development purposes.
         report_transactions = false
 
-        # Whether to emit detailed post-execution account data for
-        # every dispatched transaction (committable or not).  Each
-        # event carries the txn result, compute/cost/fee metadata,
-        # and the post-state of every account the transaction
-        # modified, along with its writable and readonly account
-        # lock sets.  Primarily useful for development and debugging
-        # mismatches between validator clients.  This generates a
-        # very high volume of events and should only be used for
-        # debugging and development purposes.
-        report_transaction_diffs = false
+        # Whether to emit the runtime events during replay
+        # Primarily useful for development and debugging mismatches
+        # between validator clients.  This generates a very high
+        # volume of events and should only be used for debugging and
+        # development purposes.
+        report_runtime_diffs = false
 
     # The following options relate to the 'firedance-dev pktgen' tool
     # only.  pktgen tests net tile transmit throughput by generating a

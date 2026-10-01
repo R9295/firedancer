@@ -28,6 +28,10 @@ mock_txncache_snapin_scratch( fd_txncache_t * txncache,
 void
 mock_slot_delta_parser_init( fd_slot_delta_parser_t * parser );
 
+static fd_txncache_fork_id_t
+record_txncache_attach_child( fd_txncache_t *       txncache,
+                              fd_txncache_fork_id_t parent_fork_id );
+
 static ulong
 test_stem_publish( fd_stem_context_t * stem,
                    ulong               out_idx,
@@ -62,7 +66,9 @@ test_stem_publish( fd_stem_context_t * stem,
 #define fd_slot_delta_parser_init     mock_slot_delta_parser_init
 #define fd_stem_publish               test_stem_publish
 #define fd_ssparse_advance            test_ssparse_advance
+#define fd_txncache_attach_child      record_txncache_attach_child
 #include "fd_snapin_tile.c"
+#undef fd_txncache_attach_child
 #undef fd_ssparse_advance
 #undef fd_stem_publish
 #undef fd_slot_delta_parser_init
@@ -178,6 +184,18 @@ mock_txncache_snapin_scratch( fd_txncache_t * txncache,
   return fd_txncache_snapin_scratch( txncache, out_sz );
 }
 
+static fd_txncache_fork_id_t test_attached_fork_id[ FD_BLOCKHASHES_MAX ];
+static ulong                 test_attached_fork_cnt;
+
+static fd_txncache_fork_id_t
+record_txncache_attach_child( fd_txncache_t *       txncache,
+                              fd_txncache_fork_id_t parent_fork_id ) {
+  fd_txncache_fork_id_t fork_id = fd_txncache_attach_child( txncache, parent_fork_id );
+  FD_TEST( test_attached_fork_cnt<FD_BLOCKHASHES_MAX );
+  test_attached_fork_id[ test_attached_fork_cnt++ ] = fork_id;
+  return fork_id;
+}
+
 void
 mock_ssmanifest_parser_init( fd_ssmanifest_parser_t * parser,
                              fd_snapshot_manifest_t * manifest ) {
@@ -245,7 +263,6 @@ sync_ctx_init( fd_snapin_tile_t * ctx,
   ctx->ct_out.idx      = 0UL;
   ctx->txncache_max_groups_per_slot  = TEST_MAX_GROUPS_PER_SLOT;
   ctx->txncache_max_entries_per_slot = TEST_MAX_ENTRIES_PER_SLOT;
-  ctx->txncache_entries_max          = TEST_MAX_ENTRIES;
 }
 
 static void
@@ -916,7 +933,6 @@ test_txncache_staging_ctx_init( fd_snapin_tile_t * ctx,
   ctx->seed = 1UL;
   ctx->txncache_max_groups_per_slot  = TEST_MAX_GROUPS_PER_SLOT;
   ctx->txncache_max_entries_per_slot = TEST_MAX_ENTRIES_PER_SLOT;
-  ctx->txncache_entries_max          = TEST_MAX_ENTRIES;
   txncache_staging_reset( ctx );
   ctx->blockhash_groups = fd_wksp_alloc_laddr( wksp, alignof(blockhash_group_t), TEST_MAX_STAGED_GROUPS*sizeof(blockhash_group_t), 1UL );
   FD_TEST( ctx->blockhash_groups );
@@ -1007,7 +1023,7 @@ test_txncache_staging_evicted_slot_drops_groups( fd_wksp_t * wksp ) {
   FD_TEST( !memcmp( group->blockhash, blockhash_x, 32UL ) );
   FD_TEST( group->txnhash_offset==3UL );
   FD_TEST( group->txncache_entry_cnt==2UL );
-  FD_TEST( ctx->txncache_entries[ ctx->txncache_slots[ oldest_idx ].entry_base ].txnhash[ 0 ]==0x33 );
+  FD_TEST( ctx->txncache_entries[ oldest_idx*ctx->txncache_max_entries_per_slot ].txnhash[ 0 ]==0x33 );
 
   for( ulong i=1UL; i<FD_TXNCACHE_MAX_SLOT_DELTAS; i++ ) FD_TEST( txncache_staging_slot_begin( ctx, 1000UL+i )!=ULONG_MAX );
 
@@ -1054,91 +1070,37 @@ test_txncache_staging_rejects_group_overflow( fd_wksp_t * wksp ) {
   FD_TEST( txncache_staging_group_begin( ctx, blockhash, 0UL )==-1 );
 }
 
-/* The entry bound is on the total, not per slot delta: a single delta
-   may hold every entry of the 151 rooted blockhashes (which is how
-   Firedancer-produced status caches look). */
+/* The entry bound is per slot delta.  Its quota accommodates Agave's
+   signature and message hash entries for one block.  Other deltas keep
+   their own quota, and a discarded older delta is still bounded. */
 static void
 test_txncache_staging_rejects_entry_overflow( fd_wksp_t * wksp ) {
   fd_snapin_tile_t ctx[ 1 ];
   test_txncache_staging_ctx_init( ctx, wksp );
+  ctx->txncache_max_entries_per_slot = 6UL;
+  ulong const max = ctx->txncache_max_entries_per_slot;
 
   static uchar const blockhash[ 32UL ] = { 0x11 };
   static uchar const txnhash[ 20UL ]   = { 0x33 };
   FD_TEST( txncache_staging_slot_begin( ctx, 1000UL )==0UL );
   FD_TEST( !txncache_staging_group_begin( ctx, blockhash, 0UL ) );
-  for( ulong i=0UL; i<ctx->txncache_entries_max; i++ ) FD_TEST( !txncache_staging_entry_add( ctx, 1000UL, txnhash ) );
-  FD_TEST( ctx->txncache_slots[ 0 ].entry_cnt==ctx->txncache_entries_max );
-  FD_TEST( ctx->blockhash_groups[ 0 ].txncache_entry_cnt==ctx->txncache_entries_max );
+  for( ulong i=0UL; i<max; i++ ) FD_TEST( !txncache_staging_entry_add( ctx, 1000UL, txnhash ) );
+  FD_TEST( ctx->txncache_slots[ 0 ].entry_cnt==max );
+  FD_TEST( ctx->blockhash_groups[ 0 ].txncache_entry_cnt==max );
   FD_TEST( txncache_staging_entry_add( ctx, 1000UL, txnhash )==-1 );
-}
 
-/* A staged slot delta that is later evicted must give its entry range
-   back: fill the pool through a low slot, evict it with 151 higher
-   slots, then stage more entries than were left over. */
-static void
-test_txncache_staging_reclaims_evicted_entries( fd_wksp_t * wksp ) {
-  fd_snapin_tile_t ctx[ 1 ];
-  test_txncache_staging_ctx_init( ctx, wksp );
-
-  static uchar const blockhash[ 32UL ] = { 0x11 };
-  uchar txnhash[ 20UL ] = { 0x33 };
-
-  ulong const big_cnt = TEST_MAX_ENTRIES-200UL;
-  FD_TEST( txncache_staging_slot_begin( ctx, 1000UL )==0UL );
+  /* Another delta has its own quota. */
+  FD_TEST( txncache_staging_slot_begin( ctx, 1001UL )==1UL );
   FD_TEST( !txncache_staging_group_begin( ctx, blockhash, 0UL ) );
-  for( ulong i=0UL; i<big_cnt; i++ ) FD_TEST( !txncache_staging_entry_add( ctx, 1000UL, txnhash ) );
+  for( ulong i=0UL; i<max; i++ ) FD_TEST( !txncache_staging_entry_add( ctx, 1001UL, txnhash ) );
+  FD_TEST( ctx->txncache_slots[ 1 ].entry_cnt==max );
+  FD_TEST( txncache_staging_entry_add( ctx, 1001UL, txnhash )==-1 );
 
-  /* 150 more retained slots, one entry each (pool: big_cnt+150) */
-  for( ulong i=1UL; i<FD_TXNCACHE_MAX_SLOT_DELTAS; i++ ) {
-    FD_TEST( txncache_staging_slot_begin( ctx, 1000UL+i )!=ULONG_MAX );
-    FD_TEST( !txncache_staging_group_begin( ctx, blockhash, 0UL ) );
-    txnhash[ 1 ] = (uchar)i;
-    FD_TEST( !txncache_staging_entry_add( ctx, 1000UL+i, txnhash ) );
-  }
-  FD_TEST( ctx->txncache_entries_len==big_cnt+150UL );
-
-  /* Slot 2000 evicts slot 1000; 400 entries do not fit the 50 left,
-     so the pool must be compacted to reclaim slot 1000's range. */
-  ulong idx = txncache_staging_slot_begin( ctx, 2000UL );
-  FD_TEST( idx==0UL );
-  FD_TEST( !txncache_staging_group_begin( ctx, blockhash, 0UL ) );
-  txnhash[ 1 ] = 0xEE;
-  for( ulong i=0UL; i<400UL; i++ ) FD_TEST( !txncache_staging_entry_add( ctx, 2000UL, txnhash ) );
-  FD_TEST( ctx->txncache_entries_len==150UL+400UL );
-  FD_TEST( ctx->txncache_slots[ 0 ].entry_base==150UL );
-  FD_TEST( ctx->txncache_slots[ 0 ].entry_cnt ==400UL );
-
-  /* The retained slots' entries survived the move, in order */
-  for( ulong i=1UL; i<FD_TXNCACHE_MAX_SLOT_DELTAS; i++ ) {
-    txncache_staging_slot_t const * s = &ctx->txncache_slots[ i ];
-    FD_TEST( s->slot==1000UL+i && s->entry_cnt==1UL && s->entry_base==i-1UL );
-    FD_TEST( ctx->txncache_entries[ s->entry_base ].txnhash[ 1 ]==(uchar)i );
-  }
-  FD_TEST( ctx->txncache_entries[ 150UL ].txnhash[ 1 ]==0xEE );
-  FD_TEST( ctx->txncache_entries[ 549UL ].txnhash[ 1 ]==0xEE );
-}
-
-/* Entries of an evicted (older than the 151 retained) slot delta are
-   discarded and do not consume the entry pool. */
-static void
-test_txncache_staging_evicted_entries_not_pooled( fd_wksp_t * wksp ) {
-  fd_snapin_tile_t ctx[ 1 ];
-  test_txncache_staging_ctx_init( ctx, wksp );
-
-  static uchar const blockhash[ 32UL ] = { 0x11 };
-  static uchar const txnhash[ 20UL ]   = { 0x33 };
-  for( ulong i=0UL; i<FD_TXNCACHE_MAX_SLOT_DELTAS; i++ ) FD_TEST( txncache_staging_slot_begin( ctx, 1000UL+i )!=ULONG_MAX );
+  for( ulong i=2UL; i<FD_TXNCACHE_MAX_SLOT_DELTAS; i++ ) FD_TEST( txncache_staging_slot_begin( ctx, 1000UL+i )!=ULONG_MAX );
   FD_TEST( txncache_staging_slot_begin( ctx, 999UL )==ULONG_MAX );
   FD_TEST( !txncache_staging_group_begin( ctx, blockhash, 0UL ) );
-  for( ulong i=0UL; i<3UL; i++ ) FD_TEST( !txncache_staging_entry_add( ctx, 999UL, txnhash ) );
-  FD_TEST( ctx->txncache_entries_len==0UL );
-
-  ulong idx = txncache_staging_slot_begin( ctx, 2000UL );
-  FD_TEST( idx!=ULONG_MAX );
-  FD_TEST( ctx->txncache_slots[ idx ].entry_base==0UL );
-  FD_TEST( !txncache_staging_group_begin( ctx, blockhash, 0UL ) );
-  FD_TEST( !txncache_staging_entry_add( ctx, 2000UL, txnhash ) );
-  FD_TEST( ctx->txncache_entries_len==1UL );
+  for( ulong i=0UL; i<max; i++ ) FD_TEST( !txncache_staging_entry_add( ctx, 999UL, txnhash ) );
+  FD_TEST( txncache_staging_entry_add( ctx, 999UL, txnhash )==-1 );
 }
 
 static blockhash_map_t *
@@ -1187,23 +1149,23 @@ test_txncache_staging_filters_recent_groups( fd_wksp_t * wksp ) {
   uchar const * recent[ 2UL ] = { recent_a, recent_b };
   blockhash_map_t * map = test_txncache_staging_recent_set( _map, pool, ctx->seed, recent, 2UL );
 
-  FD_TEST( !filter_staged_groups( ctx, map, pool ) );
+  FD_TEST( !txncache_staging_filter_groups( ctx, map, pool, 1001UL ) );
   FD_TEST( ctx->recent_groups_len==3UL );
 
   recent_blockhash_group_t const * g = ctx->recent_groups;
-  FD_TEST( g[ 0 ].chain_idx==0UL );
+  FD_TEST( g[ 0 ].blockhash_bank_i==0UL );
   FD_TEST( g[ 0 ].txnhash_offset==1UL );
   FD_TEST( g[ 0 ].txncache_entry_idx==0UL );
   FD_TEST( g[ 0 ].txncache_entry_cnt==2UL );
 
-  FD_TEST( g[ 1 ].chain_idx==1UL );
+  FD_TEST( g[ 1 ].blockhash_bank_i==1UL );
   FD_TEST( g[ 1 ].txnhash_offset==2UL );
   FD_TEST( g[ 1 ].txncache_entry_idx==4UL );
   FD_TEST( g[ 1 ].txncache_entry_cnt==2UL );
 
-  FD_TEST( g[ 2 ].chain_idx==0UL );
+  FD_TEST( g[ 2 ].blockhash_bank_i==0UL );
   FD_TEST( g[ 2 ].txnhash_offset==1UL );
-  FD_TEST( g[ 2 ].txncache_entry_idx==8UL );
+  FD_TEST( g[ 2 ].txncache_entry_idx==ctx->txncache_max_entries_per_slot+2UL );
   FD_TEST( g[ 2 ].txncache_entry_cnt==2UL );
 
   FD_TEST( ctx->txncache_entries[ g[ 0 ].txncache_entry_idx     ].txnhash[ 0 ]==1  );
@@ -1227,7 +1189,7 @@ test_txncache_staging_rejects_recent_group_overflow( fd_wksp_t * wksp ) {
   uchar const * recent[ 1UL ] = { recent_a };
   blockhash_map_t * map = test_txncache_staging_recent_set( _map, pool, ctx->seed, recent, 1UL );
 
-  FD_TEST( filter_staged_groups( ctx, map, pool )==-1 );
+  FD_TEST( txncache_staging_filter_groups( ctx, map, pool, 1000UL )==-1 );
 }
 
 static void
@@ -1238,11 +1200,14 @@ test_txncache_staging_fits_one_gigantic_page( void ) {
   ulong footprint = scratch_footprint( &tile );
   FD_TEST( footprint<(1UL<<30) );
 
-  /* The staged entries scale with the per-slot limit (up to the 512
-     byte scratch alignment). */
+  /* The staged entries scale with the per-slot limit.  Both footprints
+     are rounded up to the scratch alignment, so the difference can land
+     on either side of the exact entries term by less than one
+     alignment. */
   tile.snapin.max_txn_per_slot = 2UL*FD_MAX_TXN_PER_SLOT;
-  ulong delta = scratch_footprint( &tile )-footprint;
-  FD_TEST( delta>=TEST_MAX_ENTRIES*sizeof(fd_sstxncache_hash_t) && delta<TEST_MAX_ENTRIES*sizeof(fd_sstxncache_hash_t)+scratch_align() );
+  ulong delta   = scratch_footprint( &tile )-footprint;
+  ulong entries = TEST_MAX_ENTRIES*sizeof(fd_sstxncache_hash_t);
+  FD_TEST( delta+scratch_align()>entries && delta<entries+scratch_align() );
 }
 
 /* Group and entry bounds are runtime limits, so a raised
@@ -1253,7 +1218,6 @@ test_txncache_staging_runtime_limits( fd_wksp_t * wksp ) {
   test_txncache_staging_ctx_init( ctx, wksp );
   ctx->txncache_max_groups_per_slot  = 3UL;
   ctx->txncache_max_entries_per_slot = 6UL;
-  ctx->txncache_entries_max          = FD_TXNCACHE_MAX_SLOT_DELTAS*6UL;
 
   uchar blockhash[ 32UL ] = {0};
   static uchar const txnhash[ 20UL ] = { 0x33 };
@@ -1278,7 +1242,7 @@ test_txncache_staging_runtime_limits( fd_wksp_t * wksp ) {
   fd_blockhash_entry_t pool[ 1UL ];
   uchar const * recent[ 1UL ] = { blockhash };
   blockhash_map_t * map = test_txncache_staging_recent_set( _map, pool, ctx->seed, recent, 1UL );
-  FD_TEST( !filter_staged_groups( ctx, map, pool ) );
+  FD_TEST( !txncache_staging_filter_groups( ctx, map, pool, 1001UL ) );
   FD_TEST( ctx->recent_groups_len==1UL );
   FD_TEST( ctx->recent_groups[ 0 ].txncache_entry_idx==6UL );
   FD_TEST( ctx->recent_groups[ 0 ].txncache_entry_cnt==1UL );
@@ -1287,12 +1251,13 @@ test_txncache_staging_runtime_limits( fd_wksp_t * wksp ) {
 static int
 test_txncache_staging_populate( fd_snapin_tile_t * ctx,
                                 fd_wksp_t *        wksp,
-                                uchar const *      recent_blockhash ) {
+                                uchar const *      recent_blockhash,
+                                ulong              snapshot_slot ) {
   ctx->txncache = new_txncache( wksp, 1UL );
 
   fd_snapshot_manifest_blockhash_t blockhashes[ FD_BLOCKHASHES_MAX ] = {{ .hash_index = 0UL }};
   fd_memcpy( blockhashes[ 0UL ].hash, recent_blockhash, 32UL );
-  int res = populate_txncache( ctx, blockhashes, 1UL );
+  int res = populate_txncache( ctx, blockhashes, 1UL, snapshot_slot );
   return res;
 }
 
@@ -1307,7 +1272,7 @@ test_txncache_staging_rejects_conflicting_group_offsets( fd_wksp_t * wksp ) {
   FD_TEST( txncache_staging_slot_begin( ctx, 1001UL )!=ULONG_MAX );
   FD_TEST( !txncache_staging_group_begin( ctx, blockhash, 2UL ) );
 
-  FD_TEST( test_txncache_staging_populate( ctx, wksp, blockhash )==1 );
+  FD_TEST( test_txncache_staging_populate( ctx, wksp, blockhash, 1001UL )==1 );
 }
 
 static void
@@ -1322,34 +1287,18 @@ test_txncache_staging_ignores_evicted_group_offsets( fd_wksp_t * wksp ) {
   FD_TEST( txncache_staging_slot_begin( ctx, 1200UL )==0UL );
   FD_TEST( !txncache_staging_group_begin( ctx, blockhash, 2UL ) );
 
-  FD_TEST( test_txncache_staging_populate( ctx, wksp, blockhash )==0 );
+  FD_TEST( test_txncache_staging_populate( ctx, wksp, blockhash, 1200UL )==0 );
   FD_TEST( ctx->recent_groups_len==1UL );
   FD_TEST( ctx->recent_groups[ 0 ].txnhash_offset==2UL );
 }
 
 static void
-test_txncache_staging_populate_inserts_recent_only( fd_wksp_t * wksp ) {
-  fd_snapin_tile_t ctx[ 1 ];
+test_populate_txncache_ctx_init( fd_snapin_tile_t * ctx,
+                                 fd_wksp_t *        wksp ) {
   sync_ctx_init( ctx, 1UL, FD_SNAPSHOT_STATE_PROCESSING );
-
-  /* Transactions reference an ancestor's blockhash, never their own
-     slot's, so the chain needs the referenced blockhash below the
-     root. */
-  static uchar const recent_old[ 32UL ] = { 0xA1 };
-  static uchar const recent_new[ 32UL ] = { 0xA2 };
-  static uchar const nonce[ 32UL ]      = { 0xC3 };
-  uchar txnhash_recent[ 32UL ];
-  uchar txnhash_nonce [ 32UL ];
-  for( ulong i=0UL; i<32UL; i++ ) {
-    txnhash_recent[ i ] = (uchar)(i+1UL);
-    txnhash_nonce [ i ] = (uchar)(0x80UL+i);
-  }
-
   ctx->txncache = new_txncache( wksp, FD_PACK_MAX_TXNCACHE_TXN_PER_SLOT );
   fd_txncache_reset( ctx->txncache );
-
   ctx->blockhash_groups = txncache_staging_scratch( ctx );
-
   test_txncache_staging_side_arrays_alloc( ctx, wksp );
   txncache_staging_reset( ctx );
 
@@ -1359,10 +1308,68 @@ test_txncache_staging_populate_inserts_recent_only( fd_wksp_t * wksp ) {
   FD_TEST( ctx->slot_delta_parser );
   fd_slot_delta_parser_init( ctx->slot_delta_parser );
 
+  test_attached_fork_cnt = 0UL;
+}
+
+static void
+test_txncache_staging_rejects_oversized_slot_delta( fd_wksp_t * wksp ) {
+  fd_snapin_tile_t ctx[ 1 ];
+  test_populate_txncache_ctx_init( ctx, wksp );
+  ctx->txncache_max_entries_per_slot = 6UL;
+
+  static uchar const blockhash[ 32UL ] = { 0xB1 };
+  ulong const entry_cnt = 7UL;
+  uchar buf[ 8UL + 17UL + 48UL + 7UL*24UL ] __attribute__((aligned(FD_CHUNK_ALIGN)));
+  uchar * p = buf;
+  FD_STORE( ulong, p, 1UL );        p += 8UL;  /* slot_deltas_len */
+  FD_STORE( ulong, p, 1000UL );     p += 8UL;  /* slot */
+  *p++ = 1;                                    /* is_root */
+  FD_STORE( ulong, p, 1UL );        p += 8UL;  /* status_len */
+  fd_memcpy( p, blockhash, 32UL );  p += 32UL;
+  FD_STORE( ulong, p, 3UL );        p += 8UL;  /* txnhash_offset */
+  FD_STORE( ulong, p, entry_cnt );  p += 8UL;
+  for( ulong i=0UL; i<entry_cnt; i++ ) {
+    fd_memset( p, (int)(0x40UL+i), 20UL );
+    p += 20UL;
+    FD_STORE( uint, p, 0U );
+    p += 4UL;
+  }
+  FD_TEST( p==buf+sizeof(buf) );
+
+  ctx->in[ 0 ].wksp   = (fd_wksp_t *)buf;
+  ctx->in[ 0 ].chunk0 = 0UL;
+  ctx->in[ 0 ].wmark  = 0UL;
+  ctx->in[ 0 ].mtu    = sizeof(buf);
+  test_parser_script   = 4;
+  test_parser_call_cnt = 0UL;
+  test_pub_cnt         = 0UL;
+  FD_TEST( !handle_data_frag( ctx, 0UL, 0UL, sizeof(buf), (fd_stem_context_t *)1UL ) );
+  FD_TEST( ctx->txncache_current_slot_entry_cnt==6UL );
+  FD_TEST( ctx->txncache_slots[ 0UL ].entry_cnt==6UL );
+  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_ERROR );
+  FD_TEST( test_pub_cnt==1UL && test_pub_sig[ 0 ]==FD_SNAPSHOT_MSG_CTRL_ERROR );
+  FD_TEST( !ctx->flags.status_cache_done );
+}
+
+static void
+test_txncache_staging_populate_inserts_recent_only( fd_wksp_t * wksp ) {
+  fd_snapin_tile_t ctx[ 1 ];
+  test_populate_txncache_ctx_init( ctx, wksp );
+
+  static uchar const root_parent_blockhash[ 32UL ] = { 0xA1 };
+  static uchar const snapshot_blockhash[ 32UL ]    = { 0xA2 };
+  static uchar const nonce[ 32UL ]                 = { 0xC3 };
+  uchar txnhash_recent[ 32UL ];
+  uchar txnhash_nonce [ 32UL ];
+  for( ulong i=0UL; i<32UL; i++ ) {
+    txnhash_recent[ i ] = (uchar)(i+1UL);
+    txnhash_nonce [ i ] = (uchar)(0x80UL+i);
+  }
+
   uchar status_cache[ 169UL ] __attribute__((aligned(FD_CHUNK_ALIGN)));
-  uchar const * status_blockhashes[ 2UL ] = { nonce,          recent_old     };
-  uchar const * status_txnhashes [ 2UL ] = { txnhash_nonce,  txnhash_recent };
-  ulong const   status_offsets   [ 2UL ] = { 7UL,            5UL            };
+  uchar const * status_blockhashes[ 2UL ] = { nonce,         root_parent_blockhash };
+  uchar const * status_txnhashes [ 2UL ] = { txnhash_nonce, txnhash_recent        };
+  ulong const   status_offsets   [ 2UL ] = { 7UL,           5UL                   };
   uchar * p = status_cache;
   FD_STORE( ulong, p, 1UL );    p += sizeof(ulong);
   FD_STORE( ulong, p, 1000UL ); p += sizeof(ulong);
@@ -1391,59 +1398,197 @@ test_txncache_staging_populate_inserts_recent_only( fd_wksp_t * wksp ) {
   FD_TEST( ctx->txncache_slots[ 0UL ].entry_cnt==2UL );
 
   fd_snapshot_manifest_blockhash_t blockhashes[ FD_BLOCKHASHES_MAX ] = {{ .hash_index = 0UL }, { .hash_index = 1UL }};
-  fd_memcpy( blockhashes[ 0UL ].hash, recent_old, 32UL );
-  fd_memcpy( blockhashes[ 1UL ].hash, recent_new, 32UL );
-  FD_TEST( populate_txncache( ctx, blockhashes, 2UL )==0 );
+  fd_memcpy( blockhashes[ 0UL ].hash, root_parent_blockhash, 32UL );
+  fd_memcpy( blockhashes[ 1UL ].hash, snapshot_blockhash,    32UL );
+  FD_TEST( populate_txncache( ctx, blockhashes, 2UL, 1000UL )==0 );
   FD_TEST( ctx->recent_groups_len==1UL );
-  FD_TEST( ctx->recent_groups[ 0 ].chain_idx==1UL ); /* recent_old is the root's parent */
+  FD_TEST( ctx->recent_groups[ 0 ].blockhash_bank_i==1UL );
 
   fd_txncache_fork_id_t child = fd_txncache_attach_child( ctx->txncache, ctx->txncache_root_fork_id );
-  FD_TEST(  fd_txncache_query( ctx->txncache, child, recent_old, txnhash_recent ) );
-  FD_TEST( !fd_txncache_query( ctx->txncache, child, recent_old, txnhash_nonce  ) );
+  FD_TEST(  fd_txncache_query( ctx->txncache, child, root_parent_blockhash, txnhash_recent ) );
+  FD_TEST( !fd_txncache_query( ctx->txncache, child, root_parent_blockhash, txnhash_nonce  ) );
 }
 
-/* An entry keyed by the newest blockhash (the root's own) is protocol
-   invalid, as a transaction cannot reference the blockhash of the block
-   it executes in.  It must be rejected as malformed, not abort. */
+static uchar const test_blockhash_1000[ 32UL ] = { 0xB0 };
+static uchar const test_blockhash_1001[ 32UL ] = { 0xB1 };
+static uchar const test_blockhash_1002[ 32UL ] = { 0xB2 };
+
 static void
-test_txncache_staging_populate_rejects_newest_blockhash_entries( fd_wksp_t * wksp ) {
+test_populate_blockhashes_init( fd_snapshot_manifest_blockhash_t * blockhashes ) {
+  blockhashes[ 0UL ].hash_index = 0UL;
+  fd_memcpy( blockhashes[ 0UL ].hash, test_blockhash_1000, 32UL );
+  blockhashes[ 1UL ].hash_index = 1UL;
+  fd_memcpy( blockhashes[ 1UL ].hash, test_blockhash_1001, 32UL );
+  blockhashes[ 2UL ].hash_index = 2UL;
+  fd_memcpy( blockhashes[ 2UL ].hash, test_blockhash_1002, 32UL );
+}
+
+static void
+test_txnhash_init( uchar out[ static 32UL ],
+                   uchar tag ) {
+  for( ulong i=0UL; i<32UL; i++ ) out[ i ] = (uchar)( tag+i );
+}
+
+static void
+test_populate_txncache_slot_attribution( fd_wksp_t * wksp ) {
   fd_snapin_tile_t ctx[ 1 ];
-  sync_ctx_init( ctx, 1UL, FD_SNAPSHOT_STATE_PROCESSING );
+  test_populate_txncache_ctx_init( ctx, wksp );
 
-  static uchar const recent_old[ 32UL ] = { 0xA1 };
-  static uchar const recent_new[ 32UL ] = { 0xA2 };
+  fd_snapshot_manifest_blockhash_t blockhashes[ FD_BLOCKHASHES_MAX ] = {0};
+  test_populate_blockhashes_init( blockhashes );
+  uchar txn_1001_bh_1000[ 32UL ];
+  uchar txn_1002_bh_1001[ 32UL ];
+  uchar txn_1002_bh_1000[ 32UL ];
+  test_txnhash_init( txn_1001_bh_1000, 0x40 );
+  test_txnhash_init( txn_1002_bh_1001, 0x10 );
+  test_txnhash_init( txn_1002_bh_1000, 0x70 );
+
+  FD_TEST( txncache_staging_slot_begin( ctx, 1001UL )==0UL );
+  FD_TEST( !txncache_staging_group_begin( ctx, test_blockhash_1000, 5UL ) );
+  FD_TEST( !txncache_staging_entry_add( ctx, 1001UL, txn_1001_bh_1000+5UL ) );
+  FD_TEST( txncache_staging_slot_begin( ctx, 1002UL )==1UL );
+  FD_TEST( !txncache_staging_group_begin( ctx, test_blockhash_1001, 5UL ) );
+  FD_TEST( !txncache_staging_entry_add( ctx, 1002UL, txn_1002_bh_1001+5UL ) );
+  FD_TEST( !txncache_staging_group_begin( ctx, test_blockhash_1000, 5UL ) );
+  FD_TEST( !txncache_staging_entry_add( ctx, 1002UL, txn_1002_bh_1000+5UL ) );
+
+  FD_TEST( populate_txncache( ctx, blockhashes, 3UL, 1002UL )==0 );
+
+  fd_txncache_fork_id_t restored_fork_1000 = test_attached_fork_id[ 0UL ];
+  fd_txncache_fork_id_t restored_fork_1001 = test_attached_fork_id[ 1UL ];
+
+  fd_txncache_fork_id_t child_of_1000 = fd_txncache_attach_child( ctx->txncache, restored_fork_1000 );
+  FD_TEST( !fd_txncache_query( ctx->txncache, child_of_1000, test_blockhash_1000, txn_1001_bh_1000 ) );
+
+  fd_txncache_fork_id_t child_of_1001 = fd_txncache_attach_child( ctx->txncache, restored_fork_1001 );
+  FD_TEST(  fd_txncache_query( ctx->txncache, child_of_1001, test_blockhash_1000, txn_1001_bh_1000 ) );
+  FD_TEST( !fd_txncache_query( ctx->txncache, child_of_1001, test_blockhash_1000, txn_1002_bh_1000 ) );
+  FD_TEST( !fd_txncache_query( ctx->txncache, child_of_1001, test_blockhash_1001, txn_1002_bh_1001 ) );
+
+  fd_txncache_fork_id_t child_of_root = fd_txncache_attach_child( ctx->txncache, ctx->txncache_root_fork_id );
+  FD_TEST( fd_txncache_query( ctx->txncache, child_of_root, test_blockhash_1000, txn_1001_bh_1000 ) );
+  FD_TEST( fd_txncache_query( ctx->txncache, child_of_root, test_blockhash_1000, txn_1002_bh_1000 ) );
+  FD_TEST( fd_txncache_query( ctx->txncache, child_of_root, test_blockhash_1001, txn_1002_bh_1001 ) );
+}
+
+static void
+test_populate_txncache_rejects_invalid_blockhash_age( fd_wksp_t * wksp ) {
+  fd_snapin_tile_t ctx[ 1 ];
+  test_populate_txncache_ctx_init( ctx, wksp );
+
+  fd_snapshot_manifest_blockhash_t blockhashes[ FD_BLOCKHASHES_MAX ] = {0};
+  test_populate_blockhashes_init( blockhashes );
   uchar txnhash[ 32UL ];
-  for( ulong i=0UL; i<32UL; i++ ) txnhash[ i ] = (uchar)(i+1UL);
+  test_txnhash_init( txnhash, 0x10 );
 
-  ctx->txncache = new_txncache( wksp, FD_PACK_MAX_TXNCACHE_TXN_PER_SLOT );
+  FD_TEST( txncache_staging_slot_begin( ctx, 1002UL )==0UL );
+  FD_TEST( !txncache_staging_group_begin( ctx, test_blockhash_1002, 5UL ) );
+  FD_TEST( !txncache_staging_entry_add( ctx, 1002UL, txnhash+5UL ) );
+  FD_TEST( populate_txncache( ctx, blockhashes, 3UL, 1002UL )==1 );
+
   fd_txncache_reset( ctx->txncache );
-  ctx->blockhash_groups = txncache_staging_scratch( ctx );
-  test_txncache_staging_side_arrays_alloc( ctx, wksp );
   txncache_staging_reset( ctx );
+  FD_TEST( txncache_staging_slot_begin( ctx, 1002UL )==0UL );
+  FD_TEST( txncache_staging_slot_begin( ctx, 1001UL )==1UL );
+  FD_TEST( !txncache_staging_group_begin( ctx, test_blockhash_1001, 5UL ) );
+  FD_TEST( !txncache_staging_entry_add( ctx, 1001UL, txnhash+5UL ) );
+  FD_TEST( populate_txncache( ctx, blockhashes, 3UL, 1002UL )==1 );
 
-  void * parser_mem = fd_wksp_alloc_laddr( wksp, fd_slot_delta_parser_align(), fd_slot_delta_parser_footprint(), 1UL );
-  FD_TEST( parser_mem );
-  ctx->slot_delta_parser = fd_slot_delta_parser_join( fd_slot_delta_parser_new( parser_mem ) );
-  FD_TEST( ctx->slot_delta_parser );
-  fd_slot_delta_parser_init( ctx->slot_delta_parser );
-
-  fd_snapshot_manifest_blockhash_t blockhashes[ FD_BLOCKHASHES_MAX ] = {{ .hash_index = 0UL }, { .hash_index = 1UL }};
-  fd_memcpy( blockhashes[ 0UL ].hash, recent_old, 32UL );
-  fd_memcpy( blockhashes[ 1UL ].hash, recent_new, 32UL );
-
-  /* One delta, one group keyed by recent_new (highest hash_index, i.e.
-     the root's own blockhash), one entry. */
-  FD_TEST( txncache_staging_slot_begin( ctx, 1000UL )==0UL );
-  FD_TEST( !txncache_staging_group_begin( ctx, recent_new, 5UL ) );
+  fd_txncache_reset( ctx->txncache );
+  txncache_staging_reset( ctx );
+  FD_TEST( txncache_staging_slot_begin( ctx, 1002UL )==0UL );
+  FD_TEST( txncache_staging_slot_begin( ctx, 1001UL )==1UL );
+  FD_TEST( txncache_staging_slot_begin( ctx, 1000UL )==2UL );
+  FD_TEST( !txncache_staging_group_begin( ctx, test_blockhash_1001, 5UL ) );
   FD_TEST( !txncache_staging_entry_add( ctx, 1000UL, txnhash+5UL ) );
-  FD_TEST( populate_txncache( ctx, blockhashes, 2UL )==1 );
+  FD_TEST( populate_txncache( ctx, blockhashes, 3UL, 1002UL )==1 );
 
-  /* Control: the same group with no entries is fine. */
   fd_txncache_reset( ctx->txncache );
   txncache_staging_reset( ctx );
-  FD_TEST( txncache_staging_slot_begin( ctx, 1000UL )==0UL );
-  FD_TEST( !txncache_staging_group_begin( ctx, recent_new, 5UL ) );
-  FD_TEST( populate_txncache( ctx, blockhashes, 2UL )==0 );
+  FD_TEST( txncache_staging_slot_begin( ctx, 1002UL )==0UL );
+  FD_TEST( !txncache_staging_group_begin( ctx, test_blockhash_1002, 5UL ) );
+  FD_TEST( txncache_staging_slot_begin( ctx, 1001UL )==1UL );
+  FD_TEST( !txncache_staging_group_begin( ctx, test_blockhash_1000, 5UL ) );
+  FD_TEST( !txncache_staging_entry_add( ctx, 1001UL, txnhash+5UL ) );
+  FD_TEST( populate_txncache( ctx, blockhashes, 3UL, 1002UL )==0 );
+}
+
+static void
+test_populate_txncache_requires_snapshot_slot_delta( fd_wksp_t * wksp ) {
+  fd_snapin_tile_t ctx[ 1 ];
+  test_populate_txncache_ctx_init( ctx, wksp );
+
+  fd_snapshot_manifest_blockhash_t blockhashes[ FD_BLOCKHASHES_MAX ] = {0};
+  test_populate_blockhashes_init( blockhashes );
+  uchar txnhash[ 32UL ];
+  test_txnhash_init( txnhash, 0x10 );
+
+  FD_TEST( txncache_staging_slot_begin( ctx, 1001UL )==0UL );
+  FD_TEST( !txncache_staging_group_begin( ctx, test_blockhash_1000, 5UL ) );
+  FD_TEST( !txncache_staging_entry_add( ctx, 1001UL, txnhash+5UL ) );
+  FD_TEST( txncache_staging_slot_begin( ctx, 1000UL )==1UL );
+  FD_TEST( populate_txncache( ctx, blockhashes, 3UL, 1002UL )==1 );
+}
+
+static void
+test_parse_status_cache( fd_snapin_tile_t * ctx,
+                         uchar *            status_cache,
+                         ulong              status_cache_sz ) {
+  ctx->in[ 0 ].wksp   = (fd_wksp_t *)status_cache;
+  ctx->in[ 0 ].chunk0 = 0UL;
+  ctx->in[ 0 ].wmark  = 0UL;
+  ctx->in[ 0 ].mtu    = status_cache_sz;
+  test_parser_script   = 4;
+  test_parser_call_cnt = 0UL;
+  FD_TEST( !handle_data_frag( ctx, 0UL, 0UL, status_cache_sz, (fd_stem_context_t *)1UL ) );
+  FD_TEST( test_parser_call_cnt==1UL );
+  FD_TEST( ctx->flags.status_cache_done );
+}
+
+static void
+test_populate_txncache_accepts_empty_rooted_status_cache( fd_wksp_t * wksp ) {
+  fd_snapin_tile_t ctx[ 1 ];
+  test_populate_txncache_ctx_init( ctx, wksp );
+
+  static ulong const snapshot_slot = 1000UL;
+  static uchar const blockhash[ 32UL ] = { 0xA1 };
+  fd_snapshot_manifest_blockhash_t blockhashes[ FD_BLOCKHASHES_MAX ] = {{ .hash_index = 0UL }};
+  fd_memcpy( blockhashes[ 0UL ].hash, blockhash, 32UL );
+
+  uchar no_slots[ 8UL ] __attribute__((aligned(FD_CHUNK_ALIGN))) = {0};
+  test_parse_status_cache( ctx, no_slots, sizeof(no_slots) );
+  FD_TEST( populate_txncache( ctx, blockhashes, 1UL, snapshot_slot )==1 );
+
+  fd_txncache_reset( ctx->txncache );
+  txncache_staging_reset( ctx );
+  fd_slot_delta_parser_init( ctx->slot_delta_parser );
+  ctx->flags.status_cache_done = 0;
+  test_attached_fork_cnt        = 0UL;
+
+  uchar status_cache[ 25UL ] __attribute__((aligned(FD_CHUNK_ALIGN))) = {0};
+  FD_STORE( ulong, status_cache,      1UL           );
+  FD_STORE( ulong, status_cache+8UL,  snapshot_slot );
+  status_cache[ 16UL ] = 1U;
+  FD_STORE( ulong, status_cache+17UL, 0UL           );
+  test_parse_status_cache( ctx, status_cache, sizeof(status_cache) );
+
+  fd_slot_delta_slot_set_t slot_set = fd_slot_delta_parser_slot_set( ctx->slot_delta_parser );
+  FD_TEST( slot_set.ele_cnt==1UL );
+  FD_TEST( slot_set_ele_query( slot_set.map, &snapshot_slot, NULL, slot_set.pool ) );
+  FD_TEST( populate_txncache( ctx, blockhashes, 1UL, snapshot_slot )==0 );
+
+  fd_txncache_fork_id_t child = fd_txncache_attach_child( ctx->txncache, ctx->txncache_root_fork_id );
+  uchar inserted_txnhash       [ 32UL ];
+  uchar matching_prefix_txnhash[ 32UL ];
+  for( ulong i=0UL; i<20UL; i++ ) inserted_txnhash[ i ] = matching_prefix_txnhash[ i ] = (uchar)( i+1UL );
+  for( ulong i=20UL; i<32UL; i++ ) {
+    inserted_txnhash       [ i ] = (uchar)( 0x80UL+i );
+    matching_prefix_txnhash[ i ] = (uchar)( 0x40UL+i );
+  }
+  fd_txncache_insert( ctx->txncache, child, blockhash, inserted_txnhash );
+  FD_TEST( fd_txncache_query( ctx->txncache, child, blockhash, matching_prefix_txnhash ) );
+  matching_prefix_txnhash[ 0UL ] ^= 1U;
+  FD_TEST( !fd_txncache_query( ctx->txncache, child, blockhash, matching_prefix_txnhash ) );
 }
 
 int
@@ -1484,8 +1629,7 @@ main( int     argc,
   fd_wksp_reset( wksp, 1UL ); test_txncache_staging_evicted_slot_drops_groups( wksp );
   fd_wksp_reset( wksp, 1UL ); test_txncache_staging_rejects_group_overflow( wksp );
   fd_wksp_reset( wksp, 1UL ); test_txncache_staging_rejects_entry_overflow( wksp );
-  fd_wksp_reset( wksp, 1UL ); test_txncache_staging_evicted_entries_not_pooled( wksp );
-  fd_wksp_reset( wksp, 1UL ); test_txncache_staging_reclaims_evicted_entries( wksp );
+  fd_wksp_reset( wksp, 1UL ); test_txncache_staging_rejects_oversized_slot_delta( wksp );
   fd_wksp_reset( wksp, 1UL ); test_txncache_staging_filters_recent_groups( wksp );
   fd_wksp_reset( wksp, 1UL ); test_txncache_staging_rejects_recent_group_overflow( wksp );
   test_txncache_staging_fits_one_gigantic_page();
@@ -1493,7 +1637,10 @@ main( int     argc,
   fd_wksp_reset( wksp, 1UL ); test_txncache_staging_rejects_conflicting_group_offsets( wksp );
   fd_wksp_reset( wksp, 1UL ); test_txncache_staging_ignores_evicted_group_offsets( wksp );
   fd_wksp_reset( wksp, 1UL ); test_txncache_staging_populate_inserts_recent_only( wksp );
-  fd_wksp_reset( wksp, 1UL ); test_txncache_staging_populate_rejects_newest_blockhash_entries( wksp );
+  fd_wksp_reset( wksp, 1UL ); test_populate_txncache_slot_attribution( wksp );
+  fd_wksp_reset( wksp, 1UL ); test_populate_txncache_rejects_invalid_blockhash_age( wksp );
+  fd_wksp_reset( wksp, 1UL ); test_populate_txncache_requires_snapshot_slot_delta( wksp );
+  fd_wksp_reset( wksp, 1UL ); test_populate_txncache_accepts_empty_rooted_status_cache( wksp );
 
   fd_wksp_delete_anonymous( wksp );
   FD_LOG_NOTICE(( "pass" ));

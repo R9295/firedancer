@@ -471,6 +471,15 @@ fd_vm_footprint( void ) {
   return FD_VM_FOOTPRINT;
 }
 
+/* FD_VM_CONTROL_FOOTPRINT is the fixed size head region */
+
+#define FD_VM_CONTROL_FOOTPRINT (offsetof( fd_vm_t, shadow ))
+
+FD_STATIC_ASSERT( offsetof( fd_vm_t, stack )==FD_VM_CONTROL_FOOTPRINT+sizeof(((fd_vm_t *)NULL)->shadow), fd_vm_layout );
+FD_STATIC_ASSERT( offsetof( fd_vm_t, heap )==offsetof( fd_vm_t, stack )+FD_VM_STACK_MAX, fd_vm_layout );
+FD_STATIC_ASSERT( sizeof  ( fd_vm_t       )==offsetof( fd_vm_t, heap )+FD_VM_HEAP_MAX, fd_vm_layout );
+FD_STATIC_ASSERT( sizeof  ( fd_vm_t       )==FD_VM_FOOTPRINT,                          fd_vm_layout );
+
 void *
 fd_vm_new( void * shmem ) {
 
@@ -485,7 +494,7 @@ fd_vm_new( void * shmem ) {
   }
 
   fd_vm_t * vm = (fd_vm_t *)shmem;
-  fd_memset( vm, 0, fd_vm_footprint() );
+  fd_memset( vm, 0, FD_VM_CONTROL_FOOTPRINT ); /* partially zero, excludes shadow/stack/heap */
 
   FD_COMPILER_MFENCE();
   FD_VOLATILE( vm->magic ) = FD_VM_MAGIC;
@@ -649,11 +658,13 @@ fd_vm_init(
   vm->segv_access_type                       = 0;
   vm->dump_syscall_to_pb                     = dump_syscall_to_pb;
 
+  vm->stack_clean = 0UL;
+  vm->heap_clean  = 0UL;
+
   /* Unpack input and rodata */
   fd_vm_mem_cfg( vm );
 
   /* Initialize registers */
-  /* FIXME: Zero out shadow, stack and heap here? */
   fd_memset( vm->reg, 0, FD_VM_REG_MAX * sizeof(ulong) );
   vm->reg[1]  = FD_VM_MEM_MAP_INPUT_REGION_START;
   vm->reg[2]  = r2_initial_value;

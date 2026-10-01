@@ -253,8 +253,22 @@ dump_sanitized_transaction( fd_accdb_t *                           accdb,
   sanitized_transaction->has_message = true;
   fd_exec_test_transaction_message_t * message = &sanitized_transaction->message;
 
-  /* Transaction Context -> tx -> message -> is_legacy */
-  message->is_legacy = txn_descriptor->transaction_version == FD_TXN_VLEGACY;
+  /* Transaction Context -> tx -> message -> version / v1_config */
+  int is_v1     = txn_descriptor->transaction_version==FD_TXN_V1;
+  int is_legacy = txn_descriptor->transaction_version==FD_TXN_VLEGACY;
+  message->version       = is_v1     ? FD_EXEC_TEST_TRANSACTION_VERSION_TRANSACTION_VERSION_V1
+                         : is_legacy ? FD_EXEC_TEST_TRANSACTION_VERSION_TRANSACTION_VERSION_LEGACY
+                         :             FD_EXEC_TEST_TRANSACTION_VERSION_TRANSACTION_VERSION_V0;
+  message->has_v1_config = (bool)is_v1;
+  if( is_v1 ) {
+    uint          mask = fd_uint_load_4( txn_payload+4UL );
+    uchar const * v    = txn_payload + txn_descriptor->v1_txn_config_values_off;
+    fd_exec_test_transaction_config_t * cfg = &message->v1_config;
+    if( mask & 0x01U ) { cfg->has_priority_fee = 1;                    cfg->priority_fee = FD_LOAD( ulong, v );                   v += 8UL; }
+    if( mask & 0x04U ) { cfg->has_compute_unit_limit = 1;              cfg->compute_unit_limit = FD_LOAD( uint, v );              v += 4UL; }
+    if( mask & 0x08U ) { cfg->has_loaded_accounts_data_size_limit = 1; cfg->loaded_accounts_data_size_limit = FD_LOAD( uint, v ); v += 4UL; }
+    if( mask & 0x10U ) { cfg->has_heap_size = 1;                       cfg->heap_size = FD_LOAD( uint, v );                                 }
+  }
 
   /* Transaction Context -> tx -> message -> header */
   message->has_header = true;
@@ -310,9 +324,9 @@ dump_sanitized_transaction( fd_accdb_t *                           accdb,
     memcpy( compiled_instruction->data->bytes, instr_data, instr.data_sz );
   }
 
-  /* ALUT stuff (non-legacy) */
+  /* ALUT stuff (V0 only: legacy and V1 have none) */
   message->address_table_lookups_count = 0;
-  if( !message->is_legacy ) {
+  if( !is_legacy && !is_v1 ) {
     /* Transaction Context -> tx -> message -> address_table_lookups */
     message->address_table_lookups_count = txn_descriptor->addr_table_lookup_cnt;
     message->address_table_lookups = fd_spad_alloc( spad,
@@ -569,13 +583,13 @@ create_block_context_protobuf_from_block( fd_block_dump_ctx_t * dump_ctx,
   fd_stake_history_t * stake_delegations_history = fd_sysvar_cache_stake_history_view( &parent_bank->f.sysvar_cache, stake_delegations_history_ );
 
   fd_stake_delegations_t * stake_delegations = fd_bank_stake_delegations_modify( parent_bank );
-  fd_stake_delegations_mark_fork_deltas( stake_delegations,
-                                         parent_bank->f.epoch,
-                                         stake_delegations_history,
-                                         &parent_bank->f.warmup_cooldown_rate_epoch,
-                                         FD_FEATURE_ACTIVE_BANK( parent_bank, upgrade_bpf_stake_program_to_v5_1 ),
-                                         stake_delegations_fork_ids,
-                                         stake_delegations_fork_id_cnt );
+  fd_stake_delegations_frontier_query_begin( stake_delegations,
+                                             parent_bank->f.epoch,
+                                             stake_delegations_history,
+                                             &parent_bank->f.warmup_cooldown_rate_epoch,
+                                             FD_FEATURE_ACTIVE_BANK( parent_bank, upgrade_bpf_stake_program_to_v5_1 ),
+                                             stake_delegations_fork_ids,
+                                             stake_delegations_fork_id_cnt );
 
   /* Collect account states in a temporary set before iterating over
      them and dumping them out. */
@@ -636,8 +650,7 @@ create_block_context_protobuf_from_block( fd_block_dump_ctx_t * dump_ctx,
     fd_stake_delegation_t const * stake_delegation = fd_stake_delegations_iter_ele( iter );
     add_account_to_dumped_accounts( dumped_accounts, &stake_delegation->stake_account );
   }
-  fd_stake_delegations_unmark_fork_deltas( stake_delegations,
-                                           parent_bank->f.epoch-1UL,
+  fd_stake_delegations_frontier_query_end( stake_delegations,
                                            stake_delegations_history,
                                            &parent_bank->f.warmup_cooldown_rate_epoch,
                                            FD_FEATURE_ACTIVE_BANK( parent_bank, upgrade_bpf_stake_program_to_v5_1 ),
@@ -669,7 +682,7 @@ create_block_context_protobuf_from_block( fd_block_dump_ctx_t * dump_ctx,
     fd_pubkey_t node;
     ushort      commission;
     fd_vote_stakes_iter_ele( vote_stakes, fork_id, FD_VOTE_STAKES_ITER_T_1, iter, &pubkey, &node, &stake,
-                             NULL, NULL, &commission, NULL, NULL, NULL );
+                             NULL, NULL, &commission, NULL, NULL, NULL, NULL );
     add_account_to_dumped_accounts( dumped_accounts, &pubkey );
 
     fd_exec_test_prev_vote_account_t * acc = &va_t1[ va_t1_cnt++ ];
@@ -704,7 +717,7 @@ create_block_context_protobuf_from_block( fd_block_dump_ctx_t * dump_ctx,
     fd_pubkey_t node;
     ushort      commission;
     fd_vote_stakes_iter_ele( vote_stakes, fork_id, FD_VOTE_STAKES_ITER_T_2, iter, &pubkey, &node, &stake,
-                             NULL, NULL, &commission, NULL, NULL, NULL );
+                             NULL, NULL, &commission, NULL, NULL, NULL, NULL );
     add_account_to_dumped_accounts( dumped_accounts, &pubkey );
 
     fd_exec_test_prev_vote_account_t * acc = &va_t2[ va_t2_cnt++ ];
@@ -1542,14 +1555,20 @@ fd_dump_vm_syscall_to_protobuf( fd_vm_t const * vm,
 
   /* SyscallContext -> syscall_invocation -> heap_prefix */
   sys_ctx.syscall_invocation.heap_prefix = fd_spad_alloc( spad, 8UL, PB_BYTES_ARRAY_T_ALLOCSIZE( vm->heap_max ) );
-  sys_ctx.syscall_invocation.heap_prefix->size = (pb_size_t) vm->instr_ctx->txn_out->details.compute_budget.heap_size;
-  fd_memcpy( sys_ctx.syscall_invocation.heap_prefix->bytes, vm->heap, vm->instr_ctx->txn_out->details.compute_budget.heap_size );
+
+  ulong heap_dump_sz = vm->instr_ctx->txn_out->details.compute_budget.heap_size;
+  ulong heap_init_sz = fd_ulong_min( vm->heap_clean, heap_dump_sz );
+  sys_ctx.syscall_invocation.heap_prefix->size = (pb_size_t)heap_dump_sz;
+  fd_memcpy( sys_ctx.syscall_invocation.heap_prefix->bytes, vm->heap, heap_init_sz );
+  fd_memset( sys_ctx.syscall_invocation.heap_prefix->bytes + heap_init_sz, 0, heap_dump_sz - heap_init_sz );
 
   /* SyscallContext -> syscall_invocation -> stack_prefix */
   pb_size_t stack_sz = (pb_size_t)FD_VM_STACK_MAX;
   sys_ctx.syscall_invocation.stack_prefix = fd_spad_alloc( spad, 8UL, PB_BYTES_ARRAY_T_ALLOCSIZE( stack_sz ) );
+  ulong stack_init_sz = fd_ulong_min( vm->stack_clean, (ulong)stack_sz );
   sys_ctx.syscall_invocation.stack_prefix->size = stack_sz;
-  fd_memcpy( sys_ctx.syscall_invocation.stack_prefix->bytes, vm->stack, stack_sz );
+  fd_memcpy( sys_ctx.syscall_invocation.stack_prefix->bytes, vm->stack, stack_init_sz );
+  fd_memset( sys_ctx.syscall_invocation.stack_prefix->bytes + stack_init_sz, 0, (ulong)stack_sz - stack_init_sz );
 
   /* Output to file */
   ulong out_buf_size = 1UL<<29UL; /* 128 MB */

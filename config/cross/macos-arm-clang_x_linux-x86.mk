@@ -3,7 +3,6 @@ BASEDIR:=build-cross
 # macOS Homebrew build toolchain
 
 CROSS:=macos-arm-clang_x_linux-x86
-OPT:=./opt/cross/$(CROSS)/opt
 LLVM_PREFIX:=$(shell brew --prefix llvm)
 CC:=$(LLVM_PREFIX)/bin/clang
 LD:=$(LLVM_PREFIX)/bin/clang
@@ -30,7 +29,3 @@ LDFLAGS+=--ld-path=$(shell brew --prefix lld)/bin/ld.lld
 
 CPPFLAGS+=-isystem ./opt/cross/$(CROSS)/usr/local/include
 LDFLAGS+=-L./opt/cross/$(CROSS)/usr/local/lib
-
-FD_HAS_ZSTD:=1
-CFLAGS+=-DFD_HAS_ZSTD=1
-LDFLAGS+=-lzstd
