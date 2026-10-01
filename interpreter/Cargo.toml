@@ -10,8 +10,10 @@ crate-type = ["cdylib", "lib"]
 no-entrypoint = []
 custom-heap = []
 custom-panic = []
+arbitrary = ["dep:arbitrary"]
 
 [dependencies]
+arbitrary = { version = "1.4.2", features = ["derive"], optional = true }
 borsh = { version = "1.8.1", features = ["derive"] }
 solana-program = "4.1.0"
 

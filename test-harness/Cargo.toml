@@ -14,7 +14,7 @@ doc = false
 arbitrary = { version = "=1.4.2", features = ["derive"] }
 bincode = "1.3.3"
 borsh = "1.8.1"
-interpreter = { path = "../interpreter", features = ["no-entrypoint"] }
+interpreter = { path = "../interpreter", features = ["arbitrary", "no-entrypoint"] }
 prost = "0.14.4"
 protosol = "=15.0.0"
 solana-clock = "=3.2.0"

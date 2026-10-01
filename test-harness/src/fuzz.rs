@@ -1,4 +1,5 @@
-//! Structured runtime inputs with CPI destinations drawn from five deployments.
+//! Structured runtime inputs with owners and CPI destinations drawn from five
+//! deployments.
 
 use arbitrary::{Arbitrary, Unstructured};
 use interpreter::Action as InterpreterAction;
@@ -35,89 +36,14 @@ impl<'a> Arbitrary<'a> for InterpreterIndex {
     }
 }
 
-/// Mirrors the interpreter wire actions, with a deployment index in `CPI`.
-/// All other fields are passed through unchanged, including invalid indices,
-/// offsets, sizes, balances, and arbitrary new owners.
-#[derive(Clone, Debug, PartialEq, Eq, Arbitrary)]
-pub enum Action {
-    WriteData {
-        account: u64,
-        offset: u64,
-        bytes: Vec<u8>,
-    },
-    ResizeGrow {
-        account: u64,
-        amount: u64,
-    },
-    ResizeShrink {
-        account: u64,
-        amount: u64,
-    },
-    ResizeZero {
-        account: u64,
-        amount: u64,
-    },
-    CreditLamports {
-        account: u64,
-        amount: u64,
-    },
-    DebitLamports {
-        account: u64,
-        amount: u64,
-    },
-    ZeroLamports {
-        account: u64,
-        amount: u64,
-    },
-    AssignOwner {
-        account: u64,
-        owner: [u8; 32],
-    },
-    MarkExecutable {
-        account: u64,
-    },
-    RemoveExecutable {
-        account: u64,
-    },
-    CPI {
-        program_index: InterpreterIndex,
-        actions: Box<Vec<Action>>,
-    },
-}
+/// Interpreter actions with a deployment index as each new owner and CPI
+/// destination. All other fields are passed through unchanged, including
+/// invalid indices, offsets, sizes, and balances.
+pub type Action = interpreter::Action<InterpreterIndex>;
 
-impl From<Action> for InterpreterAction {
-    fn from(action: Action) -> Self {
-        match action {
-            Action::WriteData {
-                account,
-                offset,
-                bytes,
-            } => Self::WriteData {
-                account,
-                offset,
-                bytes,
-            },
-            Action::ResizeGrow { account, amount } => Self::ResizeGrow { account, amount },
-            Action::ResizeShrink { account, amount } => Self::ResizeShrink { account, amount },
-            Action::ResizeZero { account, amount } => Self::ResizeZero { account, amount },
-            Action::CreditLamports { account, amount } => Self::CreditLamports { account, amount },
-            Action::DebitLamports { account, amount } => Self::DebitLamports { account, amount },
-            Action::ZeroLamports { account, amount } => Self::ZeroLamports { account, amount },
-            Action::AssignOwner { account, owner } => Self::AssignOwner {
-                account,
-                owner: owner.into(),
-            },
-            Action::MarkExecutable { account } => Self::MarkExecutable { account },
-            Action::RemoveExecutable { account } => Self::RemoveExecutable { account },
-            Action::CPI {
-                program_index,
-                actions,
-            } => Self::CPI {
-                address: PROGRAM_IDS[program_index.get()].into(),
-                actions: Box::new(actions.into_iter().map(Self::from).collect()),
-            },
-        }
-    }
+/// Translate every owner and CPI deployment index to its program ID.
+pub fn resolve(action: Action) -> InterpreterAction {
+    action.map_program(|index| PROGRAM_IDS[index.get()].into())
 }
 
 pub struct RuntimeHarness {
@@ -194,7 +120,7 @@ impl RuntimeHarness {
         // Restore every account for every input; failed executions also have
         // partial effects and must not influence the next testcase.
         let mut context = self.base_context.clone();
-        let actions: Vec<InterpreterAction> = actions.into_iter().map(Into::into).collect();
+        let actions: Vec<InterpreterAction> = actions.into_iter().map(resolve).collect();
         context.data = borsh::to_vec(&actions)?;
         crate::execute_instruction(&context)
     }
@@ -206,19 +132,19 @@ mod tests {
 
     fn cpi(index: u8, actions: Vec<Action>) -> Action {
         Action::CPI {
-            program_index: InterpreterIndex::new(index),
+            address: InterpreterIndex::new(index),
             actions: Box::new(actions),
         }
     }
 
     #[test]
-    fn every_cpi_index_maps_to_one_of_the_five_deployments() {
+    fn every_index_maps_to_one_of_the_five_deployments() {
         for raw_index in u8::MIN..=u8::MAX {
             let mut input = Unstructured::new(std::slice::from_ref(&raw_index));
             let index = InterpreterIndex::arbitrary(&mut input).unwrap();
             let expected_index = raw_index as usize % PROGRAM_IDS.len();
-            let converted = InterpreterAction::from(Action::CPI {
-                program_index: index,
+            let converted = resolve(Action::CPI {
+                address: index,
                 actions: Box::new(Vec::new()),
             });
             let InterpreterAction::CPI { address, actions } = converted else {
@@ -226,12 +152,20 @@ mod tests {
             };
             assert_eq!(address.to_bytes(), PROGRAM_IDS[expected_index]);
             assert!(actions.is_empty());
+            let converted = resolve(Action::AssignOwner {
+                account: 0,
+                owner: index,
+            });
+            let InterpreterAction::AssignOwner { owner, .. } = converted else {
+                unreachable!();
+            };
+            assert_eq!(owner.to_bytes(), PROGRAM_IDS[expected_index]);
         }
     }
 
     #[test]
     fn self_cpi_and_reentrant_sequences_are_preserved() {
-        let converted = InterpreterAction::from(cpi(0, vec![cpi(0, vec![cpi(0, Vec::new())])]));
+        let converted = resolve(cpi(0, vec![cpi(0, vec![cpi(0, Vec::new())])]));
         let mut action = &converted;
         for _ in 0..3 {
             let InterpreterAction::CPI { address, actions } = action else {

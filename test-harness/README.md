@@ -55,14 +55,14 @@ Both tests explicitly require `effects.result == 0`.
 
 ## Fuzzing
 
-The `runtime-fuzz` target gives Ziggy a structured `Vec<Action>`. Its action
-format mirrors the interpreter's action format except that each CPI destination
-is an `InterpreterIndex`. Every input byte is normalized to an index from 0
-through 4 and then translated to one of five distinct deployments of the same
-ELF. Index 0 targets the entrypoint deployment, so self-CPI, reentry, repeated
-programs, and arbitrary nested CPI sequences remain available to the fuzzer.
-The harness does not reject actions or treat instruction errors as harness
-failures; it leaves runtime validation to Agave.
+The `runtime-fuzz` target gives Ziggy a structured `Vec<Action>`, the
+interpreter's `Action<InterpreterIndex>`: each new owner and CPI destination
+is an `InterpreterIndex` instead of a program ID. Every input byte is
+normalized to an index from 0 through 4 and then translated to one of five
+distinct deployments of the same ELF. Index 0 targets the entrypoint
+deployment, so self-CPI, reentry, repeated programs, and arbitrary nested CPI
+sequences remain available to the fuzzer. The harness does not reject actions or treat
+instruction errors as harness failures; it leaves runtime validation to Agave.
 
 Build or run the target from `test-harness`:
 

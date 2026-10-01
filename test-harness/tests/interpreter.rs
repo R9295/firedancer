@@ -67,7 +67,7 @@ fn write_data_runs_in_agave() {
     let account_id = vec![43; 32];
     let initial_data = vec![0; 8];
     let lamports = 10_000_000;
-    let actions = vec![Action::WriteData {
+    let actions: Vec<Action> = vec![Action::WriteData {
         account: 0,
         offset: 2,
         bytes: b"hello".to_vec(),
@@ -148,7 +148,7 @@ fn five_interpreter_deployments_write_assign_then_cpi() {
     accounts.extend(sysvar_accounts());
 
     // Build nested calldata from the deepest invocation back to the first.
-    let mut actions = Vec::new();
+    let mut actions: Vec<Action> = Vec::new();
     for level in (0..DEPTH).rev() {
         let write = Action::WriteData {
             account: 0,

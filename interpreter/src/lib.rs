@@ -29,8 +29,13 @@ use std::{ptr, slice};
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
 
+/// An interpreter action. `P` identifies each program an action names: new
+/// owners and CPI destinations. Calldata uses `Action<Pubkey>`, while harnesses
+/// may choose a narrower program domain and resolve it with `map_program`
+/// before encoding.
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub enum Action {
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub enum Action<P = Pubkey> {
     WriteData {
         account: u64,
         offset: u64,
@@ -66,7 +71,7 @@ pub enum Action {
     },
     AssignOwner {
         account: u64,
-        owner: Pubkey,
+        owner: P,
     },
     MarkExecutable {
         account: u64,
@@ -75,9 +80,53 @@ pub enum Action {
         account: u64,
     },
     CPI {
-        address: Pubkey,
-        actions: Box<Vec<Action>>,
+        address: P,
+        // Recursive; borsh boxes deserialize through `ToOwned`, so need `Clone`.
+        #[borsh(bound(serialize = "", deserialize = "P: Clone"))]
+        actions: Box<Vec<Action<P>>>,
     },
+}
+
+impl<P> Action<P> {
+    /// Replace every new owner and CPI program, including those in nested actions.
+    pub fn map_program<Q>(self, mut f: impl FnMut(P) -> Q) -> Action<Q> {
+        self.map_program_with(&mut f)
+    }
+
+    fn map_program_with<Q>(self, f: &mut impl FnMut(P) -> Q) -> Action<Q> {
+        match self {
+            Self::WriteData {
+                account,
+                offset,
+                bytes,
+            } => Action::WriteData {
+                account,
+                offset,
+                bytes,
+            },
+            Self::ResizeGrow { account, amount } => Action::ResizeGrow { account, amount },
+            Self::ResizeShrink { account, amount } => Action::ResizeShrink { account, amount },
+            Self::ResizeZero { account, amount } => Action::ResizeZero { account, amount },
+            Self::CreditLamports { account, amount } => Action::CreditLamports { account, amount },
+            Self::DebitLamports { account, amount } => Action::DebitLamports { account, amount },
+            Self::ZeroLamports { account, amount } => Action::ZeroLamports { account, amount },
+            Self::AssignOwner { account, owner } => Action::AssignOwner {
+                account,
+                owner: f(owner),
+            },
+            Self::MarkExecutable { account } => Action::MarkExecutable { account },
+            Self::RemoveExecutable { account } => Action::RemoveExecutable { account },
+            Self::CPI { address, actions } => Action::CPI {
+                address: f(address),
+                actions: Box::new(
+                    actions
+                        .into_iter()
+                        .map(|action| action.map_program_with(f))
+                        .collect(),
+                ),
+            },
+        }
+    }
 }
 
 /// Execute Borsh-encoded actions against accounts from the aligned SBF ABI.
