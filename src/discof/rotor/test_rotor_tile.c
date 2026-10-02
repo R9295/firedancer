@@ -212,6 +212,20 @@ rep_expect( ulong i, ulong slot, uint fec_set_idx, fd_hash_t const * mr,
   FD_TEST( m->slot_complete==slot_complete );
 }
 
+/* rserve_find returns the last block metadata published to rserve for
+   slot, or NULL if none was. */
+
+static fd_rotor_block_t const *
+rserve_find( ulong slot ) {
+  fd_rotor_block_t const * found = NULL;
+  for( ulong i=0UL; i<pub_cnt; i++ ) {
+    if( pub_log[ i ].out_idx!=OUT_IDX_RSERVE ) continue;
+    fd_rotor_block_t const * msg = fd_type_pun_const( pub_log[ i ].data );
+    if( msg->slot==slot ) found = msg;
+  }
+  return found;
+}
+
 /* mkhash returns a distinct, deterministic, never-zero hash for n. */
 
 static fd_hash_t
@@ -538,7 +552,10 @@ static fd_hash_t snap_bid;
 static fd_pubkey_t peer_key[ 2 ];
 
 static void
-setup_ctx( ctx_t * ctx, fd_wksp_t * wksp ) {
+setup_ctx_root( ctx_t *           ctx,
+                fd_wksp_t *       wksp,
+                ulong             root_slot,
+                fd_hash_t const * root_bid ) {
   memset( ctx, 0, sizeof(*ctx) );
   fd_event_tl = NULL;
   fd_clock_tile_init( ctx->clock );
@@ -656,10 +673,9 @@ setup_ctx( ctx_t * ctx, fd_wksp_t * wksp ) {
   ctx->pending_key_next  = 0UL;
   ctx->ag_nonce          = 0U;
 
-  /* Snapshot: root the rotor the way handle_snap does. */
+  /* Root the rotor the way handle_snap (or a genesis boot) does. */
 
-  snap_bid = mkhash( 0xB1D100UL );
-  fd_rotor_init( ctx->rotor, SNAP_SLOT, &snap_bid, report_block_received, ctx );
+  fd_rotor_init( ctx->rotor, root_slot, root_bid, report_block_received, ctx );
   FD_TEST( !fd_rotor_verify( ctx->rotor ) );
 
   /* Two repair peers, as if discovered via gossip. */
@@ -670,6 +686,14 @@ setup_ctx( ctx_t * ctx, fd_wksp_t * wksp ) {
   fd_ip4_port_t addr1 = { .addr = 0x0A000003U, .port = 9002 };
   FD_TEST( fd_policy_peer_upsert( ctx->policy, &peer_key[ 0 ], &addr0 ) );
   FD_TEST( fd_policy_peer_upsert( ctx->policy, &peer_key[ 1 ], &addr1 ) );
+}
+
+/* setup_ctx roots the rotor at the snapshot slot, SNAP_SLOT. */
+
+static void
+setup_ctx( ctx_t * ctx, fd_wksp_t * wksp ) {
+  snap_bid = mkhash( 0xB1D100UL );
+  setup_ctx_root( ctx, wksp, SNAP_SLOT, &snap_bid );
 }
 
 /* deliver_gossip_peers feeds n contact-info frags the way the gossip
@@ -786,6 +810,43 @@ test_turbine_block( fd_wksp_t * wksp ) {
 
   FD_TEST( !fd_rotor_verify( ctx->rotor ) );
   FD_LOG_NOTICE(( "pass: turbine block delivers and finalizes" ));
+}
+
+/* A cluster booted from genesis roots the rotor at slot 0 under the
+   all-zero Alpenglow genesis block ID, so a block built directly on
+   genesis names a zero parent block ID.  rserve must still get its
+   metadata: a peer that missed every shred of the block can only
+   repair it by block id, and rserve answers that only for blocks the
+   rotor published. */
+
+static void
+test_genesis_child_published( fd_wksp_t * wksp ) {
+  static ctx_t ctx[1];
+  fd_hash_t genesis = {0};
+  setup_ctx_root( ctx, wksp, 0UL, &genesis );
+
+  blk_t blk[1] = {{ .slot = 8UL, .parent_slot = 0UL, .parent_block_id = genesis, .fec_cnt = 2U }};
+  blk->fec_root[ 0 ] = mkhash( 0xC0UL );
+  blk->fec_root[ 1 ] = mkhash( 0xC1UL );
+  blk_build( blk );
+
+  deliver_turbine_block( ctx, blk );
+  pump( ctx );
+  FD_TEST( rep_cnt==2UL );
+  rep_expect( 1UL, blk->slot, FD_FEC_SHRED_CNT, &blk->fec_root[ 1 ], &blk->block_id, 1 );
+
+  fd_rotor_block_t const * pub = rserve_find( blk->slot );
+  FD_TEST( pub );
+  FD_TEST( fd_hash_eq( &pub->block_id, &blk->block_id ) );
+  FD_TEST( pub->parent_slot==0UL );
+  FD_TEST( fd_hash_check_zero( &pub->parent_block_id ) );
+  FD_TEST( pub->fec_set_cnt==blk->fec_cnt );
+  for( uint k=0U; k<blk->fec_cnt; k++ ) {
+    FD_TEST( !memcmp( pub->merkle_roots[ k ], blk->fec_root[ k ].uc, FD_SHRED_MERKLE_NODE_SZ ) );
+  }
+
+  FD_TEST( !fd_rotor_verify( ctx->rotor ) );
+  FD_LOG_NOTICE(( "pass: block built on zero-ID genesis is published to rserve" ));
 }
 
 /* Exercise the real event reporter independently of the mocked stem
@@ -1835,6 +1896,9 @@ main( int argc, char ** argv ) {
   FD_TEST( wksp );
 
   test_turbine_block( wksp );
+
+  fd_wksp_reset( wksp, 1U );
+  test_genesis_child_published( wksp );
 
   fd_wksp_reset( wksp, 1U );
   test_block_received_event( wksp );

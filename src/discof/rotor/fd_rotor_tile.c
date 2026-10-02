@@ -817,14 +817,16 @@ returnable_frag( ctx_t *             ctx,
 
 /* publish_block publishes block's block metadata to rserve.  Skipped
    if rserve is disabled, or if the block id, parent, or any FEC root is
-   unknown. */
+   unknown.  The parent check matches finalize_block_id's, so a block
+   built directly on the zero-ID genesis block is served too: a peer
+   that missed it can only repair it by block id. */
 static void
 publish_block( ctx_t *             ctx,
                fd_stem_context_t * stem,
                fd_rotor_blk_t *    block ) {
   out_ctx_t * out = ctx->rserve_out_ctx;
   if( FD_UNLIKELY( out->idx==ULONG_MAX ) ) return;
-  if( FD_UNLIKELY( fd_hash_check_zero( &block->block_id ) || fd_hash_check_zero( &block->parent_block_id ) ) ) return;
+  if( FD_UNLIKELY( fd_hash_check_zero( &block->block_id ) || !fd_rotor_parent_block_id_known( ctx->rotor, block ) ) ) return;
   if( FD_UNLIKELY( block->complete_idx>=FD_SHRED_BLK_MAX || block->parent_slot==AG_UNKNOWN_SLOT ) ) return;
 
   uint fec_set_cnt = ( block->complete_idx + 1U ) / FD_FEC_SHRED_CNT;

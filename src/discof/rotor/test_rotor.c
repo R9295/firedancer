@@ -337,7 +337,8 @@ test_basic( fd_wksp_t * wksp ) {
 /* Alpenglow starts directly from a synthetic slot-0 block whose block
    ID is all zero.  Zero is otherwise the rotor's "unknown" sentinel, so
    make sure a complete child can resolve that specific root and derive
-   its own non-zero block ID. */
+   its own non-zero block ID, and that a zero parent anywhere else stays
+   unknown. */
 
 static void
 test_zero_genesis_block_id( fd_wksp_t * wksp ) {
@@ -352,12 +353,25 @@ test_zero_genesis_block_id( fd_wksp_t * wksp ) {
   fd_rotor_blk_t * slot1 = block_at( rotor, 1UL, 0UL );
   FD_TEST( slot1 );
   FD_TEST( slot1->connected );
+  FD_TEST( fd_rotor_parent_block_id_known( rotor, slot1 ) );
   FD_TEST( !fd_hash_check_zero( &slot1->block_id ) );
   FD_TEST( slot1->delivered_idx==31U );
   FD_TEST( fd_rotor_highest_repaired_slot( rotor )==1UL );
 
   out_rec_t exp[] = { { 1UL, 0U, mr } };
   expect_out( rotor, exp, 1UL );
+  FD_TEST( !fd_rotor_verify( rotor ) );
+
+  /* A zero parent that is not the root is not genesis: the child's
+     parent stays unknown and its block ID is never derived. */
+
+  fd_hash_t mr3 = mkhash( 3UL );
+  FD_TEST( !feed_fec( rotor, 3UL, 0U, 1, &mr3, 2UL, &genesis ) );
+  fd_rotor_blk_t * slot3 = block_at( rotor, 3UL, 0UL );
+  FD_TEST( slot3 );
+  FD_TEST( !fd_rotor_parent_block_id_known( rotor, slot3 ) );
+  FD_TEST( fd_hash_check_zero( &slot3->block_id ) );
+  FD_TEST( !slot3->connected );
   FD_TEST( !fd_rotor_verify( rotor ) );
 
   teardown( rotor );

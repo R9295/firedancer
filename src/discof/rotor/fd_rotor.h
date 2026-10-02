@@ -543,6 +543,22 @@ fd_rotor_slot_version_query( fd_rotor_t *      rotor,
   return NULL;
 }
 
+/* fd_rotor_parent_block_id_known returns 1 if block->parent_block_id
+   names block's parent, 0 if it is not known yet.  A zero block ID
+   ordinarily means "not known yet".  Alpenglow's synthetic genesis
+   block is the one exception: its canonical block ID is zero.  Only
+   accept zero when it resolves to the connected rotor root, so a
+   missing non-genesis parent cannot be mistaken for genesis. */
+
+static inline int
+fd_rotor_parent_block_id_known( fd_rotor_t *           rotor,
+                                fd_rotor_blk_t const * block ) {
+  if( FD_LIKELY( !fd_hash_check_zero( &block->parent_block_id ) ) ) return 1;
+  if( FD_UNLIKELY( block->parent_slot!=rotor->root ) ) return 0;
+  fd_rotor_blk_t const * parent = fd_rotor_slot_version_query( rotor, block->parent_slot, &block->parent_block_id );
+  return parent && parent->connected;
+}
+
 /* fd_rotor_block_fecs returns block's row of rotor->fec_tbl:
    fecs[ k ] is the fd_fec_pool idx of the FEC block owns at FEC set k
    (shred position k*FD_FEC_SHRED_CNT), UINT_MAX if none, for k in

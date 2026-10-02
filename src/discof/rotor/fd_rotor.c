@@ -285,18 +285,9 @@ turbine_block_query( fd_rotor_t * rotor, ulong slot ) {
 
 static int
 finalize_block_id( fd_rotor_t * rotor, fd_rotor_blk_t * block ) {
-  if( FD_UNLIKELY( block->complete_idx==UINT_MAX ) )       return 0;
-  if( FD_UNLIKELY( block->parent_slot==AG_UNKNOWN_SLOT ) ) return 0;
-
-  /* A zero block ID ordinarily means "not known yet".  Alpenglow's
-     synthetic genesis block is the one exception: its canonical block
-     ID is zero.  Only accept zero when it resolves to the connected
-     rotor root, so a missing non-genesis parent cannot be mistaken for
-     genesis. */
-  if( FD_UNLIKELY( fd_hash_check_zero( &block->parent_block_id ) ) ) {
-    fd_rotor_blk_t * parent = fd_rotor_slot_version_query( rotor, block->parent_slot, &block->parent_block_id );
-    if( FD_UNLIKELY( block->parent_slot!=rotor->root || !parent || !parent->connected ) ) return 0;
-  }
+  if( FD_UNLIKELY( block->complete_idx==UINT_MAX ) )                  return 0;
+  if( FD_UNLIKELY( block->parent_slot==AG_UNKNOWN_SLOT ) )            return 0;
+  if( FD_UNLIKELY( !fd_rotor_parent_block_id_known( rotor, block ) ) ) return 0;
 
   uint fec_set_cnt = ( block->complete_idx + 1U ) / FD_FEC_SHRED_CNT;
   uchar tree_mem[ FD_BMTREE_COMMIT_FOOTPRINT( 0UL ) ] __attribute__((aligned(FD_BMTREE_COMMIT_ALIGN)));
