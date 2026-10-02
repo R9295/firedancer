@@ -266,7 +266,7 @@ for ((i=0; i<node_count; i++)); do
       '    slot_max = 128' \
       '' \
       '[tiles.rotor]' \
-      '    slot_max = 128' \
+      '    slot_max = 4096' \
       '' \
       '[tiles.rserve]' \
       "    repair_serve_listen_port = $((base+72))" \
