@@ -85,6 +85,9 @@ struct __attribute__((aligned(128UL))) ag_pool {
   ag_event_pool_t *   pool_events;
   ag_event_repair_t * repair_events;
 
+  ag_pool_finalization_fn_t finalization_fn;
+  void *                    finalization_ctx;
+
   struct {
     struct {
       ag_cert_t * certs;
@@ -223,6 +226,9 @@ ag_pool_new( void * mem,
 
   pool->seq = 0UL;
 
+  pool->finalization_fn  = NULL;
+  pool->finalization_ctx = NULL;
+
   pool->scratch.standstill.certs     = (ag_cert_t *)cert_scratch;
   pool->scratch.standstill.own_votes = (ag_vote_t *)own_vote_scratch;
   pool->scratch.parent_readys        = (ag_parent_ready_t *)parent_ready_scratch;
@@ -296,6 +302,14 @@ ag_pool_init_boot_block( ag_pool_t *           self,
 }
 
 void
+ag_pool_set_finalization_fn( ag_pool_t *               self,
+                             ag_pool_finalization_fn_t fn,
+                             void *                    ctx ) {
+  self->finalization_fn  = fn;
+  self->finalization_ctx = ctx;
+}
+
+void
 ag_pool_fini( ag_pool_t * self ) {
   ag_finality_tracker_fini( self->finality_tracker );
   self->parent_ready_tracker->root = ULONG_MAX;
@@ -343,6 +357,7 @@ finalization_event_default( ag_pool_t * self ) {
 static void
 handle_finalization( ag_pool_t *                     self,
                      ag_finalization_event_t const * event ) {
+  if( FD_UNLIKELY( self->finalization_fn ) ) self->finalization_fn( self->finalization_ctx, self, event );
   ag_parent_ready_t new_parents_ready = ag_parent_ready_tracker_handle_finalization( self->parent_ready_tracker, event, self->scratch.parent_readys, &self->scratch.parent_ready_cnt );
   if( FD_LIKELY( new_parents_ready.slot!=ULONG_MAX ) ) {
     ag_event_pool_t event = { .seq = self->seq++, .kind = AG_EVENT_POOL_PARENT_READY, .parent_ready = { .slot = new_parents_ready.slot, .parent = new_parents_ready.parent } };
@@ -600,6 +615,7 @@ ag_pool_add_block( ag_pool_t *           self,
 
   ag_finalization_event_t finalization_event = finalization_event_default( self );
   ag_finality_tracker_add_parent( self->finality_tracker, block_id, parent_id, &finalization_event );
+  if( FD_UNLIKELY( self->finalization_fn ) ) self->finalization_fn( self->finalization_ctx, self, &finalization_event );
   ag_parent_ready_t       new_parents_ready  = ag_parent_ready_tracker_handle_finalization( self->parent_ready_tracker, &finalization_event, self->scratch.parent_readys, &self->scratch.parent_ready_cnt );
   if( FD_UNLIKELY( new_parents_ready.slot!=ULONG_MAX ) ) {
     ag_event_pool_t event = { .seq = self->seq++, .kind = AG_EVENT_POOL_PARENT_READY, .parent_ready = { .slot = new_parents_ready.slot, .parent = new_parents_ready.parent } };

@@ -5,6 +5,7 @@
 #include "ag_cert.h"
 #include "ag_epoch_info.h"
 #include "ag_event.h"
+#include "ag_finality_tracker.h"
 #include "ag_slot_state.h"
 #include "ag_vote.h"
 
@@ -23,6 +24,14 @@
 #define AG_POOL_QUORUM_REACHED_SAFE_TO_SKIP   (6)
 
 typedef struct ag_pool ag_pool_t;
+
+/* ag_pool_finalization_fn_t observes each finalization event the
+   finality tracker emits, while the pool still holds the state of the
+   slots it names.  It may only read pool. */
+
+typedef void (* ag_pool_finalization_fn_t)( void *                          ctx,
+                                            ag_pool_t const *               pool,
+                                            ag_finalization_event_t const * event );
 
 FD_PROTOTYPES_BEGIN
 
@@ -63,6 +72,14 @@ ag_pool_init_boot_block( ag_pool_t *           self,
 
 void
 ag_pool_fini( ag_pool_t * self );
+
+/* ag_pool_set_finalization_fn sets the finalization observer, NULL for
+   none. */
+
+void
+ag_pool_set_finalization_fn( ag_pool_t *               self,
+                             ag_pool_finalization_fn_t fn,
+                             void *                    ctx );
 
 FD_FN_CONST char const *
 ag_pool_strerror( int err );

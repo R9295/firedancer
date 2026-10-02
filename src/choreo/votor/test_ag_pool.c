@@ -1,5 +1,6 @@
 #include "ag_pool.c"
 #include "ag_slot_state.c"
+#include "ag_invariant.h"
 #include "test_ag_cert_builder.h"
 #include "ag_cert_serde.h"
 #include "ag_vote_serde.h"
@@ -820,6 +821,99 @@ test_boot_block_skip_handover( void ) {
   FD_TEST( !take_events( pool ) ); /* slot 1 does not start a window */
   for( ulong s=1UL; s<SLOTS_PER_WINDOW; s++ ) add_skip_votes( pool, s, 0UL, 7UL );
   FD_TEST( is_parent_ready( pool, SLOTS_PER_WINDOW, &boot ) );
+  teardown_pool( pool );
+}
+
+/* Firedancer-only test.
+
+   The finalization observer sees every finalization, from certs and
+   from a parent link replay reports after its child was finalized,
+   while the pool still holds the finalized slot's certs.  The votor
+   tile checks its finality invariants there, so drive each path with
+   them on. */
+
+static uchar            g_inv_mem[ 1UL<<18 ] __attribute__((aligned(128)));
+static ag_invariant_t * g_inv;
+static ulong            g_finalized_cnt;
+static ulong            g_implicit_cnt;
+
+static void
+observe_finalization( void *                          ctx,
+                      ag_pool_t const *               pool,
+                      ag_finalization_event_t const * event ) {
+  FD_TEST( ctx==g_inv );
+  ag_slot_state_t const * state = event->finalized.slot!=ULONG_MAX ? ag_pool_slot_state( pool, event->finalized.slot ) : NULL;
+  ag_invariant_finalization( g_inv, event, state ? &state->certs : NULL );
+  g_finalized_cnt += event->finalized.slot!=ULONG_MAX;
+  g_implicit_cnt  += event->implicitly_finalized_cnt;
+}
+
+/* replay_block reports a completed block as the votor tile does:
+   invariants first, then the pool. */
+
+static void
+replay_block( ag_pool_t *           pool,
+              ag_block_id_t const * block,
+              ag_block_id_t const * parent ) {
+  ag_invariant_replay_completed( g_inv, block, parent );
+  FD_TEST( ag_pool_add_block( pool, block, parent, bad )==AG_POOL_SUCCESS );
+  drain_events( pool );
+}
+
+static void
+test_finalization_fn( void ) {
+  ag_pool_t * pool = setup_pool();
+  FD_TEST( ag_invariant_footprint( TEST_SLOT_MAX )<=sizeof(g_inv_mem) );
+  g_inv = ag_invariant_join( ag_invariant_new( g_inv_mem, TEST_SLOT_MAX ) );
+  FD_TEST( g_inv );
+  ag_block_hash_t genesis; genesis_hash( genesis );
+  ag_block_id_t   b0 = ag_block_id( 0UL, genesis );
+  ag_invariant_init( g_inv, &b0 );
+  ag_pool_set_finalization_fn( pool, observe_finalization, g_inv );
+  g_finalized_cnt = 0UL;
+  g_implicit_cnt  = 0UL;
+
+  /* Slot 1 finalized slowly, notar cert first */
+
+  ag_block_id_t b1 = random_block_id( 1UL );
+  replay_block( pool, &b1, &b0 );
+  add_notar_votes( pool, 1UL, b1.hash, 0UL, 7UL );
+  add_final_votes( pool, 1UL, 0UL, 7UL );
+  FD_TEST( ag_pool_finalized_slot( pool )==1UL && g_finalized_cnt==1UL );
+
+  /* Slot 2 finalized slowly, final cert first */
+
+  ag_block_id_t b2 = random_block_id( 2UL );
+  replay_block( pool, &b2, &b1 );
+  add_final_votes( pool, 2UL, 0UL, 7UL );
+  FD_TEST( g_finalized_cnt==1UL );
+  add_notar_votes( pool, 2UL, b2.hash, 0UL, 7UL );
+  FD_TEST( ag_pool_finalized_slot( pool )==2UL && g_finalized_cnt==2UL );
+
+  /* Slot 4 fast finalized, implicitly finalizing slot 3 */
+
+  ulong         implicit_cnt = g_implicit_cnt;
+  ag_block_id_t b3           = random_block_id( 3UL );
+  ag_block_id_t b4           = random_block_id( 4UL );
+  replay_block( pool, &b3, &b2 );
+  replay_block( pool, &b4, &b3 );
+  fast_finalize( pool, 4UL, b4.hash );
+  FD_TEST( ag_pool_finalized_slot( pool )==4UL && g_finalized_cnt==3UL && g_implicit_cnt==implicit_cnt+1UL );
+
+  /* Slot 6 fast finalized before replay; its parent link, reported
+     later, implicitly finalizes slot 5 */
+
+  implicit_cnt     = g_implicit_cnt;
+  ag_block_id_t b5 = random_block_id( 5UL );
+  ag_block_id_t b6 = random_block_id( 6UL );
+  fast_finalize( pool, 6UL, b6.hash );
+  FD_TEST( ag_pool_finalized_slot( pool )==6UL && g_finalized_cnt==4UL );
+  replay_block( pool, &b5, &b4 );
+  FD_TEST( g_implicit_cnt==implicit_cnt );
+  replay_block( pool, &b6, &b5 );
+  FD_TEST( g_implicit_cnt==implicit_cnt+1UL );
+
+  ag_pool_set_finalization_fn( pool, NULL, NULL );
   teardown_pool( pool );
 }
 
@@ -1654,6 +1748,7 @@ main( int     argc,
   test_two_skip_handover();
   test_skip_window_handover();
   test_boot_block_skip_handover();
+  test_finalization_fn();
   test_pruning();
   test_duplicate_votes();
   test_duplicate_certs();

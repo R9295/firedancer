@@ -3,6 +3,7 @@
 #include "generated/fd_votor_tile_seccomp.h"
 
 #include "../../choreo/votor/ag_cert_serde.h"
+#include "../../choreo/votor/ag_invariant.h"
 #include "../../choreo/votor/ag_pool.h"
 #include "../../choreo/votor/ag_slot_state.h"
 #include "../../choreo/votor/ag_vote_serde.h"
@@ -241,8 +242,9 @@ struct fd_votor_tile {
 
   /* Alpenglow data structures */
 
-  ag_pool_t *  pool;
-  ag_votor_t * votor;
+  ag_pool_t *      pool;
+  ag_votor_t *     votor;
+  ag_invariant_t * invariant;
 
   struct {
     ulong finalized_slot; /* pool finalized slot as of the previous check */
@@ -1183,6 +1185,17 @@ handle_gossip( fd_votor_tile_t *                  ctx,
   }
 }
 
+/* check_finalization is the pool's finalization observer: it checks
+   each finalization against the pool's certs for the finalized slot. */
+
+static void
+check_finalization( void *                          invariant,
+                    ag_pool_t const *               pool,
+                    ag_finalization_event_t const * event ) {
+  ag_slot_state_t const * state = event->finalized.slot!=ULONG_MAX ? ag_pool_slot_state( pool, event->finalized.slot ) : NULL;
+  ag_invariant_finalization( invariant, event, state ? &state->certs : NULL );
+}
+
 static void
 handle_replay( fd_votor_tile_t *           ctx,
                ulong                       sig,
@@ -1194,9 +1207,11 @@ handle_replay( fd_votor_tile_t *           ctx,
     fd_replay_slot_completed_t const * slot_completed  = &replay->slot_completed;
     ag_block_id_t                      block_id        = ag_block_id( slot_completed->slot,        slot_completed->block_id.uc        );
     ag_block_id_t                      parent_block_id = ag_block_id( slot_completed->parent_slot, slot_completed->parent_block_id.uc );
+    ag_invariant_replay_completed( ctx->invariant, &block_id, &parent_block_id );
     if( FD_UNLIKELY( ag_pool_finalized_slot( ctx->pool )==ULONG_MAX ) ) {
       ag_pool_init( ctx->pool, block_id.slot );
       ag_pool_init_boot_block( ctx->pool, &block_id );
+      ag_invariant_init( ctx->invariant, &block_id );
       if( FD_LIKELY( ctx->shred_version ) ) ag_votor_init( ctx->votor, block_id.slot, fd_clock_tile_now( ctx->clock ), ctx->ns_per_slot, ctx->shred_version, sign_bls, ctx );
       ctx->init = !!ctx->curr_epoch_info && !!ctx->shred_version;
     } else if( FD_UNLIKELY( block_id.slot!=0 ) ) {
@@ -1214,9 +1229,12 @@ handle_replay( fd_votor_tile_t *           ctx,
     footer = &slot_completed->footer;
     break;
   }
-  case REPLAY_SIG_SLOT_DEAD:
+  case REPLAY_SIG_SLOT_DEAD: {
+    ag_block_id_t dead = ag_block_id( replay->slot_dead.slot, replay->slot_dead.block_id.uc );
+    ag_invariant_replay_dead( ctx->invariant, &dead );
     footer = &replay->slot_dead.footer;
     break;
+  }
   default:
     FD_LOG_ERR(( "unexpected replay sig %lu", sig ));
   }
@@ -1264,6 +1282,7 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
   l = FD_LAYOUT_APPEND( l, fd_quic_align(),                fd_quic_footprint( &quic_server_limits )          );
   l = FD_LAYOUT_APPEND( l, ag_pool_align(),                ag_pool_footprint( tile->votor.max_live_slots )   );
   l = FD_LAYOUT_APPEND( l, ag_votor_align(),               ag_votor_footprint( tile->votor.max_live_slots )  );
+  l = FD_LAYOUT_APPEND( l, ag_invariant_align(),           ag_invariant_footprint( tile->votor.max_live_slots ) );
   l = FD_LAYOUT_APPEND( l, peers_align(),                  peers_footprint()                                 );
   l = FD_LAYOUT_APPEND( l, contact_infos_align(),          contact_infos_footprint()                         );
   l = FD_LAYOUT_APPEND( l, reconn_prq_align(),             reconn_prq_footprint( RECONN_MAX )                );
@@ -1529,6 +1548,7 @@ after_credit( fd_votor_tile_t *   ctx,
   }
 
   if( FD_UNLIKELY( ag_pool_poll_pool_event( ctx->pool, &ctx->scratch.pool_event ) ) ) {
+    if( FD_UNLIKELY( ctx->scratch.pool_event.kind==AG_EVENT_POOL_CERT_CREATED ) ) ag_invariant_cert_created( ctx->invariant, &ctx->scratch.pool_event.cert_created );
     ag_votor_handle_pool_event( ctx->votor, &ctx->scratch.pool_event, now );
     if( FD_UNLIKELY( ctx->scratch.pool_event.kind==AG_EVENT_POOL_PARENT_READY ) ) ctx->highest_parent_ready_slot = fd_ulong_max( ctx->highest_parent_ready_slot, ctx->scratch.pool_event.parent_ready.slot );
 
@@ -1604,6 +1624,7 @@ after_credit( fd_votor_tile_t *   ctx,
   }
 
   if( FD_UNLIKELY( ag_votor_poll_vote_event( ctx->votor, &ctx->scratch.vote_event ) ) ) { /* our own vote */
+    if( FD_LIKELY( ctx->scratch.vote_event.reason!=UCHAR_MAX /* standstill re-broadcast */ ) ) ag_invariant_vote( ctx->invariant, &ctx->scratch.vote_event.vote );
     ulong                   vote_slot  = ag_vote_slot( &ctx->scratch.vote_event.vote );
     ag_epoch_info_t const * epoch_info = fd_ptr_if( vote_slot>=ctx->next_epoch_slot, ctx->next_epoch_info, fd_ptr_if( vote_slot>=ctx->curr_epoch_slot, ctx->curr_epoch_info, ctx->prev_epoch_info ) );
     ulong                   rank       = ag_vote_rank( &ctx->scratch.vote_event.vote );
@@ -1874,6 +1895,7 @@ unprivileged_init( fd_topo_t const *      topo,
   void *            quic_server   = FD_SCRATCH_ALLOC_APPEND( l, fd_quic_align(),                fd_quic_footprint( &quic_server_limits )          );
   void *            pool          = FD_SCRATCH_ALLOC_APPEND( l, ag_pool_align(),                ag_pool_footprint( tile->votor.max_live_slots )   );
   void *            votor         = FD_SCRATCH_ALLOC_APPEND( l, ag_votor_align(),               ag_votor_footprint( tile->votor.max_live_slots )  );
+  void *            invariant     = FD_SCRATCH_ALLOC_APPEND( l, ag_invariant_align(),           ag_invariant_footprint( tile->votor.max_live_slots ) );
   void *            peers         = FD_SCRATCH_ALLOC_APPEND( l, peers_align(),                  peers_footprint()                                 );
   void *            contact_infos = FD_SCRATCH_ALLOC_APPEND( l, contact_infos_align(),          contact_infos_footprint()                         );
   void *            reconn_prq    = FD_SCRATCH_ALLOC_APPEND( l, reconn_prq_align(),             reconn_prq_footprint( RECONN_MAX )                );
@@ -1897,6 +1919,10 @@ unprivileged_init( fd_topo_t const *      topo,
 
   ctx->votor = ag_votor_join( ag_votor_new( votor, tile->votor.max_live_slots, seed ) );
   FD_TEST( ctx->votor );
+
+  ctx->invariant = ag_invariant_join( ag_invariant_new( invariant, tile->votor.max_live_slots ) );
+  FD_TEST( ctx->invariant );
+  ag_pool_set_finalization_fn( ctx->pool, check_finalization, ctx->invariant );
 
   ctx->prev_epoch_info = NULL;
   ctx->prev_epoch_slot = ULONG_MAX;
