@@ -30,12 +30,12 @@ C=/home/fuzz/cluster-10 contrib/test/run_fd_cluster.sh net
 ```
 
 Each validator has 10% of genesis stake. The generated smoke-test profile uses
-about 12.6 GiB per validator, or about 126 GiB for ten validators. Its 24 pinned
+about 16.0 GiB per validator, or about 160 GiB for ten validators. Its 24 pinned
 tile threads share a validator-specific set of physical cores. The generator reserves
 one physical core per used Non-Uniform Memory Access (NUMA) node for the host,
 uses disjoint validator CPU sets, and distributes validators round-robin across
 NUMA nodes. On a four-NUMA host, ten validators use a 3/3/2/2 memory split instead
-of reserving all 126 GiB on one NUMA node. Use the manual setup below when the
+of reserving all 160 GiB on one NUMA node. Use the manual setup below when the
 host needs a different node count, port plan, or affinity plan.
 
 The manual paths below use `/cluster` as an example. The test binary does not
@@ -195,7 +195,7 @@ telemetry = false
     cache_size_gib = 3
 
 [runtime]
-    max_live_slots = 64
+    max_live_slots = 256
     max_fork_width = 4
     program_cache_size_mib = 256
 
@@ -337,17 +337,25 @@ other. The test refuses to start such a pair.
 
 The small accounts, slot, fork, and cache values above are a smoke-test
 profile. Measure the exact total for the current configs with `mem`; the
-three-node profile above needs about 12.6 GiB of 2 MiB huge pages per
+three-node profile above needs about 16.0 GiB of 2 MiB huge pages per
 node. Raise `runtime.max_live_slots` and the associated pools for longer
-fuzz campaigns. A 64-slot pool can fill if a whole validator is
+fuzz campaigns. A 256-slot pool can fill if a whole validator is
 suspended while the rest of the cluster keeps advancing.
 
-The rotor's block pool works the same way, but filling it aborts the
-validator. `tiles.rotor.slot_max` sizes it at 2.2 block versions per
-slot, and the protocol-sized default of 30000 needs about 18.7 GiB per
-node. 4096 covers every slot a 300-second run can produce, at about
-5 slots per second, even for a validator that falls behind for the
-whole run. Raise it with the run length.
+`runtime.max_live_slots` also sizes votor's per-slot state, and votor
+aborts the validator when the cluster goes that many slots without
+finalizing. At 64, a 9-second stall of the whole cluster took down every
+validator at once; 256 takes about 50 seconds of stall at 5 slots per
+second. Memory grows quickly with the value (about 20.6 GiB per node
+at 512), so this profile stays far below the default of 2048 and
+accepts the shorter bound.
+
+The rotor's block pool works the same way. `tiles.rotor.slot_max` sizes
+it at 2.2 block versions per slot, and the protocol-sized default of
+30000 needs about 6.1 GiB per node more than 4096. 4096 covers every
+slot a 300-second run can produce, at about 5 slots per second, even
+for a validator that falls behind for the whole run. Raise it with the
+run length.
 
 ### Memory
 
@@ -379,16 +387,16 @@ an older copy at `build/firedancer-dev` will still reserve that memory.
 Smaller queues suit a low-traffic local cluster. Under load they can
 increase packet loss, cache misses, transaction eviction, or repair
 traffic. Raise them for throughput tests or delayed-network scenarios.
-The 256 MiB program cache is close to the current 252 MiB minimum for
-64 live slots; increase it when testing larger or more numerous programs.
+The 256 MiB program cache is close to the current 252 MiB minimum;
+increase it when testing larger or more numerous programs.
 
 The `development.runtime` settings are development only: a validator whose
 genesis hash names a live cluster refuses to start with them set. Each
 is a hard bound, so a validator exits if the cluster turns out to have
 more stake or vote accounts than the value allows. Leave headroom.
 
-This profile keeps the existing 64 live slots, account-cache reservation,
-and protocol block limits. With bundles disabled the account cache needs
+This profile raises live slots to 256 and keeps the existing
+account-cache reservation and protocol block limits. With bundles disabled the account cache needs
 about 2.10 GiB, so its integer-GiB setting must be at least 3. The
 transaction cache and live-block pools still cover full-size legal
 blocks. The block-size settings under `development.bench` only scale up.

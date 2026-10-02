@@ -195,7 +195,7 @@ for ((i=0; i<node_count; i++)); do
       '    cache_size_gib = 3' \
       '' \
       '[runtime]' \
-      '    max_live_slots = 64' \
+      '    max_live_slots = 256' \
       '    max_fork_width = 4' \
       '    program_cache_size_mib = 256' \
       '' \
