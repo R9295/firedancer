@@ -8,9 +8,13 @@
 
    A scenario is a JSON list of actions on a block tree:
 
-     [ { "node": "1a", "parent": "0",  "action": "NOTARIZE_CERT"  },
+     [ { "node": "1a", "parent": "0",  "action": "NOTARIZE_CERT", "part": 0 },
        { "action": "CLOCK", "ms": 100 },
        { "node": "2b", "parent": "1a", "action": "REPLAY_COMPLETE" } ]
+
+   NOTARIZE_CERT and SKIP_CERT parts 0, 1, 2 each deliver disjoint votes
+   with 20% stake.  Without "part", an older input delivers all three
+   parts in sequence, pumping events between them.
 
    Labels are a slot, then the block's index in letters (a, ..., z, aa).
    The canonical chain runs from the root to the leftmost deepest block
@@ -20,9 +24,10 @@
    suite: its worker logs the backtrace, then the suite prints the
    failing input and exits nonzero.
 
-   Requires EXTRAS=no-cert-verify: every validator signs with one fake
-   signature, so certificates only verify with the signature check off. */
+   Requires EXTRAS=no-cert-verify: direct certificate templates have
+   synthetic signatures; the partial and local votes are signed. */
 
+#include <errno.h>
 #include <execinfo.h>
 #include <glob.h>
 #include <signal.h>
@@ -39,6 +44,11 @@
 #include "../../ballet/json/fd_jtok.h"
 #include "../../util/log/fd_backtrace.h"
 
+#if FD_HAS_COVERAGE
+extern int __llvm_profile_write_file( void );
+extern void __llvm_profile_set_filename( char const * filename );
+#endif
+
 #define VALIDATOR_CNT          (20UL)
 #define QUORUM_SIGNERS         (11UL) /* validators 1 to 11, 63.4% of stake */
 #define STRONG_QUORUM_SIGNERS  (16UL) /* validators 1 to 16, 82.4% of stake */
@@ -46,15 +56,25 @@
 #define SHRED_VERSION          ((ushort)0x5a5a)
 #define NS_PER_SLOT            (400000000L)
 #define NS_EVERY_TIMEOUT       (1000000000000L)
+#define CERT_PART_CNT          (3UL)
+#define CERT_PART_SIGNERS      (4UL)
+
+/* Each group has two 620k-stake and two 380k-stake validators, exactly
+   20% of the 10M total.  The three disjoint groups form a 60% cert. */
+static ushort const cert_part_rank[ CERT_PART_CNT ][ CERT_PART_SIGNERS ] = {
+  { 1, 2, 10, 11 },
+  { 3, 4, 12, 13 },
+  { 5, 6, 14, 15 }
+};
 
 enum { NOTARIZE_CERT, FINALIZE_CERT, NOTAR_FALLBACK_CERT, FAST_FINALIZE_CERT, SKIP_CERT,
-       REPLAY_ARRIVES, REPLAY_COMPLETE, REPLAY_DEAD, CLOCK, ACTION_KIND_CNT };
+       REPLAY_ARRIVES, REPLAY_COMPLETE, REPLAY_DEAD, CLOCK, STANDSTILL, ACTION_KIND_CNT };
 
 #define CERT_CNT (REPLAY_ARRIVES)
 
 static char const * const action_kind_name[ ACTION_KIND_CNT ] = {
   "NOTARIZE_CERT", "FINALIZE_CERT", "NOTAR_FALLBACK_CERT", "FAST_FINALIZE_CERT", "SKIP_CERT",
-  "REPLAY_ARRIVES", "REPLAY_COMPLETE", "REPLAY_DEAD", "CLOCK"
+  "REPLAY_ARRIVES", "REPLAY_COMPLETE", "REPLAY_DEAD", "CLOCK", "STANDSTILL"
 };
 
 enum { CANONICAL_NONE, CANONICAL_BLOCK, CANONICAL_SKIP };
@@ -69,6 +89,7 @@ typedef struct {
   label_t label;
   label_t parent;
   ulong   ms;
+  ulong   part; /* 0, 1, 2 for a 20% notar/skip message; ULONG_MAX for legacy actions */
 } action_t;
 
 typedef struct {
@@ -86,8 +107,19 @@ typedef struct {
   int             voted_notar;
   int             voted_skip;
   int             voted_final;
+  int             voted_notar_fallback;
+  int             voted_skip_fallback;
   ag_block_hash_t voted_notar_hash;
+  ag_block_hash_t voted_notar_fallback_hash;
 } slot_t;
+
+/* A cert offered to the pool, by name and label, deduped, for tracing */
+
+typedef struct {
+  char const * name;
+  label_t      label;
+  int          slot_only; /* final and skip certs name only a slot */
+} cert_ref_t;
 
 typedef struct {
   action_t * actions;
@@ -99,10 +131,12 @@ typedef struct {
   ulong      vote_slot_cnt;
   slot_t *   slots;           /* vote_slot_cnt of them */
   ulong      canonical_final; /* deepest directly finalized canonical slot */
-  ulong      final_cert_slot; /* highest final cert slot the votor saw */
+  cert_ref_t * certs;        /* certs offered to the pool, deduped */
+  ulong        cert_cnt;
 } scenario_t;
 
 static ag_epoch_info_t epoch_info;
+static fd_bls_sec_t    validator_sk[ VALIDATOR_CNT ];
 static fd_bls_sig_t    fake_sig;
 static ag_cert_t       templates[ CERT_CNT ];
 static fd_bls_set_t    bad[ fd_bls_set_word_cnt ];
@@ -110,9 +144,10 @@ static fd_bls_set_t    bad[ fd_bls_set_word_cnt ];
 static void
 fake_sign_fn( void *         ctx,
               fd_bls_sig_t * sig,
+              uchar const *  public_key,
               uchar const *  msg,
               ulong          msg_sz ) {
-  (void)ctx; (void)msg; (void)msg_sz;
+  (void)ctx; (void)public_key; (void)msg; (void)msg_sz;
   *sig = fake_sig;
 }
 
@@ -124,8 +159,8 @@ block_id( label_t label ) {
   return id;
 }
 
-/* Signatures are all fake_sig, so a cert's aggregates depend only on
-   its signers: every cert is its kind's template, renamed. */
+/* Direct certificate templates use fake_sig, so their aggregates depend
+   only on their signers: each cert is its kind's template, renamed. */
 
 static ag_cert_t
 cert( uint    kind,
@@ -151,14 +186,19 @@ cluster_init( void ) {
   for( ulong i=0UL; i<VALIDATOR_CNT; i++ ) {
     uchar ikm[ 32 ] = {0};
     FD_STORE( ulong, ikm, i );
-    fd_bls_sec_t sk;
-    fd_bls_sec_derive( &sk, ikm, sizeof(ikm) );
+    fd_bls_sec_t * sk = &validator_sk[i];
+    fd_bls_sec_derive( sk, ikm, sizeof(ikm) );
     info[i].id    = i;
     info[i].stake = i<10UL ? 620000UL : 380000UL;
-    fd_bls_sec_to_pub( &sk, &info[i].bls_key );
-    if( !i ) sec_sign_fn( &sk, &fake_sig, (uchar const *)"votor", 5UL );
+    bls_key_from_sec( info[i].bls_key, sk );
+    if( !i ) sec_sign_fn( sk, &fake_sig, info[i].bls_key, (uchar const *)"votor", 5UL );
   }
   epoch_info_build( &epoch_info, info, VALIDATOR_CNT );
+  for( ulong part=0UL; part<CERT_PART_CNT; part++ ) {
+    ulong stake = 0UL;
+    for( ulong i=0UL; i<CERT_PART_SIGNERS; i++ ) stake += info[ cert_part_rank[ part ][ i ] ].stake;
+    FD_TEST( stake*5UL==epoch_info.total_stake );
+  }
 
   /* Validator 0 is the votor under test and never signs */
   ulong                    slot = 1UL;
@@ -168,11 +208,11 @@ cluster_init( void ) {
   ag_vote_notar_t          notar   [ STRONG_QUORUM_SIGNERS ];
   ag_vote_notar_fallback_t fallback[ QUORUM_SIGNERS-FALLBACK_NOTAR_SIGNERS ];
   for( ushort rank=1; rank<=STRONG_QUORUM_SIGNERS; rank++ ) {
-    notar[ rank-1 ] = ag_vote_construct_notar( fake_sign_fn, NULL, slot, id.hash, rank, SHRED_VERSION ).notar;
+    notar[ rank-1 ] = ag_vote_construct_notar( fake_sign_fn, NULL, info[rank].bls_key, slot, id.hash, rank, SHRED_VERSION ).notar;
     if( rank>QUORUM_SIGNERS ) continue;
-    final[ rank-1 ] = ag_vote_construct_final( fake_sign_fn, NULL, slot, rank, SHRED_VERSION ).final;
-    skip [ rank-1 ] = ag_vote_construct_skip ( fake_sign_fn, NULL, slot, rank, SHRED_VERSION ).skip;
-    if( rank>FALLBACK_NOTAR_SIGNERS ) fallback[ rank-1-FALLBACK_NOTAR_SIGNERS ] = ag_vote_construct_notar_fallback( fake_sign_fn, NULL, slot, id.hash, rank, SHRED_VERSION ).notar_fallback;
+    final[ rank-1 ] = ag_vote_construct_final( fake_sign_fn, NULL, info[rank].bls_key, slot, rank, SHRED_VERSION ).final;
+    skip [ rank-1 ] = ag_vote_construct_skip ( fake_sign_fn, NULL, info[rank].bls_key, slot, rank, SHRED_VERSION ).skip;
+    if( rank>FALLBACK_NOTAR_SIGNERS ) fallback[ rank-1-FALLBACK_NOTAR_SIGNERS ] = ag_vote_construct_notar_fallback( fake_sign_fn, NULL, info[rank].bls_key, slot, id.hash, rank, SHRED_VERSION ).notar_fallback;
   }
   templates[ NOTARIZE_CERT       ] = cert_build_notar         ( notar, QUORUM_SIGNERS, &epoch_info );
   templates[ FINALIZE_CERT       ] = cert_build_final         ( final, QUORUM_SIGNERS, &epoch_info );
@@ -247,12 +287,13 @@ actions_parse( scenario_t * s,
     action_t * a          = &s->actions[ s->action_cnt++ ];
     int        has_node   = 0;
     int        has_parent = 0;
-    *a = (action_t){ .kind = UINT_MAX, .ms = ULONG_MAX };
+    *a = (action_t){ .kind = UINT_MAX, .ms = ULONG_MAX, .part = ULONG_MAX };
     fd_jtok_obj_enter( j );
     while( fd_jtok_obj_next( j, &key ) ) {
       if(      fd_jtok_str_eq( &key, "node"   ) ) { a->label  = label_parse( j ); has_node   = 1; }
       else if( fd_jtok_str_eq( &key, "parent" ) ) { a->parent = label_parse( j ); has_parent = 1; }
       else if( fd_jtok_str_eq( &key, "ms"     ) ) fd_jtok_ulong( j, &a->ms );
+      else if( fd_jtok_str_eq( &key, "part"   ) ) fd_jtok_ulong( j, &a->part );
       else if( fd_jtok_str_eq( &key, "action" ) ) {
         fd_jtok_str_t kind;
         fd_jtok_str( j, &kind );
@@ -260,8 +301,10 @@ actions_parse( scenario_t * s,
       }
     }
     if( fd_jtok_err( j ) ) FD_LOG_ERR(( "malformed action %lu", s->action_cnt-1UL ));
-    int ok = a->kind==CLOCK ? !has_node && a->ms!=ULONG_MAX
-                            : a->kind!=UINT_MAX && has_node && has_parent && a->label.slot && a->parent.slot<a->label.slot;
+    int ok = a->kind==CLOCK      ? !has_node && !has_parent && a->ms!=ULONG_MAX && a->part==ULONG_MAX
+           : a->kind==STANDSTILL ? !has_node && !has_parent && a->ms==ULONG_MAX && a->part==ULONG_MAX
+           : a->kind!=UINT_MAX && has_node && has_parent && a->label.slot && a->parent.slot<a->label.slot &&
+             ( (a->kind==NOTARIZE_CERT || a->kind==SKIP_CERT) ? (a->part==ULONG_MAX || a->part<CERT_PART_CNT) : a->part==ULONG_MAX );
     if( !ok ) FD_LOG_ERR(( "bad action %lu", s->action_cnt-1UL ));
   }
   if( fd_jtok_fini( j ) ) FD_LOG_ERR(( "malformed JSON" ));
@@ -272,7 +315,7 @@ actions_parse( scenario_t * s,
 static void
 nodes_build( scenario_t * s ) {
   for( ulong i=0UL; i<s->action_cnt; i++ ) {
-    if( s->actions[i].kind==CLOCK ) continue;
+    if( s->actions[i].kind==CLOCK || s->actions[i].kind==STANDSTILL ) continue;
     s->slot_cnt = fd_ulong_max( s->slot_cnt, s->actions[i].label.slot +1UL );
     s->width    = fd_ulong_max( s->width,    s->actions[i].label.index+1UL );
   }
@@ -280,7 +323,7 @@ nodes_build( scenario_t * s ) {
   FD_TEST( s->nodes );
   for( ulong i=0UL; i<s->action_cnt; i++ ) {
     action_t const * a = &s->actions[i];
-    if( a->kind==CLOCK ) continue;
+    if( a->kind==CLOCK || a->kind==STANDSTILL ) continue;
     node_t * n   = &s->nodes[ a->label.slot*s->width+a->label.index ];
     s->node_cnt += !n->kinds;
     n->label     = a->label;
@@ -360,6 +403,7 @@ scenario_free( scenario_t * s ) {
   free( s->actions );
   free( s->nodes );
   free( s->slots );
+  free( s->certs );
 }
 
 /* Invariants */
@@ -373,6 +417,19 @@ check_vote( scenario_t *            s,
   ulong             slot = ag_vote_slot( vote );
   FD_TEST( slot<s->vote_slot_cnt );
   slot_t * st = &s->slots[ slot ];
+  if( event->reason==UCHAR_MAX ) { /* standstill recovery re-broadcasts prior votes */
+    int seen = 0;
+    switch( vote->kind ) {
+    case AG_VOTE_KIND_NOTAR:          seen = st->voted_notar && !memcmp( st->voted_notar_hash, vote->notar.block_hash, sizeof(ag_block_hash_t) ); break;
+    case AG_VOTE_KIND_SKIP:           seen = st->voted_skip;           break;
+    case AG_VOTE_KIND_FINAL:          seen = st->voted_final;          break;
+    case AG_VOTE_KIND_NOTAR_FALLBACK: seen = st->voted_notar_fallback; break;
+    case AG_VOTE_KIND_SKIP_FALLBACK:  seen = st->voted_skip_fallback;  break;
+    default: break;
+    }
+    if( !seen ) FD_LOG_CRIT(( "INVARIANT: standstill re-broadcasted an unseen vote in slot %lu", slot ));
+    return;
+  }
   switch( vote->kind ) {
   case AG_VOTE_KIND_NOTAR: {
     if( st->voted_skip  ) FD_LOG_CRIT(( "INVARIANT: voted notar and skip in slot %lu", slot ));
@@ -394,6 +451,15 @@ check_vote( scenario_t *            s,
       FD_LOG_CRIT(( "INVARIANT: voted final in slot %lu without voting notar for its canonical block", slot ));
     }
     st->voted_final = 1;
+    break;
+  case AG_VOTE_KIND_NOTAR_FALLBACK:
+    if( !st->voted_notar_fallback ) {
+      st->voted_notar_fallback = 1;
+      memcpy( st->voted_notar_fallback_hash, vote->notar_fallback.block_hash, sizeof(ag_block_hash_t) );
+    }
+    break;
+  case AG_VOTE_KIND_SKIP_FALLBACK:
+    st->voted_skip_fallback = 1;
     break;
   default:
     break;
@@ -474,23 +540,153 @@ check_canonical( scenario_t const * s,
   }
 }
 
-/* Unless its window already retired or a final cert covers it, a dead
-   block leaves a vote in every slot of its window. */
+/* Shuttle events between pool and votor, as the votor tile does, until
+   both are quiet, then check finality. */
 
-static void
-check_dead( scenario_t const * s,
-            ulong              slot,
-            ulong              final_cert_slot,
-            int                retired ) {
-  if( slot<=final_cert_slot || retired ) return;
-  ulong start = ag_first_slot_in_window( slot );
-  for( ulong w=start; w<start+AG_SLOTS_PER_WINDOW; w++ ) {
-    if( !s->slots[ w ].voted_notar && !s->slots[ w ].voted_skip ) FD_LOG_CRIT(( "INVARIANT: replay found a block in slot %lu dead, but slot %lu of its window has no vote", slot, w ));
+/* Tracing.  After each action, once pool and votor are quiet, both this
+   harness and agave's write the same JSON record, so a comparator can
+   diff the two implementations' state per action. */
+
+static char const *
+ag_cert_kind_name( uint kind ) {
+  switch( kind ) {
+  case AG_CERT_KIND_NOTAR:          return "NOTARIZE_CERT";
+  case AG_CERT_KIND_FINAL:          return "FINALIZE_CERT";
+  case AG_CERT_KIND_NOTAR_FALLBACK: return "NOTAR_FALLBACK_CERT";
+  case AG_CERT_KIND_FAST_FINAL:     return "FAST_FINALIZE_CERT";
+  case AG_CERT_KIND_SKIP:           return "SKIP_CERT";
+  default:                          FD_LOG_CRIT(( "unreachable" ));
   }
 }
 
-/* Shuttle events between pool and votor, as the votor tile does, until
-   both are quiet, then check finality. */
+static void
+ag_cert_label( ag_cert_t const * c,
+               label_t *        label,
+               int *            slot_only ) {
+  *slot_only = 0;
+  switch( c->kind ) {
+  case AG_CERT_KIND_FINAL:          *slot_only=1; label->slot=c->final.slot; break;
+  case AG_CERT_KIND_SKIP:           *slot_only=1; label->slot=c->skip.slot; break;
+  case AG_CERT_KIND_NOTAR:          label->slot=c->notar.slot; label->index=FD_LOAD( ulong, c->notar.block_hash+8UL ); break;
+  case AG_CERT_KIND_NOTAR_FALLBACK: label->slot=c->notar_fallback.slot; label->index=FD_LOAD( ulong, c->notar_fallback.block_hash+8UL ); break;
+  case AG_CERT_KIND_FAST_FINAL:     label->slot=c->fast_final.slot; label->index=FD_LOAD( ulong, c->fast_final.block_hash+8UL ); break;
+  default:                          FD_LOG_CRIT(( "unreachable" ));
+  }
+}
+
+static void
+scenario_cert_add( scenario_t *     s,
+                   char const *     name,
+                   label_t const *  label,
+                   int              slot_only ) {
+  for( ulong i=0UL; i<s->cert_cnt; i++ ) {
+    if( s->certs[i].slot_only!=slot_only || strcmp( s->certs[i].name, name ) ) continue;
+    if(  slot_only && s->certs[i].label.slot!=label->slot ) continue;
+    if( !slot_only && memcmp( &s->certs[i].label, label, sizeof(label_t) ) ) continue;
+    return;
+  }
+  s->certs = realloc( s->certs, ( s->cert_cnt+1UL )*sizeof(cert_ref_t) );
+  FD_TEST( s->certs );
+  s->certs[ s->cert_cnt++ ] = (cert_ref_t){ .name=name, .label=*label, .slot_only=slot_only };
+}
+
+/* Labels render as Firedancer's harness writes them: a slot in digits,
+   then the index in letters, a is 0, z 25, aa 26.  The root is "0". */
+
+static void
+label_str( label_t l,
+           char *  out ) {
+  if( !l.slot && !l.index ) { out[0]='0'; out[1]=0; return; }
+  char letters[ 32 ];
+  int  n   = 0;
+  ulong v  = l.index+1UL;
+  while( v ) { v--; letters[ n++ ] = (char)('a' + (int)(v%26UL)); v /= 26UL; }
+  int p = sprintf( out, "%lu", l.slot );
+  while( n ) out[ p++ ] = letters[ --n ];
+  out[ p ] = 0;
+}
+
+static label_t
+hash_label( uchar const * hash ) {
+  label_t l = { 0 };
+  if( FD_LIKELY( hash ) ) {
+    l.slot  = FD_LOAD( ulong, hash );
+    l.index = FD_LOAD( ulong, hash+8UL );
+  }
+  return l;
+}
+
+/* One record per action, once quiet: the votor's votes, the pool's
+   finality and certs, and the pool's root.  Root here is the pool's
+   finalized slot: firedancer's pool roots on finalization. */
+
+static void
+trace_record( FILE *             trace,
+              scenario_t const * s,
+              ag_pool_t const *  pool,
+              ulong              i,
+              char const *       action ) {
+  if( !trace ) return;
+
+  ulong         root_slot = ag_pool_finalized_slot( pool );
+  char          root_lbl[ 64 ];
+  label_t       root_l    = hash_label( ag_pool_finalized_block_hash( pool ) );
+  label_str( root_l, root_lbl );
+
+  fprintf( trace, "{\"i\":%lu,\"action\":\"%s\",\"finalized\":{\"slot\":%lu,\"hash\":\"%s\"},\"root\":{\"slot\":%lu,\"hash\":\"%s\"},\"votes\":{",
+           i, action, root_slot, root_lbl, root_slot, root_lbl );
+  int first = 1;
+  for( ulong slot=1UL; slot<s->vote_slot_cnt; slot++ ) {
+    slot_t const * st = &s->slots[ slot ];
+    if( !st->voted_notar && !st->voted_skip && !st->voted_final &&
+        !st->voted_notar_fallback && !st->voted_skip_fallback ) continue;
+    if( !first ) fputc( ',', trace );
+    first = 0;
+    char nb[ 64 ];
+    label_str( hash_label( st->voted_notar_hash ), nb );
+    char fb[ 64 ];
+    label_str( hash_label( st->voted_notar_fallback_hash ), fb );
+    fprintf( trace, "\"%lu\":{", slot );
+    int vf = 1;
+    if( st->voted_notar )          { fprintf( trace, "\"notar\":\"%s\"", nb ); vf=0; }
+    if( st->voted_final )          { fprintf( trace, "%s\"final\":true",      vf?"":"," ); vf=0; }
+    if( st->voted_notar_fallback )  { fprintf( trace, "%s\"notar_fb\":\"%s\"", vf?"":",", fb ); vf=0; }
+    if( st->voted_skip )            { fprintf( trace, "%s\"skip\":true",      vf?"":"," ); vf=0; }
+    if( st->voted_skip_fallback )   { fprintf( trace, "%s\"skip_fb\":true",   vf?"":"," ); vf=0; }
+    fprintf( trace, "}" );
+  }
+
+  fprintf( trace, "},\"finality\":{" );
+  first = 1;
+  for( ulong slot=1UL; slot<s->slot_cnt; slot++ ) {
+    ag_block_hash_t hash;
+    int status = ag_finality_tracker_status( pool->finality_tracker, slot, hash );
+    char const * tag = NULL;
+    switch( status ) {
+    case AG_FINALIZATION_STATUS_FINALIZED:            tag = "final";  break;
+    case AG_FINALIZATION_STATUS_IMPLICITLY_FINALIZED: tag = "ifinal"; break;
+    case AG_FINALIZATION_STATUS_IMPLICITLY_SKIPPED:   tag = "iskip";  break;
+    default: break;
+    }
+    if( !tag ) continue;
+    if( !first ) fputc( ',', trace );
+    first = 0;
+    char hb[ 64 ];
+    label_str( hash_label( hash ), hb );
+    fprintf( trace, "\"%lu\":\"%s%s%s\"", slot, tag, ( !strcmp(tag,"iskip") )?"":":", ( !strcmp(tag,"iskip") )?"":hb );
+  }
+
+  fprintf( trace, "},\"certs\":[" );
+  for( ulong j=0UL; j<s->cert_cnt; j++ ) {
+    if( j ) fputc( ',', trace );
+    char cb[ 64 ];
+    if( s->certs[j].slot_only ) sprintf( cb, "%lu", s->certs[j].label.slot );
+    else                        label_str( s->certs[j].label, cb );
+    fprintf( trace, "\"%s %s\"", s->certs[j].name, cb );
+  }
+  fprintf( trace, "]}\n" );
+  fflush( trace );
+}
 
 static void
 pump( scenario_t * s,
@@ -502,10 +698,6 @@ pump( scenario_t * s,
 
     ag_event_pool_t pool_event;
     if( ag_pool_poll_pool_event( pool, &pool_event ) ) {
-      if( pool_event.kind==AG_EVENT_POOL_CERT_CREATED &&
-          ( pool_event.cert_created.kind==AG_CERT_KIND_FINAL || pool_event.cert_created.kind==AG_CERT_KIND_FAST_FINAL ) ) {
-        s->final_cert_slot = fd_ulong_max( s->final_cert_slot, ag_cert_slot( &pool_event.cert_created ) );
-      }
       ag_votor_handle_pool_event( votor, &pool_event, now );
       progress = 1;
     }
@@ -529,12 +721,42 @@ pump( scenario_t * s,
 
     ag_event_cert_t cert_event;
     if( ag_votor_poll_cert_event( votor, &cert_event ) ) {
+      label_t cl = {0}; int slot_only;
+      ag_cert_label( &cert_event.cert, &cl, &slot_only );
+      scenario_cert_add( s, ag_cert_kind_name( cert_event.cert.kind ), &cl, slot_only );
       ag_pool_add_cert( pool, &cert_event.cert, bad );
       progress = 1;
     }
   }
   check_finality( s, pool );
   check_canonical( s, pool );
+}
+
+/* Deliver one 20% message, or all three for a legacy whole-cert action.
+   Pump between legacy messages so weak-quorum events reach Votor. */
+static void
+add_cert_parts( scenario_t *  s,
+                ag_pool_t *   pool,
+                ag_votor_t *  votor,
+                action_t const * a,
+                long          now ) {
+  ag_block_id_t id = block_id( a->label );
+  ulong begin = a->part==ULONG_MAX ? 0UL           : a->part;
+  ulong end   = a->part==ULONG_MAX ? CERT_PART_CNT : a->part+1UL;
+  for( ulong part=begin; part<end; part++ ) {
+    for( ulong i=0UL; i<CERT_PART_SIGNERS; i++ ) {
+      ushort rank = cert_part_rank[ part ][ i ];
+      uchar const * pubkey = epoch_info.validators[ rank ].bls_key;
+      ag_vote_t vote = a->kind==NOTARIZE_CERT
+        ? ag_vote_construct_notar( sec_sign_fn, &validator_sk[ rank ], pubkey, id.slot, id.hash, rank, SHRED_VERSION )
+        : ag_vote_construct_skip ( sec_sign_fn, &validator_sk[ rank ], pubkey, id.slot,          rank, SHRED_VERSION );
+      uchar quorum_reached;
+      int err = ag_pool_add_vote( pool, &vote, bad, &quorum_reached );
+      if( err==AG_POOL_ERR_SLOT_OUT_OF_BOUNDS ) return;
+      if( err!=AG_POOL_SUCCESS ) FD_LOG_CRIT(( "certificate part vote rejected in slot %lu: %d", id.slot, err ));
+    }
+    if( part+1UL<end ) pump( s, pool, votor, now );
+  }
 }
 
 /* Mapping fresh pool and votor memory for every scenario dominates the
@@ -547,7 +769,8 @@ static ulong  mem_slot_max;
 /* Runs the actions against a fresh pool and votor, then checks the finalized slot. */
 
 static void
-scenario_run( scenario_t * s ) {
+scenario_run( scenario_t * s,
+             FILE *        trace ) {
   /* The pool holds slots up to slot_max-AG_REWARD_SLOT_DELTA past the
      root, and its event queues hold slot_max events. */
   ulong slot_max = fd_ulong_max( s->vote_slot_cnt+AG_REWARD_SLOT_DELTA, s->node_cnt+2UL );
@@ -565,25 +788,27 @@ scenario_run( scenario_t * s ) {
   FD_TEST( pool && votor );
   ag_pool_init          ( pool, 0UL );
   ag_pool_advance_epoch ( pool, &epoch_info, 0UL, 0UL );
-  ag_votor_init         ( votor, 0UL, 0L, NS_PER_SLOT, SHRED_VERSION, fake_sign_fn, NULL );
-  ag_votor_advance_epoch( votor, NS_PER_SLOT, 0UL, 0UL );
+  ag_votor_init         ( votor, 0UL, 0L, NS_PER_SLOT, SHRED_VERSION, sec_sign_fn, &validator_sk[0] );
+  ag_votor_advance_epoch( votor, NS_PER_SLOT, 0UL, 0UL, epoch_info.validators[0].bls_key );
 
   long now = 0L;
   for( ulong i=0UL; i<s->action_cnt; i++ ) {
     action_t const * a = &s->actions[i];
     switch( a->kind ) {
     case NOTARIZE_CERT:
+    case SKIP_CERT:
+      add_cert_parts( s, pool, votor, a, now );
+      break;
     case FINALIZE_CERT:
     case NOTAR_FALLBACK_CERT:
-    case FAST_FINALIZE_CERT:
-    case SKIP_CERT: {
+    case FAST_FINALIZE_CERT: {
       ag_cert_t c = cert( a->kind, a->label );
+      scenario_cert_add( s, action_kind_name[ a->kind ], &a->label, a->kind==FINALIZE_CERT || a->kind==SKIP_CERT );
       ag_pool_add_cert( pool, &c, bad );
       break;
     }
     case REPLAY_ARRIVES: {
-      ag_event_block_t arrived = { .kind = AG_EVENT_BLOCK_FIRST_SHRED, .slot = a->label.slot };
-      ag_votor_handle_block_event( votor, &arrived );
+      /* Votor now receives replayed blocks only after completion. */
       break;
     }
     case REPLAY_COMPLETE: {
@@ -593,28 +818,38 @@ scenario_run( scenario_t * s ) {
       node_t * n          = node_find( s, a->label );
       n->replayed         = 1;
       n->replayed_parent  = parent;
-      ag_event_replay_t completed = { .kind = AG_EVENT_REPLAY_COMPLETED, .slot = id.slot, .block_info = { .parent = parent } };
+      ag_event_replay_t completed = { .slot = id.slot, .block_info = { .parent = parent } };
       memcpy( completed.block_info.hash, id.hash, sizeof(ag_block_hash_t) );
       ag_votor_handle_replay_event( votor, &completed );
       break;
     }
     case REPLAY_DEAD: {
-      ulong            final_cert_slot = s->final_cert_slot;
-      int              retired         = s->slots[ a->label.slot ].voted_final;
-      ag_event_block_t invalid         = { .kind = AG_EVENT_BLOCK_INVALID_BLOCK, .slot = a->label.slot };
+      /* A failed replay emits no replay event to Votor. */
       node_find( s, a->label )->dead = 1;
-      ag_votor_handle_block_event( votor, &invalid );
-      pump( s, pool, votor, now );
-      check_dead( s, a->label.slot, final_cert_slot, retired );
-      continue;
+      break;
     }
     case CLOCK:
       now += (long)a->ms*1000000L;
       break;
+    case STANDSTILL:
+      ag_pool_recover_from_standstill( pool );
+      break;
     }
     pump( s, pool, votor, now );
+    {
+      char as[ 96 ], lb[ 64 ];
+      if( a->kind==CLOCK ) snprintf( as, sizeof(as), "CLOCK %lums", a->ms );
+      else if( a->kind==STANDSTILL ) snprintf( as, sizeof(as), "STANDSTILL" );
+      else {
+        label_str( a->label, lb );
+        if( a->part!=ULONG_MAX ) snprintf( as, sizeof(as), "%s %s %lu/3", action_kind_name[ a->kind ], lb, a->part+1UL );
+        else                     snprintf( as, sizeof(as), "%s %s", action_kind_name[ a->kind ], lb );
+      }
+      trace_record( trace, s, pool, i, as );
+    }
   }
   pump( s, pool, votor, now+NS_EVERY_TIMEOUT );
+  trace_record( trace, s, pool, s->action_cnt, "END" );
 
   ulong         finalized_slot = ag_pool_finalized_slot( pool );
   uchar const * finalized_hash = ag_pool_finalized_block_hash( pool );
@@ -638,11 +873,12 @@ backtrace_on_exit( void ) {
 }
 
 static void
-worker( char ** paths,
-        ulong   path_cnt,
-        ulong   first,
-        ulong   stride,
-        ulong * current ) {
+worker( char **       paths,
+        ulong         path_cnt,
+        ulong         first,
+        ulong         stride,
+        ulong *       current,
+        char const *  trace_dir ) {
   atexit( backtrace_on_exit );
   fd_log_level_logfile_set( 4 ); /* ERR and up, the votor warns a lot */
   fd_log_level_stderr_set ( 4 );
@@ -650,9 +886,28 @@ worker( char ** paths,
     *current = i;
     scenario_t s;
     scenario_load( &s, paths[i] );
-    scenario_run( &s );
+    FILE * trace = NULL;
+    if( trace_dir ) {
+      char const * base = strrchr( paths[i], '/' );
+      base = base ? base+1 : paths[i];
+      char path[ PATH_MAX ];
+      FD_TEST( fd_cstr_printf_check( path, sizeof(path), NULL, "%s/%s.trace", trace_dir, base ) );
+      trace = fopen( path, "w" );
+      FD_TEST( trace );
+    }
+    scenario_run( &s, trace );
+    if( trace ) fclose( trace );
     scenario_free( &s );
   }
+#if FD_HAS_COVERAGE
+  char const * profile_file = getenv( "LLVM_PROFILE_FILE" );
+  if( profile_file ) {
+    char worker_profile[ PATH_MAX ];
+    FD_TEST( fd_cstr_printf_check( worker_profile, sizeof(worker_profile), NULL, "%s-worker-%lu", profile_file, first ) );
+    __llvm_profile_set_filename( worker_profile );
+  }
+  FD_TEST( !__llvm_profile_write_file() );
+#endif
   _exit( 0 );
 }
 
@@ -663,6 +918,10 @@ main( int     argc,
       char ** argv ) {
   fd_boot( &argc, &argv );
   ulong jobs = fd_env_strip_cmdline_ulong( &argc, &argv, "--jobs", NULL, (ulong)sysconf( _SC_NPROCESSORS_ONLN ) );
+  char const * trace_dir = fd_env_strip_cmdline_cstr( &argc, &argv, "--trace", NULL, NULL );
+  if( trace_dir ) {
+    if( mkdir( trace_dir, 0777 ) && errno!=EEXIST ) FD_LOG_ERR(( "mkdir(%s) failed", trace_dir ));
+  }
 
   glob_t g = { 0 };
   for( int i=1; i<argc; i++ ) {
@@ -687,7 +946,7 @@ main( int     argc,
   for( ulong w=0UL; w<jobs; w++ ) {
     pids[w] = fork();
     FD_TEST( pids[w]>=0 );
-    if( !pids[w] ) worker( g.gl_pathv, g.gl_pathc, w, jobs, &current[w] );
+    if( !pids[w] ) worker( g.gl_pathv, g.gl_pathc, w, jobs, &current[w], trace_dir );
   }
 
   int failed = 0;
