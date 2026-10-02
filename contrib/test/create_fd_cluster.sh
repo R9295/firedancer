@@ -38,8 +38,8 @@ expand_cpu_list() {
   done
 }
 
-# A validator has 25 affinity entries in this reduced test topology.  Shared
-# entries let those tiles use a smaller CPU set, but unlike plain `f25` they
+# A validator has 24 affinity entries in this reduced test topology.  Shared
+# entries let those tiles use a smaller CPU set, but unlike plain `f24` they
 # also give workspace placement a NUMA home.  Give every validator disjoint
 # whole physical cores and distribute validators round-robin across NUMA.
 plan_affinities() {
@@ -104,7 +104,7 @@ plan_affinities() {
     read -r -a cpus <<<"${node_cpu_lists[i]}"
     (( ${#cpus[@]} )) || fail "No CPU was assigned to validator $i."
     affinity=
-    for ((tile=0; tile<25; tile++)); do
+    for ((tile=0; tile<24; tile++)); do
       cpu=${cpus[tile%${#cpus[@]}]}
       affinity+="${affinity:+,}s$cpu"
     done

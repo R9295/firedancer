@@ -30,12 +30,12 @@ C=/home/fuzz/cluster-10 contrib/test/run_fd_cluster.sh net
 ```
 
 Each validator has 10% of genesis stake. The generated smoke-test profile uses
-about 11.1 GiB per validator, or about 111 GiB for ten validators. Its 25 tile
-threads share a validator-specific set of physical cores. The generator reserves
+about 11.7 GiB per validator, or about 117 GiB for ten validators. Its 24 pinned
+tile threads share a validator-specific set of physical cores. The generator reserves
 one physical core per used Non-Uniform Memory Access (NUMA) node for the host,
 uses disjoint validator CPU sets, and distributes validators round-robin across
 NUMA nodes. On a four-NUMA host, ten validators use a 3/3/2/2 memory split instead
-of reserving all 111 GiB on one NUMA node. Use the manual setup below when the
+of reserving all 117 GiB on one NUMA node. Use the manual setup below when the
 host needs a different node count, port plan, or affinity plan.
 
 The manual paths below use `/cluster` as an example. The test binary does not
@@ -337,7 +337,7 @@ other. The test refuses to start such a pair.
 
 The small accounts, slot, fork, and cache values above are a smoke-test
 profile. Measure the exact total for the current configs with `mem`; the
-three-node profile above needs about 11.3 GiB of 2 MiB huge pages per
+three-node profile above needs about 11.7 GiB of 2 MiB huge pages per
 node. Raise `runtime.max_live_slots` and the associated pools for longer
 fuzz campaigns. A 64-slot pool can fill if a whole validator is
 suspended while the rest of the cluster keeps advancing.
