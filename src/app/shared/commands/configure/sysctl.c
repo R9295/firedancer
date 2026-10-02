@@ -81,18 +81,24 @@ static const sysctl_param_t xdp_params[] = {
   {0}
 };
 
+/* Before Linux made them per network namespace, rmem_max and wmem_max
+   exist only in the initial namespace, and sockets in any other
+   namespace are bounded by the initial namespace's values.  Tolerate
+   them missing so validators can run in a private namespace (e.g. the
+   fd-netctl test cluster) once the host itself is configured. */
+
 static sysctl_param_t sock_params[] = {
   {
     "/proc/sys/net/core/rmem_max",
     0,
     ENFORCE_MINIMUM,
-    0,
+    1,
   },
   {
     "/proc/sys/net/core/wmem_max",
     0,
     ENFORCE_MINIMUM,
-    0,
+    1,
   },
   {0}
 };
