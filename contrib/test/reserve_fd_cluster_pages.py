@@ -6,6 +6,20 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import time
+
+# The same recovery the hugetlbfs configure stage runs on ENOMEM: free
+# memory is often too fragmented to form huge pages until the page
+# cache is dropped and memory is compacted.
+COMPACT_STEPS = (("/proc/sys/vm/compact_memory", 1),
+                 ("/proc/sys/vm/drop_caches", 3),
+                 ("/proc/sys/vm/compact_memory", 1))
+
+
+def compact():
+    for path, value in COMPACT_STEPS:
+        Path(path).write_text(f"{value}\n")
+        time.sleep(0.5)
 
 
 def requirements(summaries):
@@ -62,13 +76,18 @@ def prepare(dev, configs):
         if target == total:
             continue
         print(f"NUMA {node}: increasing {size} KiB page pool from {total} to {target}", flush=True)
-        (pool / "nr_hugepages").write_text(f"{target}\n")
-        free = int((pool / "free_hugepages").read_text())
-        if free < count:
-            raise RuntimeError(
-                f"NUMA {node}: need {count} free {size} KiB pages, got {free}. "
-                "Insufficient contiguous memory; reserve huge pages at boot or retry after reboot."
-            )
+        for attempt in range(2):
+            (pool / "nr_hugepages").write_text(f"{target}\n")
+            free = int((pool / "free_hugepages").read_text())
+            if free >= count:
+                break
+            if attempt:
+                raise RuntimeError(
+                    f"NUMA {node}: need {count} free {size} KiB pages, got {free}. "
+                    "Insufficient contiguous memory; reserve huge pages at boot or retry after reboot."
+                )
+            print(f"NUMA {node}: only {free} free {size} KiB pages; compacting memory before trying again.", flush=True)
+            compact()
 
 
 def main():

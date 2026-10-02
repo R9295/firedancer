@@ -23,6 +23,8 @@ class ReservationTest(unittest.TestCase):
             self.files[f"{base}/nr_hugepages"] = count
             self.files[f"{base}/free_hugepages"] = count
         self.writes = []
+        self.compactions = []
+        self.capacity = None  # largest pool fragmented memory can form
 
     def read(self, path):
         return str(self.files[str(path)])
@@ -30,6 +32,12 @@ class ReservationTest(unittest.TestCase):
     def write(self, path, value):
         path = str(path)
         value = int(value)
+        if path.startswith("/proc/sys/vm/"):
+            self.compactions.append(path)
+            self.capacity = None
+            return
+        if self.capacity is not None:
+            value = min(value, self.capacity)
         free_path = path.replace("nr_hugepages", "free_hugepages")
         self.files[free_path] += value - self.files[path]
         self.files[path] = value
@@ -54,13 +62,32 @@ class ReservationTest(unittest.TestCase):
         report.assert_not_called()
         write.assert_not_called()
 
+    def test_compaction_recovers_fragmented_pool(self):
+        self.capacity = 280
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1)), \
+             patch.object(subprocess, "check_output", side_effect=map(json.dumps, self.reports)), \
+             patch.object(reserve.Path, "read_text", autospec=True, side_effect=self.read), \
+             patch.object(reserve.Path, "write_text", autospec=True, side_effect=self.write), \
+             patch.object(reserve.time, "sleep"):
+            reserve.prepare("/build/firedancer-dev", self.configs)
+        node0 = "/sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages"
+        self.assertEqual(self.compactions, [path for path, _ in reserve.COMPACT_STEPS])
+        self.assertEqual(self.writes, [
+            (node0, 280),
+            (node0, 294),
+            ("/sys/devices/system/node/node3/hugepages/hugepages-2048kB/nr_hugepages", 5655),
+        ])
+
     def test_cannot_satisfy_pool(self):
         with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1)), \
              patch.object(subprocess, "check_output", side_effect=map(json.dumps, self.reports)), \
              patch.object(reserve.Path, "read_text", autospec=True, side_effect=self.read), \
-             patch.object(reserve.Path, "write_text"):
+             patch.object(reserve.Path, "write_text", autospec=True) as write, \
+             patch.object(reserve.time, "sleep"):
             with self.assertRaisesRegex(RuntimeError, "NUMA 0: need 294"):
                 reserve.prepare("/build/firedancer-dev", self.configs)
+        compactions = [str(call.args[0]) for call in write.call_args_list if str(call.args[0]).startswith("/proc/")]
+        self.assertEqual(compactions, [path for path, _ in reserve.COMPACT_STEPS])
 
     def test_allocated_pages_are_preserved(self):
         self.assertEqual(reserve.pool_target(200, 20, 100), 280)
