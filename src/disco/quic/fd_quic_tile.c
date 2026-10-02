@@ -4,6 +4,7 @@
 #include "../topo/fd_topo.h"
 #include "fd_tpu.h"
 #include "../../waltz/quic/fd_quic_private.h"
+#include <linux/futex.h>
 #include "generated/quic_seccomp.h"
 #include "../../util/io/fd_io.h"
 #include "../../util/net/fd_eth.h"
@@ -69,6 +70,30 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
   return FD_LAYOUT_FINI( l, scratch_align() );
 }
 
+/* reasm_evict_tail updates metrics for the reassembly about to be
+   evicted by the next fd_tpu_reasm_{prepare,publish_fast}.  Must be
+   called before every such call. */
+
+static void
+reasm_evict_tail( fd_quic_ctx_t * ctx ) {
+  /* Was the reasm buffer we evicted busy? */
+  fd_tpu_reasm_slot_t * victim      = fd_tpu_reasm_peek_tail( ctx->reasm );
+  int                   victim_busy = victim->k.state == FD_TPU_REASM_STATE_BUSY;
+  if( FD_LIKELY( !victim_busy ) ) return;
+
+  /* If so, does the connection it refers to still exist?
+     (Or was the buffer previously abandoned by means of conn close) */
+  fd_quic_state_t * state         = fd_quic_get_state( ctx->quic );
+  uint              victim_cidx   = fd_quic_conn_uid_idx( victim->k.conn_uid );
+  uint              victim_gen    = fd_quic_conn_uid_gen( victim->k.conn_uid );
+  fd_quic_conn_t *  victim_conn   = fd_quic_conn_at_idx( state, victim_cidx );
+  uint victim_exists = (victim_conn->conn_gen == victim_gen) &
+                       (victim_conn->state == FD_QUIC_CONN_STATE_ACTIVE); /* in [0,1] */
+  victim_conn->srx->rx_streams_active -= victim_exists;
+  ctx->metrics.reasm_overrun          += victim_exists;
+  ctx->metrics.reasm_active           -= victim_exists;
+}
+
 /* legacy_stream_notify is called for transactions sent via TPU/UDP. For
    now both QUIC and non-QUIC transactions are accepted, with traffic
    type determined by port.
@@ -89,6 +114,7 @@ legacy_stream_notify( fd_quic_ctx_t * ctx,
   void *              base     = ctx->verify_out_mem;
   ulong               seq      = stem->seqs[0];
 
+  reasm_evict_tail( ctx );
   int err = fd_tpu_reasm_publish_fast( reasm, packet, packet_sz, mcache, base, seq, tspub, ipv4, FD_TXN_M_TPU_SOURCE_UDP );
   if( FD_LIKELY( err==FD_TPU_REASM_SUCCESS ) ) {
     fd_stem_advance( stem, 0UL );
@@ -112,6 +138,12 @@ before_credit( fd_quic_ctx_t *     ctx,
   long now = fd_clock_tile_now( ctx->clock );
   ctx->now = now;
   *charge_busy = fd_quic_service( ctx->quic, now );
+}
+
+static inline long
+next_deadline( fd_quic_ctx_t * ctx ) {
+  long next = fd_quic_get_next_wakeup( ctx->quic );
+  return next==LONG_MAX ? LONG_MAX : fd_clock_tile_wallclock_to_tickcount( ctx->clock, next );
 }
 
 static inline void
@@ -279,7 +311,6 @@ quic_stream_rx( fd_quic_conn_t * conn,
                 int              fin ) {
 
   fd_quic_t *         quic     = conn->quic;
-  fd_quic_state_t *   state    = fd_quic_get_state( quic );  /* ugly */
   fd_quic_ctx_t *     ctx      = quic->cb.quic_ctx;
   long                tspub    = ctx->now;
   fd_tpu_reasm_t *    reasm    = ctx->reasm;
@@ -301,6 +332,7 @@ quic_stream_rx( fd_quic_conn_t * conn,
       ctx->metrics.quic_txn_too_large++;
       return FD_QUIC_SUCCESS; /* drop */
     }
+    reasm_evict_tail( ctx );
     int err = fd_tpu_reasm_publish_fast( reasm, data, data_sz, mcache, base, seq, tspub, conn->peer->ip_addr, FD_TXN_M_TPU_SOURCE_QUIC );
     if( FD_LIKELY( err==FD_TPU_REASM_SUCCESS ) ) {
       fd_stem_advance( stem, 0UL );
@@ -319,28 +351,13 @@ quic_stream_rx( fd_quic_conn_t * conn,
       return FD_QUIC_SUCCESS;
     }
     if( data_sz==0 ) return FD_QUIC_SUCCESS; /* ignore empty */
+    if( FD_UNLIKELY( !conn->called_conn_new ) ) return FD_QUIC_FAILED;
     if( FD_UNLIKELY( oversz ) ) {
       ctx->metrics.quic_txn_too_large++;
       return FD_QUIC_SUCCESS; /* drop */
     }
 
-    /* Was the reasm buffer we evicted busy? */
-    fd_tpu_reasm_slot_t * victim      = fd_tpu_reasm_peek_tail( reasm );
-    int                   victim_busy = victim->k.state == FD_TPU_REASM_STATE_BUSY;
-
-    /* If so, does the connection it refers to still exist?
-       (Or was the buffer previously abandoned by means of conn close) */
-    uint             victim_cidx   = fd_quic_conn_uid_idx( victim->k.conn_uid );
-    uint             victim_gen    = fd_quic_conn_uid_gen( victim->k.conn_uid );
-    fd_quic_conn_t * victim_conn   = fd_quic_conn_at_idx( state, victim_cidx ); /* possibly oob */
-    if( victim_busy ) {
-      uint victim_exists = (victim_conn->conn_gen == victim_gen) &
-                           (victim_conn->state == FD_QUIC_CONN_STATE_ACTIVE); /* in [0,1] */
-      victim_conn->srx->rx_streams_active -= victim_exists;
-      ctx->metrics.reasm_overrun          += victim_exists;
-      ctx->metrics.reasm_active           -= victim_exists;
-    }
-
+    reasm_evict_tail( ctx );
     slot = fd_tpu_reasm_prepare( reasm, conn_uid, stream_id, tspub ); /* infallible */
     ctx->metrics.reasm_started++;
     ctx->metrics.reasm_active++;
@@ -663,6 +680,7 @@ populate_allowed_fds( fd_topo_t const *      topo,
 #define STEM_CALLBACK_CONTEXT_ALIGN alignof(fd_quic_ctx_t)
 
 #define STEM_CALLBACK_METRICS_WRITE       metrics_write
+#define STEM_CALLBACK_NEXT_DEADLINE       next_deadline
 #define STEM_CALLBACK_BEFORE_CREDIT       before_credit
 #define STEM_CALLBACK_BEFORE_FRAG         before_frag
 #define STEM_CALLBACK_DURING_FRAG         during_frag

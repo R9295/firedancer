@@ -224,7 +224,7 @@ struct ag_parent_fec_count_res {
 typedef struct ag_parent_fec_count_res ag_parent_fec_count_res_t;
 struct ag_fec_root_res {
   ag_proof_node_t root; /* 20-byte FEC-set merkle root prefix */
-  ulong     proof_len; /* number of proof nodes in fec_proof */
+  ulong           proof_len; /* number of proof nodes in fec_proof */
   ag_proof_node_t fec_proof[ AG_MAX_FEC_PROOF_NODE_CNT ]; /* variable-length */
 };
 typedef struct ag_fec_root_res ag_fec_root_res_t;
@@ -361,15 +361,16 @@ ag_repair_shred_block_id( fd_repair_t * repair, fd_pubkey_t const * to, ulong ts
      u32 tag: 0=ParentFecSetCount, 1=FecSetRoot
      tag 0: u32 fec_set_count, u64 parent_slot, u8[32] parent_block_id,
             u64 proof_sz, u8[proof_sz] proof
-     tag 1: u8[32] fec_set_root, u64 proof_sz, u8[proof_sz] proof
+     tag 1: u8[20] fec_set_root, u64 proof_sz, u8[proof_sz] proof
      u32 nonce
 
    Proofs are a concatenation of 20-byte merkle nodes (proof_sz must be
    a multiple of FD_SHRED_MERKLE_NODE_SZ).  Ping responses (tag 2) are
    not handled here; they are the same sz as legacy repair pings and
    should be routed to the ping path.  fec_set_max bounds the FEC sets
-   a block may hold (max_shreds_per_block/FD_FEC_SHRED_CNT).  Returns 0
-   on success and -1 if the response is malformed.
+   a block may hold (max_shreds_per_block/FD_FEC_SHRED_CNT); a
+   fec_set_count of 0 or above that bound is malformed.  Returns 0 on
+   success and -1 if the response is malformed.
    Does NOT verify the merkle proofs. */
 int
 ag_repair_response_de( ag_repair_response_t * response,
@@ -388,7 +389,29 @@ ag_repair_parent_fec_count_verify( ag_parent_fec_count_res_t const * res,
 int
 ag_repair_fec_set_root_verify( ag_fec_root_res_t const * res,
                                fd_hash_t const *         block_id,
-                               uint                      fec_set_idx );
+                               uint                      fec_set_idx,
+                               uint                      fec_set_count );
+
+/* ag_repair_parent_fec_count_ser / ag_repair_fec_set_root_ser write a
+   response in the wire format above, including the trailing nonce.
+   proof is proof_len 20B nodes.  Return bytes written, or 0 if buf_sz
+   is too small. */
+ulong
+ag_repair_parent_fec_count_ser( uchar *           buf,
+                                ulong             buf_sz,
+                                uint              fec_set_count,
+                                ulong             parent_slot,
+                                fd_hash_t const * parent_block_id,
+                                uchar const *     proof,
+                                ulong             proof_len,
+                                uint              nonce );
+ulong
+ag_repair_fec_set_root_ser( uchar *       buf,
+                            ulong         buf_sz,
+                            uchar const * root,
+                            uchar const * proof,
+                            ulong         proof_len,
+                            uint          nonce );
 
 /* fd_repair_sz returns the bincode-serialized sz of msg. */
 

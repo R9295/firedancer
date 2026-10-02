@@ -28,6 +28,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 
+#include <linux/futex.h>
 #include "generated/fd_event_tile_seccomp.h"
 
 #define GRPC_BUF_MAX (12UL<<20UL) /* 12 MiB */
@@ -183,6 +184,12 @@ metrics_write( fd_event_tile_t * ctx ) {
   FD_MCNT_SET( EVENT, CREDIT_STALL,        metrics->credit_stall_cnt );
 
   FD_MGAUGE_SET( EVENT, CONN_STATE,        fd_event_client_state( ctx->client ) );
+}
+
+static long
+next_deadline( fd_event_tile_t * ctx ) {
+  if( FD_UNLIKELY( ctx->next_poll_deadline==LONG_MAX ) ) return LONG_MAX;
+  return fd_clock_tile_wallclock_to_tickcount( ctx->clock, ctx->next_poll_deadline );
 }
 
 static void
@@ -474,13 +481,23 @@ unprivileged_init( fd_topo_t const *      topo,
   FD_TEST( sign_in_idx!=ULONG_MAX );
   fd_topo_link_t const * sign_in = &topo->links[ tile->in_link_id[ sign_in_idx ] ];
   fd_topo_link_t const * sign_out = &topo->links[ tile->out_link_id[ sign_out_idx ] ];
+
+  fd_sleep_t * sleep = NULL;
+  if( FD_UNLIKELY( topo->sleep_obj_id!=ULONG_MAX ) ) {
+    sleep = fd_sleep_join( fd_topo_obj_laddr( topo, topo->sleep_obj_id ) );
+    FD_TEST( sleep );
+  }
+
   if( FD_UNLIKELY( !fd_keyguard_client_join( fd_keyguard_client_new( ctx->keyguard_client,
           sign_out->mcache,
           sign_out->dcache,
           sign_in->mcache,
           sign_in->dcache,
           sign_out->mtu,
-          sign_in->mtu ) ) ) ) {
+          sign_in->mtu,
+          sleep,
+          sign_out->id,
+          fd_topo_find_link_consumer( topo, sign_out ) ) ) ) ) {
     FD_LOG_ERR(( "failed to construct keyguard" ));
   }
 
@@ -641,6 +658,7 @@ during_housekeeping( fd_event_tile_t * ctx ) {
 #define STEM_CALLBACK_CONTEXT_ALIGN alignof(fd_event_tile_t)
 
 #define STEM_CALLBACK_METRICS_WRITE       metrics_write
+#define STEM_CALLBACK_NEXT_DEADLINE       next_deadline
 #define STEM_CALLBACK_BEFORE_CREDIT       before_credit
 #define STEM_CALLBACK_DURING_FRAG         during_frag
 #define STEM_CALLBACK_AFTER_FRAG          after_frag

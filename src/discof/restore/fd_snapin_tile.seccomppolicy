@@ -5,7 +5,7 @@
 #              tiles may need to pull accounts into the cache from disk,
 #              or purge out of cache to the disk to make forward
 #              progress.
-uint logfile_fd, uint accounts_fd, uint stake_spill_fd
+uint logfile_fd, uint accounts_fd, uint accounts_direct_fd, uint stake_spill_fd
 
 # logging: all log messages are written to a file and/or pipe
 #
@@ -51,5 +51,24 @@ pread64: (eq (arg 0) stake_spill_fd)
 # Stake delegations may also spill full records to disk.
 #
 # arg 0 is the file descriptor to write to.
-pwrite64: (or (eq (arg 0) accounts_fd)
+pwrite64: (or (eq (arg 0) accounts_direct_fd)
               (eq (arg 0) stake_spill_fd))
+
+# power saving: sleep when there is no work to do
+#
+# In the efficient scheduler mode, an idle tile parks on its sleep word
+# with futex_wait until a producer has work for it or its next deadline
+# passes.
+#
+# arg 1 is the futex op, always FUTEX_WAIT_BITSET so the timeout is an
+# absolute deadline.  arg 2 is the expected value of the word, always 0
+# (parked).
+futex: (and (eq (arg 1) FUTEX_WAIT_BITSET)
+            (eq (arg 2) 0))
+
+# power saving: resume an interrupted sleep
+#
+# A signal delivered to a parked tile interrupts its futex_wait, and the
+# kernel resumes the wait with the remaining timeout via restart_syscall
+# when the tile next runs.
+restart_syscall

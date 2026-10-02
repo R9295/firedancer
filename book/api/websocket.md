@@ -1301,6 +1301,8 @@ potentially CPU heavy tasks
 regardless of the presence of incoming messages
 - handling: the portion of the run loop that executes as a side effect
 of an incoming message from an upstream producer tile
+- parked: the tile is asleep in the kernel waiting for work or a
+deadline, not executing the run loop
 
 ##### `regimes`
 
@@ -1314,10 +1316,15 @@ of an incoming message from an upstream producer tile
     "stalled_routine",
     "running_handling",
     "processing_handling",
+    "waiting",
+    "stalled_waiting",
 ]
 ```
 
-"stalled_handling" is an impossible state, and is therefore excluded.
+"waiting" is running_parked and "stalled_waiting" is stalled_parked.
+"stalled_handling" and "processing_parked" are impossible states (a
+tile with a message to consume never parks), and are therefore
+excluded.
 
 The sched_timers field is structured the same as the timers field, but
 represents a different set of regimes that together make up the total
@@ -1554,7 +1561,8 @@ are subsystem-specific and described below.
         "vote": "voting",
         "bundle": "connected",
         "replay": "running",
-        "turbine": "running"
+        "turbine": "running",
+        "builder": "disabled"
     }
 }
 ```
@@ -1568,13 +1576,14 @@ are subsystem-specific and described below.
 | bundle  | `string` | Bundle subsystem status |
 | replay  | `string` | Replay subsystem status |
 | turbine | `string` | Turbine subsystem status |
+| builder | `string` | External block builder status |
 
 **`vote`** states:
 | State          | Description |
 |----------------|-------------|
 | `disabled`     | The validator is non-voting, or the active consensus tile (`tower` for Tower or `votor` for Alpenglow) is not present in the topology |
 | `not_started`  | The active consensus tile exists but is not yet running, or the validator has not yet recorded a vote |
-| `delinquent`   | Under Tower, the vote distance exceeds 150 slots or the vote slot has not advanced for over 60 seconds. Under Alpenglow, the validator is delinquent according to the exact 128-slot on-chain vote-account lookback in `summary.vote_state` |
+| `delinquent`   | Under Tower, the vote distance exceeds 150 slots or the vote slot has not advanced for over 60 seconds. Under Alpenglow, the validator is delinquent according to the exact 128-slot on-chain vote-account lookback in `summary.vote_state`. Also reported when votes land but the vote account fails the validator admission ticket filter (not V4 with a BLS pubkey, or below the V4 rent-exempt minimum), so its stake is not admitted: no leader slots, no rewards |
 | `voting`       | The validator is voting and is not `delinquent` |
 
 **`bundle`** states:
@@ -1584,7 +1593,7 @@ are subsystem-specific and described below.
 | `disconnected` | All bundle tiles are disconnected from their block engine |
 | `connecting`   | At least one bundle tile is attempting to connect, but none are connected or sleeping |
 | `connected`    | At least one bundle tile has an active connection to its block engine |
-| `sleeping`     | At least one bundle tile is deliberately sleeping (backing off before reconnecting), but none are connected |
+| `sleeping`     | At least one bundle tile is deliberately idle (for example, no upcoming leader slots, or standing by while another block source is active), but none are connected |
 
 **`replay`** states:
 | State          | Description |
@@ -1602,6 +1611,15 @@ are subsystem-specific and described below.
 | `stalled`          | The turbine slot has not advanced in over 12 seconds |
 | `repair_outpacing` | Turbine slot is advancing, but repair byte throughput has exceeded turbine byte throughput over the last 12-second window, indicating degraded turbine connectivity |
 | `running`          | Turbine is receiving shreds and its throughput exceeds repair |
+
+**`builder`** states:
+| State          | Description |
+|----------------|-------------|
+| `disabled`     | No external block builder is configured. Validator clients without block builder support always report this state |
+| `disconnected` | The block builder is disconnected |
+| `connecting`   | The block builder connection is being established |
+| `unhealthy`    | The block builder is connected but is not in a usable state |
+| `connected`    | The block builder is connected and healthy |
 
 #### `summary.live_system_resources`
 | frequency      | type         | example |
@@ -2812,8 +2830,8 @@ Value is a flat array of base58-encoded identity pubkeys that have gone
 offline (activity timeout expired) since the last message.
 
 ### timeline
-Historical shred event data recorded by the validator, queryable over a
-UNIX nanosecond timestamp window.
+Historical event data recorded by the validator, queryable over a UNIX
+nanosecond timestamp window.
 
 #### `timeline.query_shreds`
 | frequency   | type          | example |
@@ -2859,6 +2877,93 @@ window, the response arrays are empty.
         "shred_idx": [1234, null],
         "event": [0, 1],
         "event_ts_delta": ["1000000", "2000000"]
+    }
+}
+```
+
+:::
+
+#### `timeline.query_agg_revenue`
+| frequency | type                 | example |
+|-----------|----------------------|---------|
+| *Request* | `TimelineAggRevenue` | below   |
+
+| param       | type     | description |
+|-------------|----------|-------------|
+| start_ns    | `string` | Inclusive lower bound, as a UNIX timestamp in nanoseconds |
+| end_ns      | `string` | Exclusive upper bound, as a UNIX timestamp in nanoseconds |
+| granularity | `string` | Required; one of the granularities below |
+
+`start_ns` and `end_ns` are non-negative UNIX nanosecond timestamps,
+encoded as decimal strings without leading zeros (except `"0"`). Both
+must be less than `9223372036854775807`, and `end_ns` must be greater
+than `start_ns`. Windows are half-open: `[start_ns, end_ns)`.
+
+| granularities |
+|---------------|
+| `250ms`, `500ms`, `1s`, `2s`, `4s`, `8s`, `15s`, `30s`, `1m`, `2m`, `4m`, `8m`, `15m`, `30m`, `1h`, `2h`, `4h`, `8h`, `12h`, `1d` |
+
+The request window is aligned to the request granularity bucket
+boundaries. At most 10,000 buckets may be requested, and the aligned
+exclusive end must also be less than `9223372036854775807`. The
+connection is closed if either limit is exceeded.
+
+Revenue aggregates include locally produced blocks. Transactions are
+bucketed by commit time into cached calendar-day aggregates, retained
+independently of detailed transaction history.
+
+The GUI's database is wiped on boot. When it reaches capacity, data is
+evicted approximately oldest-first.
+
+**`TimelineAggRevenue`**
+| field              | type               | description |
+|--------------------|--------------------|-------------|
+| granularity        | `string`           | Echoes the requested granularity |
+| reference_ts_ns    | `string`           | Start of the first aligned response bucket |
+| available_start_ns | `string\|null`     | Inclusive start of the retained calendar-day aggregates |
+| available_end_ns   | `string\|null`     | Exclusive end of the retained calendar-day aggregates |
+| txn_fees           | `(string\|null)[]` | Sum of base transaction fees per bucket, in lamports |
+| prio_fees          | `(string\|null)[]` | Sum of priority fees per bucket, in lamports |
+| tips               | `(string\|null)[]` | Sum of tips per bucket, in lamports |
+
+`available_start_ns` and `available_end_ns` are half-open lookup bounds,
+`[available_start_ns, available_end_ns)`, reflecting the data available
+in the server's database. Both are `null` when the server is missing
+data needed for a non-empty response.
+
+Each array has one entry per aligned bucket. Bucket `i` covers
+`[reference_ts_ns + i*duration, reference_ts_ns + (i+1)*duration)`.
+An entry is `null` when the field is unknown, distinct from a known
+zero. `null` values are ignored when computing rolled-up aggregates.
+
+::: details Example
+
+```json
+{
+    "topic": "timeline",
+    "key": "query_agg_revenue",
+    "id": 50,
+    "params": {
+        "start_ns": "1739657040000000000",
+        "end_ns": "1739657100000000000",
+        "granularity": "15s"
+    }
+}
+```
+
+```json
+{
+    "topic": "timeline",
+    "key": "query_agg_revenue",
+    "id": 50,
+    "value": {
+        "granularity": "15s",
+        "reference_ts_ns": "1739657040000000000",
+        "available_start_ns": "1739577600000000000",
+        "available_end_ns": "1739664000000000000",
+        "txn_fees": ["6015000", "5935000", null, "6200000"],
+        "prio_fees": ["120400", "98200", null, "131000"],
+        "tips": ["2500000", "0", null, "1000000"]
     }
 }
 ```

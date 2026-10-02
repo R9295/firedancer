@@ -6,6 +6,7 @@
 #include "../../disco/fd_clock_tile.h"
 #include "../../discof/fd_startup.h"
 #include <time.h>
+#include <linux/futex.h>
 #include "generated/fd_poh_tile_seccomp.h"
 
 #define IN_KIND_REPLAY (0)
@@ -103,6 +104,14 @@ after_credit( fd_poh_tile_t *     ctx,
     fd_poh_advance( ctx->poh, stem, opt_poll_in, charge_busy );
     ctx->idle_cnt = 0UL;
   }
+}
+
+static inline long
+next_deadline( fd_poh_tile_t * ctx ) {
+  long next = fd_poh_next_deadline( ctx->poh );
+  if( FD_LIKELY( next==LONG_MAX ) ) return LONG_MAX;
+  if( FD_UNLIKELY( next<=0L ) ) return 0L;
+  return fd_clock_tile_wallclock_to_tickcount( ctx->poh->clock, next );
 }
 
 /* ....
@@ -303,7 +312,7 @@ unprivileged_init( fd_topo_t const *      topo,
     ctx->in[ i ].wmark  = fd_dcache_compact_wmark ( ctx->in[ i ].mem, link->dcache, link->mtu );
     ctx->in[ i ].mtu    = link->mtu;
 
-    if(      !strcmp( link->name, "replay_out" ) ) ctx->in_kind[ i ] = IN_KIND_REPLAY;
+    if(      !strcmp( link->name, "replay_slot" ) ) ctx->in_kind[ i ] = IN_KIND_REPLAY;
     else if( !strcmp( link->name, "pack_poh"   ) ) ctx->in_kind[ i ] = IN_KIND_PACK;
     else if( !strcmp( link->name, "execle_poh" ) ) ctx->in_kind[ i ] = IN_KIND_EXECLE;
     else FD_LOG_ERR(( "unexpected input link name %s", link->name ));
@@ -366,6 +375,7 @@ populate_allowed_fds( fd_topo_t const *      topo,
 #define STEM_CALLBACK_CONTEXT_ALIGN alignof(fd_poh_tile_t)
 
 #define STEM_CALLBACK_DURING_HOUSEKEEPING during_housekeeping
+#define STEM_CALLBACK_NEXT_DEADLINE       next_deadline
 #define STEM_CALLBACK_AFTER_CREDIT        after_credit
 #define STEM_CALLBACK_BEFORE_FRAG         before_frag
 #define STEM_CALLBACK_RETURNABLE_FRAG     returnable_frag

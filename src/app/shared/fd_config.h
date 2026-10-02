@@ -105,6 +105,8 @@ struct fd_configf {
   } accounts;
 
   struct {
+    char mode[ 16 ];
+
     int  enable_block_production;
     int  enable_snapshot_production;
     uint sign_tile_count;
@@ -215,7 +217,7 @@ struct fd_configf {
 
   struct {
     ulong authorized_voter_paths_cnt;
-    char  authorized_voter_paths[ 16 ][ PATH_MAX ];
+    char  authorized_voter_paths[ FD_KEYGUARD_AUTH_VOTERS_MAX ][ PATH_MAX ];
   } paths;
 
 };

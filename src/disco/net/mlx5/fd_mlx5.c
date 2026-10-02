@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "fd_mlx5_private.h"
 #include "../../../util/log/fd_log.h"
 #include "../../../util/net/fd_eth.h"
@@ -16,18 +17,17 @@
 #include <stdlib.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
-#include <linux/netlink.h>
 #include <rdma/ib_user_ioctl_cmds.h>
 #include <rdma/ib_user_ioctl_verbs.h>
 #include <rdma/ib_user_verbs.h>
 #include <rdma/mlx5-abi.h>
 #include <rdma/mlx5_user_ioctl_cmds.h>
 #include <rdma/mlx5_user_ioctl_verbs.h>
-#include <rdma/rdma_netlink.h>
 #include <rdma/rdma_user_ioctl_cmds.h>
 
 /* Provide uverbs and mlx5 UAPI definitions missing from older Linux headers. */
@@ -82,45 +82,7 @@
 #ifndef MLX5_QP_FLAG_UAR_PAGE_INDEX
 #define MLX5_QP_FLAG_UAR_PAGE_INDEX (1024U)
 #endif
-#ifndef RDMA_NLDEV_CMD_STAT_SET
-#define RDMA_NLDEV_CMD_STAT_SET (16U)
-#endif
-#ifndef RDMA_NLDEV_CMD_STAT_GET
-#define RDMA_NLDEV_CMD_STAT_GET (17U)
-#endif
-#ifndef RDMA_NLDEV_ATTR_STAT_MODE
-#define RDMA_NLDEV_ATTR_STAT_MODE (74U)
-#endif
-#ifndef RDMA_NLDEV_ATTR_STAT_RES
-#define RDMA_NLDEV_ATTR_STAT_RES (75U)
-#endif
-#ifndef RDMA_NLDEV_ATTR_STAT_COUNTER
-#define RDMA_NLDEV_ATTR_STAT_COUNTER (77U)
-#endif
-#ifndef RDMA_NLDEV_ATTR_STAT_COUNTER_ENTRY
-#define RDMA_NLDEV_ATTR_STAT_COUNTER_ENTRY (78U)
-#endif
-#ifndef RDMA_NLDEV_ATTR_STAT_COUNTER_ID
-#define RDMA_NLDEV_ATTR_STAT_COUNTER_ID (79U)
-#endif
-#ifndef RDMA_NLDEV_ATTR_STAT_HWCOUNTERS
-#define RDMA_NLDEV_ATTR_STAT_HWCOUNTERS (80U)
-#endif
-#ifndef RDMA_NLDEV_ATTR_STAT_HWCOUNTER_ENTRY
-#define RDMA_NLDEV_ATTR_STAT_HWCOUNTER_ENTRY (81U)
-#endif
-#ifndef RDMA_NLDEV_ATTR_STAT_HWCOUNTER_ENTRY_NAME
-#define RDMA_NLDEV_ATTR_STAT_HWCOUNTER_ENTRY_NAME (82U)
-#endif
-#ifndef RDMA_NLDEV_ATTR_STAT_HWCOUNTER_ENTRY_VALUE
-#define RDMA_NLDEV_ATTR_STAT_HWCOUNTER_ENTRY_VALUE (83U)
-#endif
-#ifndef RDMA_COUNTER_MODE_MANUAL
-#define RDMA_COUNTER_MODE_MANUAL (2U)
-#endif
 
-/* FD_MLX5_UAR_DB_OFFSET is SQ doorbell register offset */
-#define FD_MLX5_UAR_DB_OFFSET       (0x800UL) /* MLX5_BF_OFFSET */
 #define FD_MLX5_ETH_INLINE_HDR_SZ   (18UL)    /* MLX5_ETH_L2_INLINE_HEADER_SIZE */
 #define FD_MLX5_LINK_LAYER_ETHERNET (2U)      /* IB_LINK_LAYER_ETHERNET */
 #define FD_UVERBS_NAME_MAX          (32UL)
@@ -329,6 +291,47 @@ fd_mlx5_uverbs_avail( void ) {
   return !stat( "/sys/class/infiniband_verbs", &class_stat ) && S_ISDIR( class_stat.st_mode );
 }
 
+int
+fd_mlx5_uverbs_modprobe( int is_dry_run ) {
+  pid_t pid = fork();
+  if( FD_UNLIKELY( pid<0 ) ) {
+    FD_LOG_WARNING(( "fork() for modprobe failed (%i-%s)", errno, fd_io_strerror( errno ) ));
+    return -1;
+  }
+  if( !pid ) {
+    int null_fd = open( "/dev/null", O_RDWR );
+    if( FD_UNLIKELY( null_fd<0 ) ) {
+      FD_LOG_WARNING(( "open(/dev/null) for modprobe failed (%i-%s)", errno, fd_io_strerror( errno ) ));
+      _exit( 1 );
+    }
+    if( FD_UNLIKELY( dup2( null_fd, STDIN_FILENO )<0 ||
+                     ( is_dry_run && dup2( null_fd, STDOUT_FILENO )<0 ) ) ) {
+      FD_LOG_WARNING(( "dup2() for modprobe failed (%i-%s)", errno, fd_io_strerror( errno ) ));
+      _exit( 1 );
+    }
+    if( null_fd!=STDIN_FILENO &&
+        !( is_dry_run && null_fd==STDOUT_FILENO ) ) close( null_fd );
+
+    char * argv[] = { "modprobe", "--quiet", "ib_uverbs", NULL, NULL };
+    if( is_dry_run ) {
+      argv[2] = "--dry-run";
+      argv[3] = "ib_uverbs";
+    }
+    char * const envp[] = { NULL };
+    execve( "/sbin/modprobe", argv, envp );
+    FD_LOG_WARNING(( "execve(/sbin/modprobe) failed (%i-%s)", errno, fd_io_strerror( errno ) ));
+    _exit( 1 );
+  }
+
+  int status;
+  while( FD_UNLIKELY( waitpid( pid, &status, 0 )<0 ) ) {
+    if( errno==EINTR ) continue;
+    FD_LOG_WARNING(( "waitpid() for modprobe failed (%i-%s)", errno, fd_io_strerror( errno ) ));
+    return -1;
+  }
+  return WIFEXITED( status ) && !WEXITSTATUS( status ) ? 0 : -1;
+}
+
 struct fd_mlx5_pd {
   fd_uverbs_ctx_t * ctx;    /* uverbs context */
   uint              handle; /* protection domain handle */
@@ -448,6 +451,13 @@ struct fd_uverbs_destroy_uar_req {
 };
 typedef struct fd_uverbs_destroy_uar_req fd_uverbs_destroy_uar_req_t;
 FD_STATIC_ASSERT( sizeof(fd_uverbs_destroy_uar_req_t)==40UL, uverbs_destroy_uar_req_sz );
+
+struct fd_uverbs_create_comp_channel_req {
+  struct ib_uverbs_cmd_hdr hdr;
+  ulong                    response;
+};
+typedef struct fd_uverbs_create_comp_channel_req fd_uverbs_create_comp_channel_req_t;
+FD_STATIC_ASSERT( sizeof(fd_uverbs_create_comp_channel_req_t)==16UL, uverbs_create_comp_channel_req_sz );
 
 struct fd_uverbs_create_cq_req {
   struct ib_uverbs_cmd_hdr hdr;
@@ -672,30 +682,6 @@ fd_rdma_name_valid( char const * name,
   return 0;
 }
 
-static int
-fd_mlx5_check_driver( char const * rdma_name ) {
-  char path[ FD_RDMA_PATH_MAX ];
-  FD_TEST( fd_cstr_printf_check( path, sizeof(path), NULL,
-                                 "/sys/class/infiniband/%s/device/driver", rdma_name ) );
-
-  char target[ FD_RDMA_PATH_MAX ];
-  ssize_t target_sz = readlink( path, target, sizeof(target)-1UL );
-  if( FD_UNLIKELY( target_sz<0 ) ) return -1;
-  if( FD_UNLIKELY( (ulong)target_sz==sizeof(target)-1UL ) ) {
-    errno = ENAMETOOLONG;
-    return -1;
-  }
-  target[ target_sz ] = '\0';
-
-  char const * driver = strrchr( target, '/' );
-  driver = driver ? driver+1 : target;
-  if( FD_UNLIKELY( strcmp( driver, "mlx5_core" ) ) ) {
-    errno = ENODEV;
-    return -1;
-  }
-  return 0;
-}
-
 /* fd_uverbs_* helpers build and submit Linux uverbs commands */
 static int
 fd_uverbs_name_valid( char const * name ) {
@@ -713,7 +699,6 @@ fd_uverbs_resolve( char         uverbs_name[ FD_UVERBS_NAME_MAX ],
     errno = EINVAL;
     return -1;
   }
-  if( FD_UNLIKELY( fd_mlx5_check_driver( rdma_name ) ) ) return -1;
 
   DIR * uverbs_dir = opendir( "/sys/class/infiniband_verbs" );
   if( FD_UNLIKELY( !uverbs_dir ) ) return -1;
@@ -1096,7 +1081,7 @@ fd_uverbs_destroy_uar( fd_uverbs_ctx_t * ctx,
     errno = EINVAL;
     return -1;
   }
-  return ioctl( ctx->cmd_fd, RDMA_VERBS_IOCTL, &req->hdr );
+  return (int)syscall( SYS_ioctl, ctx->cmd_fd, RDMA_VERBS_IOCTL, &req->hdr );
 }
 
 static ulong *
@@ -1111,7 +1096,7 @@ fd_uverbs_alloc_uar( fd_uverbs_ctx_t * ctx,
     errno = EINVAL;
     return NULL;
   }
-  if( FD_UNLIKELY( ioctl( ctx->cmd_fd, RDMA_VERBS_IOCTL, &req->hdr ) ) ) return NULL;
+  if( FD_UNLIKELY( syscall( SYS_ioctl, ctx->cmd_fd, RDMA_VERBS_IOCTL, &req->hdr ) ) ) return NULL;
 
   ulong handle_raw = req->attrs[0].data;
   if( FD_UNLIKELY( handle_raw>UINT_MAX || mmap_sz!=FD_MLX5_PAGE_SZ ||
@@ -1140,15 +1125,30 @@ fd_uverbs_map_uar( fd_uverbs_ctx_t * ctx,
   void * uar_mapping = mmap( NULL, FD_MLX5_PAGE_SZ, PROT_WRITE, MAP_SHARED,
                              ctx->cmd_fd, (off_t)mmap_offset );
   if( FD_UNLIKELY( uar_mapping==MAP_FAILED ) ) return NULL;
-  return (volatile uchar *)uar_mapping + FD_MLX5_UAR_DB_OFFSET;
+  return (volatile uchar *)uar_mapping;
+}
+
+static int
+fd_uverbs_create_comp_channel( fd_uverbs_ctx_t * ctx ) {
+  fd_uverbs_create_comp_channel_req_t       req [1];
+  struct ib_uverbs_create_comp_channel_resp resp[1];
+  fd_memset( req,  0, sizeof(req ) );
+  fd_memset( resp, 0, sizeof(resp) );
+
+  req->response = (ulong)resp;
+  FD_TEST( !fd_uverbs_init_cmd_hdr( &req->hdr, IB_USER_VERBS_CMD_CREATE_COMP_CHANNEL,
+                                    sizeof(req), sizeof(resp) ) );
+  if( FD_UNLIKELY( fd_uverbs_write_cmd( ctx->cmd_fd, req, sizeof(req) ) ) ) return -1;
+  return (int)resp->fd;
 }
 
 static uint *
-fd_uverbs_create_cq( uint *               handle,
-                     fd_uverbs_ctx_t *    ctx,
-                     fd_mlx5_cq_t const * cq,
-                     uint                 page_id,
-                     uint                 max_cqe ) {
+fd_uverbs_create_cq( uint *            handle,
+                     fd_uverbs_ctx_t * ctx,
+                     fd_mlx5_cq_t *    cq,
+                     int               comp_channel_fd,
+                     uint              page_id,
+                     uint              max_cqe ) {
   if( FD_UNLIKELY( !handle ) ) {
     errno = EINVAL;
     return NULL;
@@ -1168,7 +1168,7 @@ fd_uverbs_create_cq( uint *               handle,
   req->response                = (ulong)resp;
   req->user_handle             = (ulong)cq;
   req->cqe                     = cq->depth-1U;
-  req->comp_channel            = -1;
+  req->comp_channel            = comp_channel_fd;
   req->mlx5.fields.buf_addr    = (ulong)cq->entries;
   req->mlx5.fields.db_addr     = (ulong)cq->control;
   req->mlx5.fields.cqe_size    = sizeof(fd_mlx5_cqe_t);
@@ -1193,6 +1193,7 @@ fd_uverbs_create_cq( uint *               handle,
     return NULL;
   }
 
+  cq->cqn = resp->mlx5.cqn;
   *handle = resp->cq_handle;
   return handle;
 }
@@ -1577,17 +1578,23 @@ fd_uverbs_init( fd_uverbs_ctx_t *       uverbs,
       return NULL;
     }
 
+    int rx_comp_channel_fd = -1;
+    if( tile->rx_comp_channel_fd ) {
+      rx_comp_channel_fd = fd_uverbs_create_comp_channel( uverbs );
+      if( FD_UNLIKELY( rx_comp_channel_fd<0 ) ) return NULL;
+      *tile->rx_comp_channel_fd = rx_comp_channel_fd;
+    }
+
     uint uar_page_id;
     uint rx_cq_handle;
     uint tx_cq_handle;
-    if( FD_UNLIKELY( !fd_uverbs_alloc_uar( uverbs, &uar_page_id, &tx_qp->uar_mmap_offset )                  ||
-                     !fd_uverbs_create_cq( &rx_cq_handle, uverbs, tile->rx_cq, uar_page_id, caps->max_cqe ) ||
-                     !fd_uverbs_create_cq( &tx_cq_handle, uverbs, tile->tx_cq, uar_page_id, caps->max_cqe ) ||
-                     !fd_uverbs_register_mr( tile->lkey, pd, tile->packet_memory, tile->packet_memory_sz,
-                                             tile->packet_iova, caps->max_mr_size )                         ||
-                     !fd_uverbs_create_tx_qp( uverbs, tx_qp, pd, tx_cq_handle, uar_page_id )                ||
-                     !fd_uverbs_start_tx_qp( uverbs, tx_qp )                                                ||
-                     !fd_uverbs_create_rx_wq( uverbs, rx_wq, pd, rx_cq_handle )                             ||
+    if( FD_UNLIKELY( !fd_uverbs_alloc_uar( uverbs, &uar_page_id, &tx_qp->uar_mmap_offset )                                                       ||
+                     !fd_uverbs_create_cq( &rx_cq_handle, uverbs, tile->rx_cq, rx_comp_channel_fd, uar_page_id, caps->max_cqe )                  ||
+                     !fd_uverbs_create_cq( &tx_cq_handle, uverbs, tile->tx_cq, -1, uar_page_id, caps->max_cqe )                                  ||
+                     !fd_uverbs_register_mr( tile->lkey, pd, tile->packet_memory, tile->packet_memory_sz, tile->packet_iova, caps->max_mr_size ) ||
+                     !fd_uverbs_create_tx_qp( uverbs, tx_qp, pd, tx_cq_handle, uar_page_id )                                                     ||
+                     !fd_uverbs_start_tx_qp( uverbs, tx_qp )                                                                                     ||
+                     !fd_uverbs_create_rx_wq( uverbs, rx_wq, pd, rx_cq_handle )                                                                  ||
                      !fd_uverbs_start_rx_wq( uverbs, rx_wq ) ) ) {
       return NULL;
     }
@@ -1601,427 +1608,4 @@ fd_uverbs_init( fd_uverbs_ctx_t *       uverbs,
                                              FD_MLX5_RX_HASH_IPV4_UDP | FD_MLX5_RX_HASH_INNER,
                                              FD_MLX5_QP_TUNNEL_OFFLOADS ) ) ) return NULL;
   return outer_rss_qp;
-}
-
-#define FD_MLX5_NL_RECV_BUF_SZ (8192UL)
-
-struct fd_mlx5_nl_req {
-  struct nlmsghdr nlh;
-  uchar           attrs[ 5UL*(sizeof(struct nlattr)+sizeof(uint)) ];
-};
-typedef struct fd_mlx5_nl_req fd_mlx5_nl_req_t;
-
-typedef int (*fd_mlx5_nl_parse_fn_t)( struct nlmsghdr const * nlh,
-                                      void *                  parse_arg );
-
-static void
-fd_mlx5_nl_req_init( fd_mlx5_nl_req_t * req,
-                     uint               type,
-                     uint               flags,
-                     uint               request_seq ) {
-  fd_memset( req, 0, sizeof(*req) );
-  req->nlh.nlmsg_len   = sizeof(struct nlmsghdr);
-  req->nlh.nlmsg_type  = (ushort)type;
-  req->nlh.nlmsg_flags = (ushort)flags;
-  req->nlh.nlmsg_seq   = request_seq;
-}
-
-static int
-fd_mlx5_nl_req_u32( fd_mlx5_nl_req_t * req,
-                    ushort             type,
-                    uint               value ) {
-  ulong const attr_sz = sizeof(struct nlattr)+sizeof(uint);
-  if( FD_UNLIKELY( (ulong)req->nlh.nlmsg_len+attr_sz>sizeof(*req) ) ) {
-    errno = ENOSPC;
-    return -1;
-  }
-  struct nlattr * attr = (struct nlattr *)((uchar *)req+req->nlh.nlmsg_len);
-  attr->nla_len  = (ushort)attr_sz;
-  attr->nla_type = type;
-  fd_memcpy( (uchar *)(attr+1), &value, sizeof(value) );
-  req->nlh.nlmsg_len += (uint)attr_sz;
-  return 0;
-}
-
-static int
-fd_mlx5_nla_next( uchar const **         attr_cur,
-                  ulong *                attr_rem,
-                  struct nlattr const ** attr ) {
-  if( FD_UNLIKELY( !*attr_rem ) ) return 0;
-  if( FD_UNLIKELY( *attr_rem<sizeof(struct nlattr) ) ) {
-    errno = EPROTO;
-    return -1;
-  }
-
-  struct nlattr const * next_attr       = (struct nlattr const *)*attr_cur;
-  ulong const           attr_sz         = next_attr->nla_len;
-  ulong const           aligned_attr_sz = fd_ulong_align_up( attr_sz, NLA_ALIGNTO );
-  if( FD_UNLIKELY( attr_sz<sizeof(*next_attr) || aligned_attr_sz>*attr_rem ) ) {
-    errno = EPROTO;
-    return -1;
-  }
-
-  *attr      = next_attr;
-  *attr_cur += aligned_attr_sz;
-  *attr_rem -= aligned_attr_sz;
-  return 1;
-}
-
-static int
-fd_mlx5_nla_find( void const *           attr_data,
-                  ulong                  attr_data_sz,
-                  ushort                 type,
-                  struct nlattr const ** result_attr ) {
-  *result_attr = NULL;
-  uchar const * attr_cur = attr_data;
-  while( attr_data_sz ) {
-    struct nlattr const * attr;
-    int next_result = fd_mlx5_nla_next( &attr_cur, &attr_data_sz, &attr );
-    if( FD_UNLIKELY( next_result<0 ) ) return -1;
-    if( (attr->nla_type & (ushort)NLA_TYPE_MASK)==type ) {
-      *result_attr = attr;
-      return 1;
-    }
-  }
-  return 0;
-}
-
-static int
-fd_mlx5_nla_u32( struct nlattr const * attr,
-                 uint *                value ) {
-  if( FD_UNLIKELY( attr->nla_len!=sizeof(*attr)+sizeof(uint) ) ) {
-    errno = EPROTO;
-    return -1;
-  }
-  fd_memcpy( value, attr+1, sizeof(*value) );
-  return 0;
-}
-
-static int
-fd_mlx5_nl_send( int                      netlink_fd,
-                 fd_mlx5_nl_req_t const * req ) {
-  struct sockaddr_nl kernel_addr = { .nl_family=AF_NETLINK };
-  ssize_t send_sz = sendto( netlink_fd, req, req->nlh.nlmsg_len, 0,
-                            fd_type_pun_const( &kernel_addr ), sizeof(kernel_addr) );
-  if( FD_UNLIKELY( send_sz!=(ssize_t)req->nlh.nlmsg_len ) ) {
-    if( send_sz>=0 ) errno = EIO;
-    return -1;
-  }
-  return 0;
-}
-
-static int
-fd_mlx5_nl_recv( int                   netlink_fd,
-                 uint                  request_seq,
-                 int                   multipart,
-                 fd_mlx5_nl_parse_fn_t parse_fn,
-                 void *                parse_arg ) {
-  uchar msg_buf[ FD_MLX5_NL_RECV_BUF_SZ ] __attribute__((aligned(alignof(struct nlmsghdr))));
-  for(;;) {
-    ssize_t recv_sz;
-    do recv_sz = recvfrom( netlink_fd, msg_buf, sizeof(msg_buf), MSG_TRUNC, NULL, NULL );
-    while( FD_UNLIKELY( recv_sz<0 && errno==EINTR ) );
-    if( FD_UNLIKELY( recv_sz<=0 || (ulong)recv_sz>sizeof(msg_buf) ) ) {
-      if( !recv_sz ) errno = EPROTO;
-      else if( recv_sz>0 ) errno = EMSGSIZE;
-      return -1;
-    }
-
-    uchar const * msg_cur = msg_buf;
-    ulong msg_rem = (ulong)recv_sz;
-    while( msg_rem ) {
-      if( FD_UNLIKELY( msg_rem<sizeof(struct nlmsghdr) ) ) {
-        errno = EPROTO;
-        return -1;
-      }
-      struct nlmsghdr const * nlh = (struct nlmsghdr const *)msg_cur;
-      ulong const msg_sz          = nlh->nlmsg_len;
-      ulong const aligned_msg_sz  = fd_ulong_align_up( msg_sz, NLMSG_ALIGNTO );
-      if( FD_UNLIKELY( msg_sz<sizeof(struct nlmsghdr) || aligned_msg_sz>msg_rem ) ) {
-        errno = EPROTO;
-        return -1;
-      }
-      if( FD_UNLIKELY( nlh->nlmsg_seq!=request_seq ) ) {
-        errno = EPROTO;
-        return -1;
-      }
-      if( FD_UNLIKELY( nlh->nlmsg_flags & NLM_F_DUMP_INTR ) ) {
-        errno = EAGAIN;
-        return -1;
-      }
-      if( nlh->nlmsg_type==NLMSG_DONE ) {
-        ulong const payload_sz = msg_sz-sizeof(*nlh);
-        if( payload_sz ) {
-          if( FD_UNLIKELY( payload_sz<sizeof(int) ) ) {
-            errno = EPROTO;
-            return -1;
-          }
-          int done_err;
-          fd_memcpy( &done_err, nlh+1, sizeof(done_err) );
-          if( FD_UNLIKELY( done_err>0 ) ) {
-            errno = EPROTO;
-            return -1;
-          }
-          if( FD_UNLIKELY( done_err<0 ) ) {
-            errno = -done_err;
-            return -1;
-          }
-        }
-        if( FD_UNLIKELY( !multipart ) ) {
-          errno = EPROTO;
-          return -1;
-        }
-        return 0;
-      }
-      if( nlh->nlmsg_type==NLMSG_ERROR ) {
-        if( FD_UNLIKELY( msg_sz<sizeof(struct nlmsghdr)+sizeof(struct nlmsgerr) ) ) {
-          errno = EPROTO;
-          return -1;
-        }
-        int err = ((struct nlmsgerr const *)(nlh+1))->error;
-        if( FD_UNLIKELY( err ) ) {
-          errno = -err;
-          return -1;
-        }
-        if( FD_UNLIKELY( multipart ) ) {
-          errno = EPROTO;
-          return -1;
-        }
-        return 0;
-      }
-      if( FD_UNLIKELY( parse_fn( nlh, parse_arg ) ) ) return -1;
-      msg_cur += aligned_msg_sz;
-      msg_rem -= aligned_msg_sz;
-    }
-  }
-}
-
-struct fd_mlx5_nl_dev_find {
-  char const * rdma_name;
-  uint         dev_idx;
-};
-typedef struct fd_mlx5_nl_dev_find fd_mlx5_nl_dev_find_t;
-
-static int
-fd_mlx5_nl_parse_dev( struct nlmsghdr const * nlh,
-                      void *                  parse_arg ) {
-  if( FD_UNLIKELY( nlh->nlmsg_type!=RDMA_NL_GET_TYPE( RDMA_NL_NLDEV, RDMA_NLDEV_CMD_GET ) ) ) {
-    errno = EPROTO;
-    return -1;
-  }
-
-  fd_mlx5_nl_dev_find_t * dev_find     = parse_arg;
-  void const *            attr_data    = nlh+1;
-  ulong                   attr_data_sz  = nlh->nlmsg_len-sizeof(*nlh);
-
-  struct nlattr const * dev_idx_attr;
-  int found = fd_mlx5_nla_find( attr_data, attr_data_sz, RDMA_NLDEV_ATTR_DEV_INDEX, &dev_idx_attr );
-  if( FD_UNLIKELY( found<=0 ) ) return found;
-  struct nlattr const * dev_name_attr;
-  found     = fd_mlx5_nla_find( attr_data, attr_data_sz, RDMA_NLDEV_ATTR_DEV_NAME, &dev_name_attr );
-  if( FD_UNLIKELY( found<=0 ) ) return found;
-
-  uint dev_idx;
-  if( FD_UNLIKELY( fd_mlx5_nla_u32( dev_idx_attr, &dev_idx ) ) ) return -1;
-
-  ulong const expected_name_sz = strlen( dev_find->rdma_name )+1UL;
-  ulong const dev_name_sz      = dev_name_attr->nla_len-sizeof(*dev_name_attr);
-  if( dev_name_sz==expected_name_sz && !memcmp( dev_name_attr+1, dev_find->rdma_name, expected_name_sz ) ) {
-    dev_find->dev_idx = dev_idx;
-  }
-
-  return 0;
-}
-
-struct fd_mlx5_nl_counter_find {
-  uint counter_id;
-  int  found;
-};
-typedef struct fd_mlx5_nl_counter_find fd_mlx5_nl_counter_find_t;
-
-static int
-fd_mlx5_nl_parse_counter_id( struct nlmsghdr const * nlh,
-                             void *                  parse_arg ) {
-  if( FD_UNLIKELY( nlh->nlmsg_type!=RDMA_NL_GET_TYPE( RDMA_NL_NLDEV, RDMA_NLDEV_CMD_STAT_SET ) ) ) {
-    errno = EPROTO;
-    return -1;
-  }
-  fd_mlx5_nl_counter_find_t * counter_find = parse_arg;
-  struct nlattr const * counter_id_attr;
-  int counter_id_found = fd_mlx5_nla_find( nlh+1, nlh->nlmsg_len-sizeof(*nlh),
-                                           RDMA_NLDEV_ATTR_STAT_COUNTER_ID, &counter_id_attr );
-  if( FD_UNLIKELY( counter_id_found<=0 ) ) {
-    if( !counter_id_found ) errno = EPROTO;
-    return -1;
-  }
-  if( FD_UNLIKELY( fd_mlx5_nla_u32( counter_id_attr, &counter_find->counter_id ) ) ) return -1;
-  counter_find->found = 1;
-  return 0;
-}
-
-struct fd_mlx5_nl_stat_find {
-  uint  counter_id;
-  ulong out_of_buffer;
-  int   found;
-};
-typedef struct fd_mlx5_nl_stat_find fd_mlx5_nl_stat_find_t;
-
-static int
-fd_mlx5_nl_parse_hw_counters( uchar const *            attr_cur,
-                              ulong                    attr_rem,
-                              fd_mlx5_nl_stat_find_t * stat_find ) {
-  while( attr_rem ) {
-    struct nlattr const * entry_attr;
-    int next_result = fd_mlx5_nla_next( &attr_cur, &attr_rem, &entry_attr );
-    if( FD_UNLIKELY( next_result<=0 ) ) return next_result;
-    if( (entry_attr->nla_type & (ushort)NLA_TYPE_MASK)!=RDMA_NLDEV_ATTR_STAT_HWCOUNTER_ENTRY ) continue;
-
-    void const * entry_data = entry_attr+1;
-    ulong entry_data_sz     = entry_attr->nla_len-sizeof(*entry_attr);
-    struct nlattr const * name_attr;
-    struct nlattr const * value_attr;
-    int name_found  = fd_mlx5_nla_find( entry_data, entry_data_sz,
-                                        RDMA_NLDEV_ATTR_STAT_HWCOUNTER_ENTRY_NAME, &name_attr );
-    int value_found = fd_mlx5_nla_find( entry_data, entry_data_sz,
-                                        RDMA_NLDEV_ATTR_STAT_HWCOUNTER_ENTRY_VALUE, &value_attr );
-    if( FD_UNLIKELY( name_found<0 || value_found<0 ) ) return -1;
-    if( !name_found || name_attr->nla_len!=sizeof(*name_attr)+sizeof("out_of_buffer") ||
-        memcmp( name_attr+1, "out_of_buffer", sizeof("out_of_buffer") ) ) continue;
-    if( FD_UNLIKELY( !value_found || value_attr->nla_len!=sizeof(*value_attr)+sizeof(ulong) ) ) {
-      errno = EPROTO;
-      return -1;
-    }
-    fd_memcpy( &stat_find->out_of_buffer, value_attr+1, sizeof(ulong) );
-    stat_find->found = 1;
-  }
-  return 0;
-}
-
-static int
-fd_mlx5_nl_parse_counter_entry( uchar const *            attr_cur,
-                                ulong                    attr_rem,
-                                fd_mlx5_nl_stat_find_t * stat_find ) {
-  struct nlattr const * counter_id_attr;
-  int counter_id_found = fd_mlx5_nla_find( attr_cur, attr_rem, RDMA_NLDEV_ATTR_STAT_COUNTER_ID, &counter_id_attr );
-  if( FD_UNLIKELY( counter_id_found<0 ) ) return -1;
-  uint counter_id;
-  if( !counter_id_found ) return 0;
-  if( FD_UNLIKELY( fd_mlx5_nla_u32( counter_id_attr, &counter_id ) ) ) return -1;
-  if( counter_id!=stat_find->counter_id ) return 0;
-  struct nlattr const * hw_counters_attr;
-  int hw_counters_found = fd_mlx5_nla_find( attr_cur, attr_rem, RDMA_NLDEV_ATTR_STAT_HWCOUNTERS, &hw_counters_attr );
-  if( FD_UNLIKELY( hw_counters_found<0 ) ) return -1;
-  if( !hw_counters_found ) return 0;
-  return fd_mlx5_nl_parse_hw_counters( (uchar const *)(hw_counters_attr+1),
-                                       hw_counters_attr->nla_len-sizeof(*hw_counters_attr), stat_find );
-}
-
-static int
-fd_mlx5_nl_parse_stats( struct nlmsghdr const * nlh,
-                        void *                  parse_arg ) {
-  if( FD_UNLIKELY( nlh->nlmsg_type!=RDMA_NL_GET_TYPE( RDMA_NL_NLDEV, RDMA_NLDEV_CMD_STAT_GET ) ) ) {
-    errno = EPROTO;
-    return -1;
-  }
-  fd_mlx5_nl_stat_find_t * stat_find = parse_arg;
-  struct nlattr const * counters_attr;
-  int counters_found = fd_mlx5_nla_find( nlh+1, nlh->nlmsg_len-sizeof(*nlh),
-                                         RDMA_NLDEV_ATTR_STAT_COUNTER, &counters_attr );
-  if( FD_UNLIKELY( counters_found<0 ) ) return -1;
-  if( !counters_found ) return 0;
-  uchar const * attr_cur = (uchar const *)(counters_attr+1);
-  ulong attr_rem = counters_attr->nla_len-sizeof(*counters_attr);
-  while( attr_rem ) {
-    struct nlattr const * entry_attr;
-    int next_result = fd_mlx5_nla_next( &attr_cur, &attr_rem, &entry_attr );
-    if( FD_UNLIKELY( next_result<=0 ) ) return next_result;
-    if( (entry_attr->nla_type & (ushort)NLA_TYPE_MASK)==RDMA_NLDEV_ATTR_STAT_COUNTER_ENTRY &&
-        FD_UNLIKELY( fd_mlx5_nl_parse_counter_entry( (uchar const *)(entry_attr+1),
-                                                     entry_attr->nla_len-sizeof(*entry_attr), stat_find ) ) ) return -1;
-  }
-  return 0;
-}
-
-fd_netlink_rdma_ctx_t *
-fd_mlx5_netlink_rdma_init( fd_netlink_rdma_ctx_t * netlink_rdma,
-                           char const *            rdma_name,
-                           uint                    port_num,
-                           uint                    qpn ) {
-  if( FD_UNLIKELY( !netlink_rdma ) ) { errno = EINVAL; return NULL; }
-  fd_memset( netlink_rdma, 0, sizeof(*netlink_rdma) );
-  netlink_rdma->fd = -1;
-  int netlink_fd = socket( AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC, NETLINK_RDMA );
-  if( FD_UNLIKELY( netlink_fd<0 ) ) return NULL;
-  struct sockaddr_nl local_addr = { .nl_family=AF_NETLINK };
-  if( FD_UNLIKELY( bind( netlink_fd, fd_type_pun( &local_addr ), sizeof(local_addr) ) ) ) goto fail;
-  netlink_rdma->fd = netlink_fd;
-
-  fd_mlx5_nl_req_t req[1];
-  uint request_seq = ++netlink_rdma->seq;
-  fd_mlx5_nl_req_init( req, RDMA_NL_GET_TYPE( RDMA_NL_NLDEV, RDMA_NLDEV_CMD_GET ),
-                       NLM_F_REQUEST|NLM_F_DUMP, request_seq );
-  fd_mlx5_nl_dev_find_t dev_find = { .rdma_name=rdma_name };
-  if( FD_UNLIKELY( fd_mlx5_nl_send( netlink_fd, req ) ||
-                   fd_mlx5_nl_recv( netlink_fd, request_seq, 1, fd_mlx5_nl_parse_dev, &dev_find ) ) ) {
-    goto fail;
-  }
-  if( FD_UNLIKELY( !dev_find.dev_idx ) ) { errno = ENODEV; goto fail; }
-
-  request_seq = ++netlink_rdma->seq;
-  fd_mlx5_nl_req_init( req, RDMA_NL_GET_TYPE( RDMA_NL_NLDEV, RDMA_NLDEV_CMD_STAT_SET ),
-                       NLM_F_REQUEST|NLM_F_ACK, request_seq );
-  if( FD_UNLIKELY( fd_mlx5_nl_req_u32( req, RDMA_NLDEV_ATTR_STAT_MODE, RDMA_COUNTER_MODE_MANUAL ) ||
-                   fd_mlx5_nl_req_u32( req, RDMA_NLDEV_ATTR_STAT_RES,  RDMA_NLDEV_ATTR_RES_QP   ) ||
-                   fd_mlx5_nl_req_u32( req, RDMA_NLDEV_ATTR_DEV_INDEX, dev_find.dev_idx         ) ||
-                   fd_mlx5_nl_req_u32( req, RDMA_NLDEV_ATTR_PORT_INDEX, port_num                ) ||
-                   fd_mlx5_nl_req_u32( req, RDMA_NLDEV_ATTR_RES_LQPN, qpn                       ) ) ) {
-    goto fail;
-  }
-
-  fd_mlx5_nl_counter_find_t counter_find = {0};
-  if( FD_UNLIKELY( fd_mlx5_nl_send( netlink_fd, req ) ||
-                   fd_mlx5_nl_recv( netlink_fd, request_seq, 0, fd_mlx5_nl_parse_counter_id, &counter_find ) ) ) {
-    goto fail;
-  }
-  if( FD_UNLIKELY( !counter_find.found ) ) { errno = EPROTO; goto fail; }
-
-  netlink_rdma->dev_idx    = dev_find.dev_idx;
-  netlink_rdma->port_num   = port_num;
-  netlink_rdma->counter_id = counter_find.counter_id;
-  return netlink_rdma;
-
-fail:
-  {
-    int err = errno;
-    close( netlink_fd );
-    netlink_rdma->fd = -1;
-    errno = err;
-    return NULL;
-  }
-}
-
-int
-fd_mlx5_netlink_rdma_qp_counter_read( fd_netlink_rdma_ctx_t * netlink_rdma,
-                                      ulong *                   out_of_buffer ) {
-  if( FD_UNLIKELY( !netlink_rdma || netlink_rdma->fd<0 || !netlink_rdma->dev_idx || !out_of_buffer ) ) {
-    errno = EINVAL;
-    return -1;
-  }
-  uint request_seq = ++netlink_rdma->seq;
-  fd_mlx5_nl_req_t req[1];
-  fd_mlx5_nl_req_init( req, RDMA_NL_GET_TYPE( RDMA_NL_NLDEV, RDMA_NLDEV_CMD_STAT_GET ),
-                       NLM_F_REQUEST|NLM_F_DUMP, request_seq );
-  if( FD_UNLIKELY( fd_mlx5_nl_req_u32( req, RDMA_NLDEV_ATTR_DEV_INDEX, netlink_rdma->dev_idx )   ||
-                   fd_mlx5_nl_req_u32( req, RDMA_NLDEV_ATTR_PORT_INDEX, netlink_rdma->port_num ) ||
-                   fd_mlx5_nl_req_u32( req, RDMA_NLDEV_ATTR_STAT_RES, RDMA_NLDEV_ATTR_RES_QP )   ||
-                   fd_mlx5_nl_send( netlink_rdma->fd, req ) ) ) return -1;
-
-  fd_mlx5_nl_stat_find_t stat_find = { .counter_id=netlink_rdma->counter_id };
-  if( FD_UNLIKELY( fd_mlx5_nl_recv( netlink_rdma->fd, request_seq, 1, fd_mlx5_nl_parse_stats, &stat_find ) ) ) return -1;
-  if( FD_UNLIKELY( !stat_find.found ) ) {
-    errno = ENOENT;
-    return -1;
-  }
-  *out_of_buffer = stat_find.out_of_buffer;
-  return 0;
 }

@@ -1,0 +1,39 @@
+# logfile_fd: It can be disabled by configuration, but typically tiles
+#             will open a log file on boot and write all messages there.
+#
+# eventfd_lo, eventfd_hi: The eventfd doorbells of the tiles that park
+#                         in epoll on their own fds, at fixed inherited
+#                         numbers in [eventfd_lo,eventfd_hi).
+uint logfile_fd, uint eventfd_lo, uint eventfd_hi
+
+# logging: all log messages are written to a file and/or pipe
+#
+# 'WARNING' and above are written to the STDERR pipe, while all
+# messages are always written to the log file.
+#
+# arg 0 is the file descriptor to write to.  The boot process ensures
+# that descriptor 2 is always STDERR and descriptor 4 is the logfile.
+#
+# power saving: wake a tile parked in epoll by writing 1 (8 bytes) to
+# its eventfd doorbell.
+write: (or (eq (arg 0) 2)
+           (eq (arg 0) logfile_fd)
+           (and (>= (arg 0) eventfd_lo)
+                (< (arg 0) eventfd_hi)
+                (eq (arg 2) 8)))
+
+# logging: 'WARNING' and above fsync the logfile to disk immediately
+#
+# arg 0 is the file descriptor to fsync.
+fsync: (eq (arg 0) logfile_fd)
+
+# power saving: wake a parked tile that has work
+#
+# The mwaitx tile turns doorbell rings into futex wakes on the parked
+# tile's sleep word.  It is the only tile that issues FUTEX_WAKE, and it
+# never waits itself.
+#
+# arg 1 is the futex op and arg 2 is the number of waiters to wake,
+# always 1.
+futex: (and (eq (arg 1) FUTEX_WAKE)
+            (eq (arg 2) 1))

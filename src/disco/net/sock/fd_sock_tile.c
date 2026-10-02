@@ -1,6 +1,5 @@
 #define _GNU_SOURCE /* dup3 */
 #include "fd_sock_tile_private.h"
-#include "../fd_net_common.h"
 #include "../../fd_disco_base.h"
 #include "../../../discof/repair/fd_repair.h"
 #include "../../topo/fd_topo.h"
@@ -31,6 +30,18 @@
 /* Controls max ancillary data size.
    Must be aligned by alignof(struct cmsghdr) */
 #define FD_SOCK_CMSG_MAX (64UL)
+
+/* Musl's CMSG_NXTHDR macro compares size_t against ptrdiff_t,
+   triggering -Wsign-compare. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wsign-compare"
+#pragma GCC diagnostic ignored "-Wsign-conversion"
+static inline struct cmsghdr *
+fd_cmsg_nxthdr( struct msghdr *   mhdr,
+                struct cmsghdr * cmsg ) {
+  return CMSG_NXTHDR( mhdr, cmsg );
+}
+#pragma GCC diagnostic pop
 
 static ulong
 populate_allowed_seccomp( fd_topo_t const *      topo,
@@ -430,7 +441,7 @@ poll_rx_socket( fd_sock_tile_t *    ctx,
           struct in_pktinfo const * pi = (struct in_pktinfo const *)CMSG_DATA( cmsg );
           daddr = pi->ipi_addr.s_addr;
         }
-        cmsg = CMSG_NXTHDR( &ctx->batch_msg[ j ].msg_hdr, cmsg );
+        cmsg = fd_cmsg_nxthdr( &ctx->batch_msg[ j ].msg_hdr, cmsg );
       } while( FD_UNLIKELY( cmsg ) ); /* optimize for 1 cmsg */
     }
     if( FD_UNLIKELY( daddr<0L ) ) {
@@ -767,6 +778,7 @@ rlimit_file_cnt( fd_topo_t const *      topo,
   return RX_SOCK_FD_MIN + ctx->sock_cnt;
 }
 
+#define STEM_NEVER_PARK             1
 #define STEM_CALLBACK_CONTEXT_TYPE  fd_sock_tile_t
 #define STEM_CALLBACK_CONTEXT_ALIGN alignof(fd_sock_tile_t)
 

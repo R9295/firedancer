@@ -506,7 +506,7 @@ test_simd0232_fee_stake_account_collector_cache( fd_svm_mini_t * mini ) {
   fd_accdb_unwrite_one( mini->runtime->accdb, &acc );
 
   fd_stake_delegations_fork_update( fd_bank_stake_delegations_modify( bank ),
-                                    bank->stake_delegations_fork_id,
+                                    bank->stake_delegations_fork_id, 0UL,
                                     &stake_key,
                                     &vote_key,
                                     delegated_stake,
@@ -514,8 +514,7 @@ test_simd0232_fee_stake_account_collector_cache( fd_svm_mini_t * mini ) {
                                     ULONG_MAX,
                                     0UL,
                                     stake_lamports,
-                                    (uint)sizeof(stake_data),
-                                    FD_STAKE_DELEGATIONS_WARMUP_COOLDOWN_RATE_ENUM_025 );
+                                    (uint)sizeof(stake_data) );
 
   bank->f.execution_fees = SIMD0232_FEE_EXECUTION;
   bank->f.priority_fees  = SIMD0232_FEE_PRIORITY;

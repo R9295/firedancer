@@ -14,6 +14,14 @@
 #define AG_POOL_ERR_SLASHABLE          (-3)
 #define AG_POOL_ERR_CERT_VERIFY        (-4)
 
+#define AG_POOL_QUORUM_REACHED_FINAL          (AG_CERT_KIND_FINAL)
+#define AG_POOL_QUORUM_REACHED_FAST_FINAL     (AG_CERT_KIND_FAST_FINAL)
+#define AG_POOL_QUORUM_REACHED_NOTAR          (AG_CERT_KIND_NOTAR)
+#define AG_POOL_QUORUM_REACHED_NOTAR_FALLBACK (AG_CERT_KIND_NOTAR_FALLBACK)
+#define AG_POOL_QUORUM_REACHED_SKIP           (AG_CERT_KIND_SKIP)
+#define AG_POOL_QUORUM_REACHED_SAFE_TO_NOTAR  (5)
+#define AG_POOL_QUORUM_REACHED_SAFE_TO_SKIP   (6)
+
 typedef struct ag_pool ag_pool_t;
 
 FD_PROTOTYPES_BEGIN
@@ -38,13 +46,20 @@ ag_pool_leave( ag_pool_t const * pool );
 void *
 ag_pool_delete( void * mem );
 
-/* init before any cert, vote or block is added.  boot_block is already
-   finalized (genesis is slot 0) and therefore is also a valid
-   notar-fallback-or-stronger parent for the first live leader window. */
+void
+ag_pool_init( ag_pool_t * self,
+              ulong       slot );
+
+/* ag_pool_init_boot_block marks boot_block, the already finalized block
+   the pool was just initialized at, as a notar-fallback-or-stronger
+   parent, publishing any ParentReady this grants.  Without it, skip
+   certs for the rest of the boot block's window have no parent to
+   propagate into the next leader window, so a cluster whose first
+   window after genesis is skipped never becomes parent ready. */
 
 void
-ag_pool_init( ag_pool_t *           self,
-              ag_block_id_t const * boot_block );
+ag_pool_init_boot_block( ag_pool_t *           self,
+                         ag_block_id_t const * boot_block );
 
 void
 ag_pool_fini( ag_pool_t * self );
@@ -58,6 +73,16 @@ ag_pool_advance_epoch( ag_pool_t *             self,
                        ulong                   epoch_rank,
                        ulong                   epoch_slot );
 
+/* Replaces our rank in the epoch starting at epoch_slot, for when our
+   identity changes after the epoch advanced.  The epoch's live slot
+   states then treat the new rank's votes as ours.  USHORT_MAX if we
+   are not ranked in that epoch. */
+
+void
+ag_pool_set_rank( ag_pool_t * self,
+                  ulong       epoch_slot,
+                  ulong       epoch_rank );
+
 /* Definition 13. Pool::add_cert */
 
 int
@@ -70,7 +95,8 @@ ag_pool_add_cert( ag_pool_t *       self,
 int
 ag_pool_add_vote( ag_pool_t *       self,
                   ag_vote_t const * vote,
-                  fd_bls_set_t *    bad );
+                  fd_bls_set_t *    bad,
+                  uchar *           quorum_reached );
 
 /* Definition 16. Pool::add_block */
 
@@ -86,30 +112,10 @@ ag_slot_state_t const *
 ag_pool_slot_state( ag_pool_t const * self,
                     ulong             slot );
 
-/* ag_pool_standstill is called when no new finalization has been
-   observed for AG_DELTA_STANDSTILL_NS, and again every
-   AG_DELTA_STANDSTILL_NS for as long as that lasts.  Schedules every
-   slot above the finalized slot that currently holds a cert or one of
-   our own votes for ag_pool_refresh, and emits an
-   AG_EVENT_POOL_STANDSTILL naming the finalized slot so Votor extends
-   its skip timeouts.  Mirrors Agave's Standstill event and its refresh
-   of votes and certs into the StandstillRefreshQueue. */
+/* Section 4.1. Pool::recover_from_standstill */
 
 void
-ag_pool_standstill( ag_pool_t * self );
-
-/* ag_pool_refresh is called every AG_REFRESH_INTERVAL_NS.  If any slot
-   scheduled by ag_pool_standstill is still above the finalized slot,
-   emits an AG_EVENT_POOL_REFRESH with at most AG_REFRESH_MSG_MAX
-   messages to rebroadcast: the certs that finalized the finalized slot,
-   then whole slots of certs and own votes, resuming after the slot the
-   previous refresh ended on and wrapping around once.  Does nothing
-   while the previous refresh event has not been polled, as the event
-   points into pool scratch.  Mirrors Agave's
-   VotingService::maybe_handle_standstill_queue. */
-
-void
-ag_pool_refresh( ag_pool_t * self );
+ag_pool_recover_from_standstill( ag_pool_t * self );
 
 /* Definition 14. Pool::finalized_slot */
 
@@ -139,6 +145,9 @@ ag_pool_poll_pool_event( ag_pool_t *       self,
 int
 ag_pool_poll_repair_event( ag_pool_t *         self,
                            ag_event_repair_t * event );
+
+FD_FN_PURE ulong
+ag_pool_pool_event_cnt( ag_pool_t const * self );
 
 FD_PROTOTYPES_END
 

@@ -189,6 +189,10 @@
 #define FD_HAS_ARM 0
 #endif
 
+#ifndef FD_HAS_RISCV
+#define FD_HAS_RISCV 0
+#endif
+
 /* FD_HAS_LZ4 indicates that the target supports LZ4 compression.
    Roughly, does "#include <lz4.h>" and the APIs therein work? */
 
@@ -762,6 +766,10 @@ fd_type_pun_const( void const * p ) {
 #define FD_HW_MFENCE()    __asm__ __volatile__( "dmb ish" ::: "memory" )
 #define FD_HW_MFENCE_LD() __asm__ __volatile__( "dmb ishld" ::: "memory" )
 #define FD_HW_MFENCE_ST() __asm__ __volatile__( "dmb ishst" ::: "memory" )
+#elif FD_HAS_RISCV
+#define FD_HW_MFENCE()    __asm__ __volatile__( "fence rw,rw" ::: "memory" )
+#define FD_HW_MFENCE_LD() __asm__ __volatile__( "fence r,rw"  ::: "memory" )
+#define FD_HW_MFENCE_ST() __asm__ __volatile__( "fence w,w"   ::: "memory" )
 #else
 #define FD_HW_MFENCE()    __sync_synchronize()
 #define FD_HW_MFENCE_LD() __sync_synchronize()
@@ -1255,6 +1263,8 @@ fd_hash_memcpy( ulong                    seed,
 #define FD_TICKCOUNT_STYLE 1
 #elif FD_HAS_ARM /* Use CNTVCT_EL0 */
 #define FD_TICKCOUNT_STYLE 2
+#elif FD_HAS_RISCV /* Uses shared timebase instead of CPU cycles. */
+#define FD_TICKCOUNT_STYLE 3
 #else /* Use portable fallback */
 #define FD_TICKCOUNT_STYLE 0
 #endif
@@ -1313,6 +1323,28 @@ fd_tickcount( void ) {
     "mrs %0, cntvct_el0\n"
     "nop"
     : "=r" (value) );
+  return (long)value;
+}
+
+#elif FD_TICKCOUNT_STYLE==3 /* RV64 time CSR */
+
+/* The time CSR is a platform timebase shared across harts, which is
+   independent of core frequency.  Unlike cycle, it is suitable for
+   migration between heterogeneous cores.  The kernel must permit
+   user-mode reads.  Select FD_TICKCOUNT_STYLE=0 on systems that do
+   not allow it (and trap on rdtime).
+
+   We may not assume a frequency or nanoseconds per tick, tempo calibrate
+   it against wallclock time. */
+
+#if !defined(__riscv) || (__riscv_xlen!=64)
+#error "FD_TICKCOUNT_STYLE=3 requires RV64"
+#endif
+
+static inline long
+fd_tickcount( void ) {
+  ulong value;
+  __asm__ __volatile__( "rdtime %0" : "=r" (value) );
   return (long)value;
 }
 

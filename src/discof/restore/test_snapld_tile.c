@@ -5,11 +5,14 @@
 #include "../../util/io/fd_io.h"
 
 #include <netinet/in.h>
+#include <sys/epoll.h>
 
 static ulong publish_cnt;
 static ulong publish_sig;
 static ulong init_cnt;
 static uchar output[ 4UL*FD_SNAPSHOT_DATA_MTU ] __attribute__((aligned(FD_CHUNK_ALIGN)));
+
+static fd_stem_context_t test_stem[1]; /* no sleep object: the tile nanosleeps when idle */
 
 static ulong
 test_stem_publish( fd_stem_context_t * stem FD_PARAM_UNUSED,
@@ -46,6 +49,8 @@ test_sshttp_init( fd_sshttp_t * http,
 #define fd_stem_publish test_stem_publish
 #define fd_sshttp_init  test_sshttp_init
 #include "fd_snapld_tile.c"
+
+static int test_epoll_fd = -1;
 #undef fd_sshttp_init
 #undef fd_stem_publish
 
@@ -54,8 +59,11 @@ test_start( int file,
             int bad_target ) {
   static fd_sshttp_t http[1];
   static uchar      input[ sizeof(fd_ssctrl_start_t) ] __attribute__((aligned(FD_CHUNK_ALIGN)));
+  static ulong waker_fseq[ FD_FSEQ_FOOTPRINT/sizeof(ulong) ] __attribute__((aligned(FD_FSEQ_ALIGN)));
   fd_snapld_tile_t ctx[1] = {0};
-  ctx->sshttp        = fd_sshttp_join( fd_sshttp_new( http ) );
+  ctx->sshttp        = fd_sshttp_join( fd_sshttp_new( http, test_epoll_fd ) );
+  ctx->waker_fseq    = fd_fseq_join( fd_fseq_new( waker_fseq, 0UL ) );
+  fd_clock_tile_init( ctx->clock );
   ctx->in_rd.base    = input;
   ctx->out_dc.mem    = (fd_wksp_t *)output;
   ctx->out_dc.mtu    = FD_SNAPSHOT_DATA_MTU;
@@ -96,7 +104,7 @@ test_start( int file,
   /* Spend longer than the request deadline waiting for START. */
   fd_log_sleep( FD_SSHTTP_DEADLINE_NANOS+1000000L );
   int busy = 0;
-  for( int i=0; i<3; i++ ) after_credit( ctx, NULL, NULL, &busy );
+  for( int i=0; i<3; i++ ) after_credit( ctx, test_stem, NULL, &busy );
   FD_TEST( publish_cnt==1UL && !init_cnt && !ctx->sent_meta );
   fd_ssctrl_start_t * start = (fd_ssctrl_start_t *)input;
   fd_memset( start, 0, sizeof(*start) );
@@ -110,12 +118,12 @@ test_start( int file,
     fd_memset( start->path, 'x', sizeof(start->path) );
     start->path_len = sizeof(start->path);
   }
-  long before = fd_log_wallclock();
+  long before = fd_clock_tile_now( ctx->clock );
   FD_TEST( !returnable_frag( ctx, 0UL, 0UL, FD_SNAPSHOT_MSG_CTRL_START, 0UL, file ? 0UL : sizeof(*start), 0UL, 0UL, 0UL, NULL ) );
   if( bad_target ) {
     FD_TEST( init_cnt==1UL && !ctx->pipeline_ready && ctx->state==FD_SNAPSHOT_STATE_ERROR );
     FD_TEST( publish_cnt==2UL && publish_sig==FD_SNAPSHOT_MSG_CTRL_ERROR );
-    after_credit( ctx, NULL, NULL, &busy );
+    after_credit( ctx, test_stem, NULL, &busy );
     FD_TEST( !returnable_frag( ctx, 0UL, 0UL, FD_SNAPSHOT_MSG_CTRL_START, 0UL, sizeof(*start), 0UL, 0UL, 0UL, NULL ) );
     FD_TEST( publish_cnt==2UL && init_cnt==1UL );
   } else {
@@ -127,7 +135,7 @@ test_start( int file,
       FD_TEST( !strcmp( http->hostname, "localhost" ) );
       FD_TEST( strstr( http->request, "GET /snapshot.tar.bz2 HTTP/1.1" ) );
     } else {
-      after_credit( ctx, NULL, NULL, &busy );
+      after_credit( ctx, test_stem, NULL, &busy );
       FD_TEST( publish_cnt>1UL && ctx->sent_meta );
     }
   }
@@ -140,6 +148,8 @@ int
 main( int     argc,
       char ** argv ) {
   fd_boot( &argc, &argv );
+  test_epoll_fd = epoll_create1( 0 );
+  FD_TEST( test_epoll_fd!=-1 );
   test_start( 0, 0 );
   test_start( 0, 1 );
   test_start( 1, 0 );
