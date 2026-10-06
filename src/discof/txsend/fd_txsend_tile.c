@@ -103,6 +103,7 @@ during_housekeeping( fd_txsend_tile_t * ctx ) {
     fd_quic_set_identity_public_key( ctx->quic, ctx->keyswitch->bytes );
 
     memcpy( ctx->identity_key, ctx->keyswitch->bytes, 32UL );
+    ctx->keyswitch->result = ctx->txsend_out_seq;
     fd_keyswitch_state( ctx->keyswitch, FD_KEYSWITCH_STATE_COMPLETED );
   }
 
@@ -633,6 +634,7 @@ handle_vote_msg( fd_txsend_tile_t *           ctx,
   ulong tspub_comp = fd_frag_meta_ts_comp( fd_tickcount() );
   fd_stem_publish( stem, ctx->txsend_out->idx, 1UL, ctx->txsend_out->chunk, msg_sz, 0UL, 0UL, tspub_comp );
   ctx->txsend_out->chunk = fd_dcache_compact_next( ctx->txsend_out->chunk, msg_sz, ctx->txsend_out->chunk0, ctx->txsend_out->wmark );
+  ctx->txsend_out_seq    = stem->seqs[ ctx->txsend_out->idx ];
 }
 
 
@@ -818,7 +820,7 @@ unprivileged_init( fd_topo_t const *      topo,
     if( !strcmp( link->name, "net_txsend"   ) ) {
       fd_net_rx_bounds_init( &ctx->net_in_bounds[ i ], link->dcache );
       ctx->in_kind[ i ] = IN_KIND_NET;
-    } else if( !strcmp( link->name, "gossip_out" ) ) ctx->in_kind[ i ] = IN_KIND_GOSSIP;
+    } else if( !strcmp( link->name, "gossip_ciaddr" ) ) ctx->in_kind[ i ] = IN_KIND_GOSSIP;
     else if( !strcmp( link->name, "replay_epoch" ) ) ctx->in_kind[ i ] = IN_KIND_EPOCH;
     else if( !strcmp( link->name, "tower_out"    ) ) ctx->in_kind[ i ] = IN_KIND_TOWER;
     else if( !strcmp( link->name, "sign_txsend"  ) ) ctx->in_kind[ i ] = IN_KIND_SIGN;
@@ -863,6 +865,7 @@ unprivileged_init( fd_topo_t const *      topo,
   }
 
   ctx->tower_in_expect_seq = 0UL;
+  ctx->txsend_out_seq      = 0UL;
   ctx->halt_net_frags = 0;
 
   fd_histf_join( fd_histf_new( ctx->quic->metrics.service_duration, FD_MHIST_SECONDS_MIN( TXSEND, SERVICE_DURATION_SECONDS ),

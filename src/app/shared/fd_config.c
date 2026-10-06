@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #include "fd_config.h"
-#include "fd_config_auto.h"
+#include "fd_auto_net.h"
 #include "fd_config_private.h"
 
 #include "../platform/fd_net_util.h"
@@ -143,6 +143,13 @@ fd_config_fillf( fd_config_t * config ) {
     replace( config->paths.guidb, "{name}", config->name );
   } else {
     FD_TEST( fd_cstr_printf_check( config->paths.guidb, sizeof(config->paths.guidb), NULL, "%s/gui.db", config->paths.base ) );
+  }
+
+  if( FD_UNLIKELY( strcmp( config->paths.tower, "" ) ) ) {
+    replace( config->paths.tower, "{user}", config->user );
+    replace( config->paths.tower, "{name}", config->name );
+  } else {
+    fd_cstr_ncpy( config->paths.tower, config->paths.base, sizeof(config->paths.tower) );
   }
 
   for( ulong i=0UL; i<config->firedancer.paths.authorized_voter_paths_cnt; i++ ) {
@@ -415,7 +422,7 @@ fd_config_fill( fd_config_t * config,
     fd_config_fillh( config );
   }
 
-  fd_config_auto( config );
+  fd_auto_net( config );
   if( FD_UNLIKELY( !strcmp( config->net.provider, "auto" ) ) ) {
     FD_LOG_ERR(( "failed to resolve automatic network provider" ));
   }

@@ -4,9 +4,8 @@
 #include "ag_votor_base.h"
 #include "ag_cert.h"
 #include "ag_epoch_info.h"
-#include "ag_event.h"
 #include "ag_finality_tracker.h"
-#include "ag_slot_state.h"
+#include "ag_parent_ready_tracker.h" /* ag_parent_ready_t */
 #include "ag_vote.h"
 
 #define AG_POOL_SUCCESS                ( 0)
@@ -23,7 +22,40 @@
 #define AG_POOL_QUORUM_REACHED_SAFE_TO_NOTAR  (5)
 #define AG_POOL_QUORUM_REACHED_SAFE_TO_SKIP   (6)
 
+#define AG_POOL_EVENT_PARENT_READY  (0) /* Definition 15. PoolEvent::ParentReady */
+#define AG_POOL_EVENT_SAFE_TO_NOTAR (1) /* Definition 16. PoolEvent::SafeToNotar */
+#define AG_POOL_EVENT_SAFE_TO_SKIP  (2) /* Definition 16. PoolEvent::SafeToSkip  */
+#define AG_POOL_EVENT_CERT_CREATED  (3) /* Definition 13. PoolEvent::CertCreated */
+#define AG_POOL_EVENT_STANDSTILL    (4) /* Section 4.1.   PoolEvent::Standstill  */
+
+#define AG_POOL_EVENT_IMPLICITLY_SKIPPED   (5) /* Firedancer only: for other tiles, never routed to ag_votor */
+#define AG_POOL_EVENT_IMPLICITLY_FINALIZED (6) /* Firedancer only: for other tiles, never routed to ag_votor */
+
 typedef struct ag_pool ag_pool_t;
+
+typedef struct ag_slot_state ag_slot_state_t;
+
+struct ag_pool_event {
+  int kind;
+  union {
+    ag_parent_ready_t parent_ready;
+    ag_block_id_t     safe_to_notar;
+    ulong             safe_to_skip;
+    ag_cert_t         cert_created;
+    ag_standstill_t   standstill;
+    ulong             implicitly_skipped;
+    ag_block_id_t     implicitly_finalized;
+  };
+};
+typedef struct ag_pool_event ag_pool_event_t;
+
+struct ag_pool_metrics {
+  ulong slot_state_pool_used;
+  ulong slot_state_pool_free;
+  ulong finalized_slot;
+  ulong pool_events_cnt;
+};
+typedef struct ag_pool_metrics ag_pool_metrics_t;
 
 /* ag_pool_finalization_fn_t observes each finalization event the
    finality tracker emits, while the pool still holds the state of the
@@ -55,20 +87,12 @@ ag_pool_leave( ag_pool_t const * pool );
 void *
 ag_pool_delete( void * mem );
 
-void
-ag_pool_init( ag_pool_t * self,
-              ulong       slot );
-
-/* ag_pool_init_boot_block marks boot_block, the already finalized block
-   the pool was just initialized at, as a notar-fallback-or-stronger
-   parent, publishing any ParentReady this grants.  Without it, skip
-   certs for the rest of the boot block's window have no parent to
-   propagate into the next leader window, so a cluster whose first
-   window after genesis is skipped never becomes parent ready. */
+/* ag_pool_init starts the pool at root, a finalized block that is
+   treated as notarized (Section 2.9). */
 
 void
-ag_pool_init_boot_block( ag_pool_t *           self,
-                         ag_block_id_t const * boot_block );
+ag_pool_init( ag_pool_t *           self,
+              ag_block_id_t const * root );
 
 void
 ag_pool_fini( ag_pool_t * self );
@@ -83,6 +107,9 @@ ag_pool_set_finalization_fn( ag_pool_t *               self,
 
 FD_FN_CONST char const *
 ag_pool_strerror( int err );
+
+FD_FN_PURE ag_pool_metrics_t
+ag_pool_metrics( ag_pool_t const * self );
 
 void
 ag_pool_advance_epoch( ag_pool_t *             self,
@@ -106,6 +133,15 @@ int
 ag_pool_add_cert( ag_pool_t *       self,
                   ag_cert_t const * cert,
                   fd_bls_set_t *    bad );
+
+/* ag_pool_add_verified_cert is ag_pool_add_cert for a cert whose
+   signature and stake were already verified, e.g. by replay.  The
+   bounds, duplicate and safety checks still run. */
+
+int
+ag_pool_add_verified_cert( ag_pool_t *       self,
+                           ag_cert_t const * cert,
+                           fd_bls_set_t *    bad );
 
 /* Definition 12. Pool::add_vote */
 
@@ -142,12 +178,14 @@ ag_pool_finalized_slot( ag_pool_t const * self );
 FD_FN_PURE uchar const *
 ag_pool_finalized_block_hash( ag_pool_t const * self );
 
-/* Definition 15. Pool::parents_ready */
+/* Definition 15. Pool::parents_ready.  Writes up to out_max ready
+   parents of slot to out and returns how many are ready. */
 
-ag_block_id_t const *
-ag_pool_parents_ready( ag_pool_t * self,
-                       ulong       slot,
-                       ulong *     cnt );
+ulong
+ag_pool_parents_ready( ag_pool_t const * self,
+                       ulong             slot,
+                       ag_block_id_t *   out,
+                       ulong             out_max );
 
 /* Definition 15. Pool::wait_for_parent_ready; slot ULONG_MAX is the pending receiver */
 
@@ -157,14 +195,11 @@ ag_pool_wait_for_parent_ready( ag_pool_t * self,
 
 int
 ag_pool_poll_pool_event( ag_pool_t *       self,
-                         ag_event_pool_t * event );
+                         ag_pool_event_t * event );
 
 int
-ag_pool_poll_repair_event( ag_pool_t *         self,
-                           ag_event_repair_t * event );
-
-FD_FN_PURE ulong
-ag_pool_pool_event_cnt( ag_pool_t const * self );
+ag_pool_poll_repair_event( ag_pool_t *     self,
+                           ag_block_id_t * block );
 
 FD_PROTOTYPES_END
 

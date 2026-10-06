@@ -219,8 +219,10 @@ unprivileged_init( fd_topo_t const *      topo,
 /* State 7: TXSEND_FLUSHED
      TxSend has processed all Tower messages through the halt sequence,
      switched its identity key, and stopped receiving Net fragments that
-     could invoke QUIC signing callbacks.  This state can also be
-     reached right after VOTER_HALTED only if Alpenglow is active. */
+     could invoke QUIC signing callbacks.  TxSend also reported the
+     sequence after its final txsend_out vote, which carries the old
+     identity.  This state can also be reached right after VOTER_HALTED
+     only if Alpenglow is active. */
 #define FD_SET_IDENTITY_STATE_TXSEND_FLUSHED           (7UL)
 
 /* State 8: SIGNERS_HALT_REQUESTED
@@ -240,7 +242,9 @@ unprivileged_init( fd_topo_t const *      topo,
            sign tile before halting any new signing requests.
        (b) Gossip.  The gossip tile sends out ContactInfo messages with
            our identity key, and also uses the identity key to sign
-           outgoing gossip messages.
+           outgoing gossip messages.  Gossip first pushes the TxSend
+           votes through the sequence TxSend reported, since the sign
+           tile only signs them under the old key.
        (c) Bundle.  The bundle tile uses the identity key to sign an
            authentication challenge from the bundle server.
        (d) Rserve.  The rserve tile uses the identity key to sign
@@ -319,10 +323,11 @@ find_identity_keyswitch( fd_admin_tile_ctx_t * ctx,
 }
 
 static int FD_FN_SENSITIVE
-poll_set_identity( fd_admin_tile_ctx_t * ctx,
-                   ulong *               state,
-                   ulong                 identity_outset,
-                   uchar *               keypair ) {
+poll_set_identity( fd_admin_tile_ctx_t *   ctx,
+                   ulong *                 state,
+                   ulong                   identity_outset,
+                   uchar *                 keypair,
+                   fd_tower_file_t const * vote_history ) {
   fd_topo_t const * topo = ctx->topo;
 
   switch( *state ) {
@@ -366,6 +371,10 @@ poll_set_identity( fd_admin_tile_ctx_t * ctx,
       fd_keyswitch_t * voter  = find_identity_keyswitch( ctx, ctx->voter_name );
       voter->param = replay->result;
       memcpy( voter->bytes, keypair+32UL, 32UL );
+      /* Copy in the tower vote history if one exists. */
+      FD_TEST( 40UL+sizeof(fd_tower_file_t)<=sizeof(voter->bytes) );
+      FD_STORE( ulong, voter->bytes+32UL, !!vote_history );
+      if( vote_history ) memcpy( voter->bytes+40UL, vote_history, sizeof(fd_tower_file_t) );
       FD_COMPILER_MFENCE();
       voter->state = FD_KEYSWITCH_STATE_SWITCH_PENDING;
       FD_COMPILER_MFENCE();
@@ -420,6 +429,7 @@ poll_set_identity( fd_admin_tile_ctx_t * ctx,
       break;
     }
     case FD_SET_IDENTITY_STATE_TXSEND_FLUSHED: {
+      ulong txsend_flushed_seq = ctx->alpenglow ? 0UL : find_identity_keyswitch( ctx, "txsend" )->result;
       for( ulong i=0UL; i<topo->tile_cnt; i++ ) {
         fd_topo_tile_t const * tile = &topo->tiles[ i ];
         if( FD_LIKELY( tile->id_keyswitch_obj_id==ULONG_MAX ) ) continue;
@@ -433,7 +443,7 @@ poll_set_identity( fd_admin_tile_ctx_t * ctx,
         }
 
         fd_keyswitch_t * tile_ks = fd_topo_obj_laddr( topo, tile->id_keyswitch_obj_id );
-        if( !strcmp( tile->name, "gossip" ) ) tile_ks->param = identity_outset;
+        if( !strcmp( tile->name, "gossip" ) ) tile_ks->param = txsend_flushed_seq;
         if( !strcmp( tile->name, "shred"  ) ) tile_ks->param = 0UL; /* the leader pipeline is halted, nothing more to reach */
         memcpy( tile_ks->bytes, keypair+32UL, 32UL );
         FD_COMPILER_MFENCE();
@@ -568,6 +578,7 @@ poll_set_identity( fd_admin_tile_ctx_t * ctx,
         }
 
         fd_keyswitch_t * tile_ks = fd_topo_obj_laddr( topo, tile->id_keyswitch_obj_id );
+        if( !strcmp( tile->name, "gossip" ) ) tile_ks->param = identity_outset;
         FD_COMPILER_MFENCE();
         tile_ks->state = FD_KEYSWITCH_STATE_UNHALT_PENDING;
         FD_COMPILER_MFENCE();
@@ -668,20 +679,43 @@ set_identity( fd_admin_tile_ctx_t * ctx,
   }
 
   fd_adminctl_set_identity_t * req = fd_type_pun( data );
+  if( FD_UNLIKELY( req->vote_history_sz>sizeof(req->vote_history) ) ) {
+    FD_LOG_WARNING(( "unexpected adminctl set-identity vote_history_sz %lu", req->vote_history_sz ));
+    report_admin_command( &event, FD_EVENT_ADMIN_COMMAND_RESULT_ABI_SIZE_MISMATCH );
+    fd_adminctl_complete( adminctl, slot_idx, FD_ADMINCTL_RESULT_ABI_SIZE_MISMATCH );
+    return;
+  }
 
-  uchar public_key[ 32UL ];
-  fd_ed25519_public_from_private( public_key, req->keypair, ctx->sha512 );
-  if( FD_UNLIKELY( memcmp( public_key, req->keypair+32UL, 32UL ) ) ) {
+  fd_pubkey_t public_key;
+  fd_ed25519_public_from_private( public_key.uc, req->keypair, ctx->sha512 );
+  if( FD_UNLIKELY( memcmp( public_key.uc, req->keypair+32UL, 32UL ) ) ) {
     FD_LOG_WARNING(( "set-identity failed: public key in key file does not match private key" ));
     report_admin_command_custom_result( &event, "keypair_mismatch" );
     fd_adminctl_complete( adminctl, slot_idx, FD_SET_IDENTITY_RESULT_KEYPAIR_MISMATCH );
     return;
   }
 
+  fd_tower_file_t vote_history;
+  if( req->vote_history_sz ) {
+    if( FD_UNLIKELY( ctx->alpenglow ) ) {
+      FD_LOG_WARNING(( "set-identity failed: vote history files are not supported with Alpenglow" ));
+      report_admin_command_custom_result( &event, "vote_history_unsupported" );
+      fd_adminctl_complete( adminctl, slot_idx, FD_SET_IDENTITY_RESULT_VOTE_HISTORY_UNSUPPORTED );
+      return;
+    }
+    int err = fd_tower_file_de( req->vote_history, req->vote_history_sz, &public_key, &vote_history );
+    if( FD_UNLIKELY( err ) ) {
+      FD_LOG_WARNING(( "set-identity failed: invalid vote history file (%i)", err ));
+      report_admin_command_custom_result( &event, "invalid_vote_history" );
+      fd_adminctl_complete( adminctl, slot_idx, FD_SET_IDENTITY_RESULT_INVALID_VOTE_HISTORY );
+      return;
+    }
+  }
+
   ulong state           = FD_SET_IDENTITY_STATE_UNLOCKED;
   ulong identity_outset = (ulong)fd_log_wallclock();
   for(;;) {
-    if( FD_UNLIKELY( poll_set_identity( ctx, &state, identity_outset, req->keypair ) ) ) break;
+    if( FD_UNLIKELY( poll_set_identity( ctx, &state, identity_outset, req->keypair, req->vote_history_sz ? &vote_history : NULL ) ) ) break;
   }
 
   memcpy( ctx->identity_pubkey, req->keypair+32UL, 32UL );

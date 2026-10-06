@@ -240,6 +240,13 @@ void
 fd_accdb_advance_root( fd_accdb_t *       accdb,
                        fd_accdb_fork_id_t fork_id );
 
+/* fd_accdb_cmd_pending returns 1 if the accdb tile has not finished
+   the last submitted background command (e.g. advance_root), so the
+   next advance_root or purge would block, 0 otherwise. */
+
+int
+fd_accdb_cmd_pending( fd_accdb_t const * accdb );
+
 /* fd_accdb_purge removes the provided fork and all of its descendants
    from the accounts database.  This is an extremely rare operation,
    used to handle cases where a leader equivocated and produced two
@@ -372,7 +379,6 @@ fd_accdb_acquire_b( fd_accdb_t *          accdb,
                     ulong                 reserved_cnt,
                     ulong                 pubkeys_cnt,
                     uchar const * const * pubkeys,
-                    int *                 writable,
                     fd_acc_t *            out_accs );
 
 /* fd_accdb_release releases previously acquired accounts back to the
@@ -610,9 +616,11 @@ fd_accdb_snapshot_write_batch( fd_accdb_t *        accdb,
 
    First checks for a pending advance_root or purge command from T1; if
    one is present it executes the command, sets *charge_busy to 1, and
-   returns immediately without doing compaction. Otherwise, attempts one
-   step of compaction at each layer, setting *charge_busy if work was
-   done. */
+   returns immediately without doing compaction. Otherwise, if every
+   fallocated partition is in use, grows the file by one partition
+   (fallocate, can take seconds on slow filesystems), sets *charge_busy
+   and returns.  Otherwise, attempts one step of compaction at each
+   layer, setting *charge_busy if work was done. */
 
 void
 fd_accdb_background( fd_accdb_t * accdb,

@@ -1506,6 +1506,9 @@
 | <span class="metrics-name">tower_&#8203;vote_&#8203;gate</span><br/>{tower_&#8203;vote_&#8203;gate="<span class="metrics-enum">threshold_&#8203;fail</span>"} | counter | Result of the vote gating checks after a fork was selected (Did not pass threshold check (can't vote)) |
 | <span class="metrics-name">tower_&#8203;vote_&#8203;gate</span><br/>{tower_&#8203;vote_&#8203;gate="<span class="metrics-enum">propagated_&#8203;fail</span>"} | counter | Result of the vote gating checks after a fork was selected (Prev leader block did not propagate (can't vote)) |
 | <span class="metrics-name">tower_&#8203;vote_&#8203;gate</span><br/>{tower_&#8203;vote_&#8203;gate="<span class="metrics-enum">no_&#8203;candidate</span>"} | counter | Result of the vote gating checks after a fork was selected (Fork decision did not produce a votable block) |
+| <span class="metrics-name">tower_&#8203;tower_&#8203;file_&#8203;write</span> | counter | Number of times the tower file was written |
+| <span class="metrics-name">tower_&#8203;tower_&#8203;file_&#8203;slot</span> | gauge | Newest vote slot in the last written tower file, ULONG_MAX if not written yet |
+| <span class="metrics-name">tower_&#8203;tower_&#8203;file_&#8203;size_&#8203;bytes</span> | gauge | Size of the last written tower file |
 | <span class="metrics-name">tower_&#8203;vote_&#8203;txn</span><br/>{vote_&#8203;txn_&#8203;result="<span class="metrics-enum">success</span>"} | counter | Result of processing a vote txn (per txn) (Vote txn passed per-txn validation and reached slot counting (per-slot outcomes tracked by VoteSlotResult)) |
 | <span class="metrics-name">tower_&#8203;vote_&#8203;txn</span><br/>{vote_&#8203;txn_&#8203;result="<span class="metrics-enum">not_&#8203;simple_&#8203;vote</span>"} | counter | Result of processing a vote txn (per txn) (Txn was not a simple vote transaction) |
 | <span class="metrics-name">tower_&#8203;vote_&#8203;txn</span><br/>{vote_&#8203;txn_&#8203;result="<span class="metrics-enum">bad_&#8203;deser</span>"} | counter | Result of processing a vote txn (per txn) (Vote txn failed to deserialize) |
@@ -2367,9 +2370,12 @@
 | <span class="metrics-name">votor_&#8203;cert_&#8203;rx</span><br/>{cert_&#8203;rx_&#8203;result="<span class="metrics-enum">duplicate</span>"} | counter | Result of processing an inbound cert (per cert) (Cert was already in the pool) |
 | <span class="metrics-name">votor_&#8203;cert_&#8203;rx</span><br/>{cert_&#8203;rx_&#8203;result="<span class="metrics-enum">failed_&#8203;verify</span>"} | counter | Result of processing an inbound cert (per cert) (Cert failed the stake threshold or the aggregate signature check) |
 | <span class="metrics-name">votor_&#8203;cert_&#8203;rx</span><br/>{cert_&#8203;rx_&#8203;result="<span class="metrics-enum">banned</span>"} | counter | Result of processing an inbound cert (per cert) (Sender is banned for a failed signature verification) |
-| <span class="metrics-name">votor_&#8203;slot_&#8203;state_&#8203;used</span> | gauge | Number of slots tracked by the voting state machine |
-| <span class="metrics-name">votor_&#8203;slot_&#8203;state_&#8203;max</span> | gauge | Capacity of the voting state machine's slot table |
-| <span class="metrics-name">votor_&#8203;finalized_&#8203;slot</span> | gauge | Highest slot with a finalization cert, or 0 if none |
+| <span class="metrics-name">votor_&#8203;slot_&#8203;state_&#8203;pool_&#8203;used</span> | gauge | Number of slots tracked by the voting state machine |
+| <span class="metrics-name">votor_&#8203;slot_&#8203;state_&#8203;pool_&#8203;free</span> | gauge | Number of free entries in the voting state machine's slot table |
+| <span class="metrics-name">votor_&#8203;highest_&#8203;final_&#8203;cert_&#8203;slot</span> | gauge | Highest slot with a finalization cert, or 0 if none |
+| <span class="metrics-name">votor_&#8203;pool_&#8203;slot_&#8203;state_&#8203;pool_&#8203;used</span> | gauge | Number of slots tracked by the vote and cert pool |
+| <span class="metrics-name">votor_&#8203;pool_&#8203;slot_&#8203;state_&#8203;pool_&#8203;free</span> | gauge | Number of free entries in the vote and cert pool's slot table |
+| <span class="metrics-name">votor_&#8203;pool_&#8203;finalized_&#8203;slot</span> | gauge | Highest slot the vote and cert pool has finalized, or 0 if none |
 | <span class="metrics-name">votor_&#8203;rank</span> | gauge | Rank of this validator in the current epoch (0 is the highest rank), -1 if unranked (unstaked) |
 | <span class="metrics-name">votor_&#8203;peers_&#8203;connected</span> | gauge | Number of peers with an active outbound connection |
 

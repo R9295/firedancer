@@ -4,7 +4,7 @@
 #include "ag_votor_base.h"
 #include "ag_cert.h"
 #include "ag_epoch_info.h"
-#include "ag_event.h"
+#include "ag_pool.h"
 #include "ag_vote.h"
 
 #define AG_PARENT_STATUS_KNOWN     (1)
@@ -21,10 +21,12 @@
 #define AG_SLOT_STATE_OUT_EVENT_MAX  (3UL)
 #define AG_SLOT_STATE_OUT_REPAIR_MAX (3UL)
 
-#define AG_NOTAR_MAP_LG_SLOT_CNT          (11)
-#define AG_NOTAR_MAP_SLOT_CNT             (1UL<<AG_NOTAR_MAP_LG_SLOT_CNT)
-#define AG_NOTAR_FALLBACK_MAP_LG_SLOT_CNT (13)
-#define AG_NOTAR_FALLBACK_MAP_SLOT_CNT    (1UL<<AG_NOTAR_FALLBACK_MAP_LG_SLOT_CNT)
+#define AG_NOTAR_MAP_LG_SLOT_CNT            (11)
+#define AG_NOTAR_MAP_SLOT_CNT               (1UL<<AG_NOTAR_MAP_LG_SLOT_CNT)
+#define AG_NOTAR_MAP_USED_WORD_CNT          ((AG_NOTAR_MAP_SLOT_CNT+63UL)>>6)
+#define AG_NOTAR_FALLBACK_MAP_LG_SLOT_CNT   (13)
+#define AG_NOTAR_FALLBACK_MAP_SLOT_CNT      (1UL<<AG_NOTAR_FALLBACK_MAP_LG_SLOT_CNT)
+#define AG_NOTAR_FALLBACK_MAP_USED_WORD_CNT ((AG_NOTAR_FALLBACK_MAP_SLOT_CNT+63UL)>>6)
 FD_STATIC_ASSERT( AG_NOTAR_MAP_SLOT_CNT         >AG_VAT_MAX,                            notar_map          );
 FD_STATIC_ASSERT( AG_NOTAR_FALLBACK_MAP_SLOT_CNT>AG_VAT_MAX*AG_NOTAR_FALLBACK_VOTE_MAX, notar_fallback_map ); /* TODO tighten further */
 
@@ -48,13 +50,15 @@ struct ag_block_hash_set {
 typedef struct ag_block_hash_set ag_block_hash_set_t;
 
 struct ag_slot_votes {
-  ag_slot_voted_stake_hash_t notar_stake_map[ AG_NOTAR_MAP_SLOT_CNT ];
-  fd_bls_set_t               notar_set      [ fd_bls_set_word_cnt ];
-  fd_bls_sig_t               notar_sig      [ AG_VAT_MAX ];
-  ag_slot_voted_stake_hash_t notar_fallback_stake_map[ AG_NOTAR_FALLBACK_MAP_SLOT_CNT ];
-  fd_bls_sig_t               notar_fallback_sig      [ AG_VAT_MAX ][ AG_NOTAR_FALLBACK_VOTE_MAX ];
-  ag_block_hash_t            notar_fallback_sig_hash [ AG_VAT_MAX ][ AG_NOTAR_FALLBACK_VOTE_MAX ];
-  uchar                      notar_fallback_sig_cnt  [ AG_VAT_MAX ];
+  ag_slot_voted_stake_hash_t notar_stake_map [ AG_NOTAR_MAP_SLOT_CNT ];
+  ulong                      notar_stake_used[ AG_NOTAR_MAP_USED_WORD_CNT ];
+  fd_bls_set_t               notar_set       [ fd_bls_set_word_cnt ];
+  fd_bls_sig_t               notar_sig       [ AG_VAT_MAX ];
+  ag_slot_voted_stake_hash_t notar_fallback_stake_map [ AG_NOTAR_FALLBACK_MAP_SLOT_CNT ];
+  ulong                      notar_fallback_stake_used[ AG_NOTAR_FALLBACK_MAP_USED_WORD_CNT ];
+  fd_bls_sig_t               notar_fallback_sig       [ AG_VAT_MAX ][ AG_NOTAR_FALLBACK_VOTE_MAX ];
+  ag_block_hash_t            notar_fallback_sig_hash  [ AG_VAT_MAX ][ AG_NOTAR_FALLBACK_VOTE_MAX ];
+  uchar                      notar_fallback_sig_cnt   [ AG_VAT_MAX ];
   ulong                      skip_stake;
   fd_bls_sig_t               skip_sig[ AG_VAT_MAX ];
   fd_bls_agg_t               skip_agg;
@@ -102,6 +106,9 @@ typedef struct ag_slot_state ag_slot_state_t;
 
 FD_PROTOTYPES_BEGIN
 
+/* Resets self to an empty slot state.  self must be zeroed memory or a
+   slot state, as only the used stake map slots are cleared. */
+
 void
 ag_slot_state_null( ag_slot_state_t * self );
 
@@ -121,16 +128,16 @@ ag_slot_state_add_cert( ag_slot_state_t * self,
 /* Definition 12. SlotState::add_vote */
 
 int
-ag_slot_state_add_vote( ag_slot_state_t *   self,
-                        ag_vote_t const *   vote,
-                        ulong               stake,
-                        ag_event_cert_t *   out_cert_events,
-                        ulong *             out_cert_event_cnt,
-                        ag_event_pool_t *   out_pool_events,
-                        ulong *             out_pool_event_cnt,
-                        ag_event_repair_t * out_repair_events,
-                        ulong *             out_repair_event_cnt,
-                        fd_bls_set_t *      bad );
+ag_slot_state_add_vote( ag_slot_state_t *  self,
+                        ag_vote_t const *  vote,
+                        ulong              stake,
+                        ag_cert_t *        out_cert_events,
+                        ulong *            out_cert_event_cnt,
+                        ag_pool_event_t *  out_pool_events,
+                        ulong *            out_pool_event_cnt,
+                        ag_block_id_t *    out_repair_events,
+                        ulong *            out_repair_event_cnt,
+                        fd_bls_set_t *     bad );
 
 /* Definition 16. SlotState::notify_parent_known */
 

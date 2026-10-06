@@ -1,5 +1,7 @@
 #include "fd_tower_serdes.h"
 #include "fd_tower.h"
+#include "fd_tower_file.h"
+#include "../../ballet/ed25519/fd_ed25519.h"
 
 #include <string.h>
 
@@ -373,6 +375,52 @@ test_compact_to_votes( void ) {
   FD_LOG_NOTICE(( "pass: test_compact_to_votes" ));
 }
 
+/* Helper: write an Agave tower file into buf whose tower matches sync,
+   signed by keypair (private key then public key).  Returns the file
+   size. */
+
+static ulong
+make_tower_file( uchar *                               buf,
+                 uchar const *                         keypair,
+                 fd_compact_tower_sync_serde_t const * sync,
+                 fd_sha512_t *                         sha ) {
+  ulong sz = fd_tower_file_ser( sync, (fd_pubkey_t const *)fd_type_pun_const( keypair+32UL ), buf );
+  fd_ed25519_sign( buf+FD_TOWER_FILE_SIG_OFF, buf+FD_TOWER_FILE_DATA_OFF, sz-FD_TOWER_FILE_DATA_OFF, keypair+32UL, keypair, sha );
+  return sz;
+}
+
+static void
+test_tower_file_root( void ) {
+  fd_sha512_t   _sha[1];
+  fd_sha512_t * sha = fd_sha512_join( fd_sha512_new( _sha ) );
+
+  uchar keypair[ 64 ];
+  for( ulong i=0UL; i<32UL; i++ ) keypair[ i ] = (uchar)i;
+  fd_ed25519_public_from_private( keypair+32UL, keypair, sha );
+  fd_pubkey_t identity;
+  memcpy( identity.uc, keypair+32UL, 32UL );
+
+  fd_compact_tower_sync_serde_t sync;
+  fd_memset( &sync, 0, sizeof(sync) );
+  sync.root         = 100UL;
+  sync.lockouts_cnt = 3;
+  sync.lockouts[ 0 ] = ( __typeof__(sync.lockouts[0]) ){ .offset=5UL, .confirmation_count=3 };
+  sync.lockouts[ 1 ] = ( __typeof__(sync.lockouts[0]) ){ .offset=2UL, .confirmation_count=2 };
+  sync.lockouts[ 2 ] = ( __typeof__(sync.lockouts[0]) ){ .offset=4UL, .confirmation_count=1 };
+
+  uchar           buf[ FD_TOWER_FILE_MAX ];
+  fd_tower_file_t out;
+  FD_TEST( fd_tower_file_de( buf, make_tower_file( buf, keypair, &sync, sha ), &identity, &out )==FD_TOWER_FILE_SUCCESS );
+  FD_TEST( out.root==100UL && out.votes_cnt==3UL && out.votes[ 2 ].slot==111UL && out.timestamp_slot==111UL );
+
+  sync.root                 = ULONG_MAX;
+  sync.lockouts[ 0 ].offset = 105UL;
+  FD_TEST( fd_tower_file_de( buf, make_tower_file( buf, keypair, &sync, sha ), &identity, &out )==FD_TOWER_FILE_ERR_TOWER );
+
+  fd_sha512_delete( fd_sha512_leave( sha ) );
+  FD_LOG_NOTICE(( "pass: test_tower_file_root" ));
+}
+
 int
 main( int     argc,
       char ** argv ) {
@@ -383,6 +431,7 @@ main( int     argc,
   test_voter_v4();
   test_de_attacker();
   test_compact_to_votes();
+  test_tower_file_root();
 
   FD_LOG_NOTICE(( "pass" ));
   fd_halt();

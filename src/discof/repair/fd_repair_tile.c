@@ -1100,6 +1100,20 @@ during_housekeeping( ctx_t * ctx ) {
     FD_CHECK_CRIT( ctx->halt_signing, "state machine corruption" );
     ctx->halt_signing = 0;
     fd_keyswitch_state( ctx->keyswitch, FD_KEYSWITCH_STATE_COMPLETED );
+
+    /* Peers key their ping-pong cache by our pubkey, so every peer is
+       cold for the new identity.  Re-warm them all. */
+    fd_policy_peers_t * peers = &ctx->policy->peers;
+    fd_policy_peer_dlist_t * lists[ 2 ] = { peers->fast, peers->slow };
+    for( ulong l=0UL; l<2UL; l++ ) {
+      for( fd_policy_peer_dlist_iter_t iter = fd_policy_peer_dlist_iter_fwd_init( lists[ l ], peers->pool );
+           !fd_policy_peer_dlist_iter_done( iter, lists[ l ], peers->pool ) && !fd_signs_queue_full( ctx->pong_queue );
+           iter = fd_policy_peer_dlist_iter_fwd_next( iter, lists[ l ], peers->pool ) ) {
+        fd_policy_peer_t const * peer = fd_policy_peer_dlist_iter_ele_const( iter, lists[ l ], peers->pool );
+        fd_repair_msg_t * init = fd_repair_shred( ctx->protocol, &peer->key, (ulong)fd_clock_tile_now( ctx->clock )/1000000UL, 0, 0, 0 );
+        fd_signs_queue_push( ctx->pong_queue, (sign_pending_t){ .msg = *init } );
+      }
+    }
   }
 
   if( FD_UNLIKELY( fd_keyswitch_state_query( ctx->keyswitch )==FD_KEYSWITCH_STATE_SWITCH_PENDING ) ) {
@@ -1199,7 +1213,7 @@ unprivileged_init( fd_topo_t const *      topo,
       sign_repair_in_idx[ sign_repair_idx++ ] = in_idx;
       sign_link_depth                         = link->depth;
     }
-    else if( 0==strcmp( link->name, "gossip_out"   ) ) ctx->in_kind[ in_idx ] = IN_KIND_GOSSIP;
+    else if( 0==strcmp( link->name, "gossip_ciaddr" ) ) ctx->in_kind[ in_idx ] = IN_KIND_GOSSIP;
     else if( 0==strcmp( link->name, "tower_out"    ) ) ctx->in_kind[ in_idx ] = IN_KIND_TOWER;
     else if( 0==strcmp( link->name, "shred_out"    ) ) ctx->in_kind[ in_idx ] = IN_KIND_SHRED;
     else if( 0==strcmp( link->name, "snapin_manif" ) ) ctx->in_kind[ in_idx ] = IN_KIND_SNAP;

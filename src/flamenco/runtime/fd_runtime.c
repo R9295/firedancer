@@ -65,6 +65,9 @@ fd_runtime_update_next_leaders( fd_bank_t *          bank,
   ulong epoch    = fd_slot_to_epoch ( epoch_schedule, bank->f.slot, NULL ) + 1UL;
   ulong slot0    = fd_epoch_slot0   ( epoch_schedule, epoch );
   ulong slot_cnt = fd_epoch_slot_cnt( epoch_schedule, epoch );
+  if( FD_UNLIKELY( slot_cnt>FD_RUNTIME_SLOTS_PER_EPOCH ) ) {
+    FD_LOG_ERR(( "epoch %lu has %lu slots, but the maximum supported is %lu", epoch, slot_cnt, FD_RUNTIME_SLOTS_PER_EPOCH ));
+  }
 
   fd_vote_stakes_t const * vote_stakes      = fd_bank_vote_stakes( bank );
   fd_vote_stake_weight_t * epoch_weights    = runtime_stack->stakes.stake_weights;
@@ -101,6 +104,9 @@ fd_runtime_update_leaders( fd_bank_t *          bank,
   ulong epoch    = fd_slot_to_epoch ( epoch_schedule, bank->f.slot, NULL );
   ulong slot0    = fd_epoch_slot0   ( epoch_schedule, epoch );
   ulong slot_cnt = fd_epoch_slot_cnt( epoch_schedule, epoch );
+  if( FD_UNLIKELY( slot_cnt>FD_RUNTIME_SLOTS_PER_EPOCH ) ) {
+    FD_LOG_ERR(( "epoch %lu has %lu slots, but the maximum supported is %lu", epoch, slot_cnt, FD_RUNTIME_SLOTS_PER_EPOCH ));
+  }
 
   fd_vote_stakes_t const * vote_stakes      = fd_bank_vote_stakes( bank );
   fd_vote_stake_weight_t * epoch_weights    = runtime_stack->stakes.stake_weights;
@@ -2106,7 +2112,6 @@ fd_runtime_prepare_bundle_accounts( fd_runtime_t *      runtime,
 
   fd_pubkey_t   programdata_keys[ FD_BUNDLE_ACCT_MAX ];
   uchar const * pd_pubkeys      [ FD_BUNDLE_ACCT_MAX ];
-  int           pd_writable     [ FD_BUNDLE_ACCT_MAX ];
   ulong         pd_cnt = 0UL;
 
   FD_TEST( bank->parent_accdb_fork_id.val!=USHORT_MAX );
@@ -2134,7 +2139,6 @@ fd_runtime_prepare_bundle_accounts( fd_runtime_t *      runtime,
     FD_TEST( pd_cnt<FD_BUNDLE_ACCT_MAX );
     programdata_keys[ pd_cnt ] = *programdata_key;
     pd_pubkeys[ pd_cnt ]       = programdata_keys[ pd_cnt ].uc;
-    pd_writable[ pd_cnt ]      = 0;
     pd_cnt++;
   }
 
@@ -2143,7 +2147,7 @@ fd_runtime_prepare_bundle_accounts( fd_runtime_t *      runtime,
     programdata.  Skip it entirely for an empty bundle (nothing was
     reserved and nothing is executable). */
   if( FD_LIKELY( acquire_cnt || pd_cnt ) ) {
-    fd_accdb_acquire_b( runtime->accdb, bank->parent_accdb_fork_id, acquire_cnt, pd_cnt, pd_pubkeys, pd_writable, runtime->accounts.executable );
+    fd_accdb_acquire_b( runtime->accdb, bank->parent_accdb_fork_id, acquire_cnt, pd_cnt, pd_pubkeys, runtime->accounts.executable );
   }
   runtime->accounts.executable_cnt = pd_cnt;
 

@@ -247,16 +247,17 @@ fd_topo_tile_extra_normal_pages( fd_topo_tile_t const * tile ) {
 
       /* completion ring */
       xsk_rings_sz_bytes += tile->xdp.xdp_tx_queue_size * xdp_address_sz_bytes;
-      /* free ring */
-      xsk_rings_sz_bytes += tile->xdp.free_ring_depth   * xdp_address_sz_bytes;
+      /* fill ring */
+      xsk_rings_sz_bytes += tile->xdp.xdp_rx_queue_size * xdp_address_sz_bytes * 2UL;
 
-      key_pages += fd_ulong_align_up( xsk_rings_sz_bytes, FD_SHMEM_NORMAL_PAGE_SZ ) / FD_SHMEM_NORMAL_PAGE_SZ;
+      ulong xsk_cnt = ( strcmp( tile->xdp.if_virt, "lo" ) && !tile->kind_id ) ? 2UL : 1UL;
+      key_pages += xsk_cnt * fd_ulong_align_up( xsk_rings_sz_bytes, FD_SHMEM_NORMAL_PAGE_SZ ) / FD_SHMEM_NORMAL_PAGE_SZ;
 
       /* All 4 rings must store a ring header. This is 320 bytes
          per ring as of linux v6.18.3, however could change in
          the future so allow up to a full 4KB page per ring to
          be safe. */
-      key_pages += 4UL;
+      key_pages += xsk_cnt * 4UL;
   }
 
   return key_pages;
@@ -465,6 +466,12 @@ fd_topo_print_log( int         stdout,
     PRINT( "  %s%-23s%s  %s\n", c_dim, "Agave Affinity", c_normal, agave_affinity );
   }
 
+  if( FD_LIKELY( !stdout ) ) {
+    if( FD_LIKELY( cur>message ) ) cur[ -1 ] = '\0'; /* Strip trailing newline */
+    FD_LOG_INFO(( "%s", message ));
+    return;
+  }
+
   SECTION( "Workspaces (%lu)", topo->wksp_cnt );
   PRINT( "  %s%3s  %10s  %-13s  %5s  %-8s  %4s  %12s  %12s%s\n", c_dim, "ID", "SIZE", "NAME", "PAGES", "PAGE SZ", "NUMA", "FOOTPRINT", "LOOSE", c_normal );
   for( ulong i=0UL; i<topo->wksp_cnt; i++ ) {
@@ -549,7 +556,8 @@ fd_topo_print_log( int         stdout,
   for( ulong i=0UL; i<topo->tile_cnt; i++ ) {
     fd_topo_tile_t * tile = &topo->tiles[ i ];
 
-    char in[ 256 ] = {0};
+    /* Worst case ", -1023" per link */
+    char in[ 8UL*FD_TOPO_MAX_TILE_IN_LINKS ] = {0};
     char * cur_in = in;
     ulong remaining_in = sizeof( in ) - 1;
 
@@ -559,7 +567,7 @@ fd_topo_print_log( int         stdout,
       else PRINTIN( "%2ld", (long)-tile->in_link_id[ j ] );
     }
 
-    char out[ 256 ] = {0};
+    char out[ 8UL*FD_TOPO_MAX_TILE_OUT_LINKS ] = {0};
     char * cur_out = out;
     ulong remaining_out = sizeof( out ) - 1;
 
@@ -611,8 +619,7 @@ fd_topo_print_log( int         stdout,
     if( FD_LIKELY( i != topo->tile_cnt-1 ) ) PRINT( "\n" );
   }
 
-  if( FD_UNLIKELY( stdout ) ) FD_LOG_STDOUT(( "%s\n", message ));
-  else                        FD_LOG_INFO(( "%s", message ));
+  FD_LOG_STDOUT(( "%s\n", message ));
 
 #undef PRINT
 #undef PRINTIN

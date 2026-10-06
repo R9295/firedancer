@@ -1425,7 +1425,6 @@ fd_executor_setup_accounts_for_txn( fd_runtime_t *      runtime,
   ushort executable_acquire_cnt = 0;
   ushort executable_acquire_idx[ MAX_TX_ACCOUNT_LOCKS ];
   fd_pubkey_t programdata_keys[ MAX_TX_ACCOUNT_LOCKS ];
-  int writable[ MAX_TX_ACCOUNT_LOCKS ];
   uchar const * pubkeys[ MAX_TX_ACCOUNT_LOCKS ];
   for( ushort i=0; i<txn_out->accounts.cnt; i++ ) {
     fd_acc_t * acc = txn_out->accounts.account[ i ];
@@ -1466,7 +1465,6 @@ fd_executor_setup_accounts_for_txn( fd_runtime_t *      runtime,
       continue;
     }
 
-    writable[ executable_acquire_cnt ]               = 0;
     executable_acquire_idx[ executable_acquire_cnt ] = executable_account_cnt;
     /* Keep the derived programdata address in stable storage until
        fd_accdb_acquire_b() consumes the pubkey array below. */
@@ -1481,7 +1479,7 @@ fd_executor_setup_accounts_for_txn( fd_runtime_t *      runtime,
      and not txn_out->accounts.cnt. */
   FD_TEST( runtime->accounts.executable_cnt+executable_acquire_cnt<=FD_PACK_MAX_TXN_PER_BUNDLE*MAX_TX_ACCOUNT_LOCKS );
   fd_acc_t * acquire_base = &runtime->accounts.executable[ runtime->accounts.executable_cnt ];
-  fd_accdb_acquire_b( runtime->accdb, bank->parent_accdb_fork_id, acquire_cnt, executable_acquire_cnt, pubkeys, writable, acquire_base );
+  fd_accdb_acquire_b( runtime->accdb, bank->parent_accdb_fork_id, acquire_cnt, executable_acquire_cnt, pubkeys, acquire_base );
   int acquired_from_parent = bank->parent_accdb_fork_id.val!=bank->accdb_fork_id.val;
   for( ushort i=0; i<executable_acquire_cnt; i++ ) {
     ushort exe_idx = executable_acquire_idx[ i ];
@@ -1505,8 +1503,9 @@ fd_executor_setup_accounts_for_txn( fd_runtime_t *      runtime,
 }
 
 int
-fd_executor_txn_verify( fd_txn_p_t *  txn_p,
-                        fd_sha512_t * shas[ FD_TXN_SIG_MAX ] ) {
+fd_executor_txn_verify( fd_txn_p_t *         txn_p,
+                        fd_sha512_t *        shas[ FD_TXN_SIG_MAX ],
+                        fd_ed25519_cache_t * cache ) {
   fd_txn_t * txn = TXN( txn_p );
 
   uchar * signatures = txn_p->payload + txn->signature_off;
@@ -1514,7 +1513,8 @@ fd_executor_txn_verify( fd_txn_p_t *  txn_p,
   uchar * msg        = txn_p->payload + txn->message_off;
   ulong   msg_sz     = fd_txn_msg_sz( txn, txn_p->payload_sz );
 
-  int res = fd_ed25519_verify_batch_single_msg( msg, msg_sz, signatures, pubkeys, shas, txn->signature_cnt );
+  int res = cache ? fd_ed25519_verify_batch_single_msg_cached( msg, msg_sz, signatures, pubkeys, shas, txn->signature_cnt, cache ) :
+                    fd_ed25519_verify_batch_single_msg       ( msg, msg_sz, signatures, pubkeys, shas, txn->signature_cnt        );
   if( FD_UNLIKELY( res!=FD_ED25519_SUCCESS ) ) return FD_RUNTIME_TXN_ERR_SIGNATURE_FAILURE;
 
   return FD_RUNTIME_EXECUTE_SUCCESS;

@@ -1,3 +1,4 @@
+#define _GNU_SOURCE /* syscall, RENAME_EXCHANGE */
 #include "fd_tower_tile.h"
 #include <linux/futex.h>
 #include "generated/fd_tower_tile_seccomp.h"
@@ -7,6 +8,7 @@
 #include "../../choreo/hfork/fd_hfork.h"
 #include "../../choreo/votes/fd_votes.h"
 #include "../../choreo/tower/fd_tower.h"
+#include "../../choreo/tower/fd_tower_file.h"
 #include "../../choreo/tower/fd_tower_serdes.h"
 #include "../../choreo/tower/fd_tower_stakes.h"
 #include "../../disco/fd_txn_p.h"
@@ -24,6 +26,7 @@
 #include "../../flamenco/runtime/fd_bank.h"
 #include "../../flamenco/leaders/fd_multi_epoch_leaders.h"
 #include "../../flamenco/runtime/fd_system_ids.h"
+#include "../../flamenco/runtime/sysvar/fd_sysvar_slot_history.h"
 #include "../../flamenco/runtime/program/vote/fd_vote_state_versioned.h"
 #include "../../flamenco/runtime/program/vote/fd_vote_codec_tmpl.h"
 #include "../../util/pod/fd_pod.h"
@@ -31,7 +34,13 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdio.h>
 #include <unistd.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
+
+/* TODO: the tower file is not read during boot, just during identity
+   switches. */
 
 /* The Tower tile broadly processes three classes of frags, leading to
    three distinct kinds of frag processing:
@@ -134,6 +143,7 @@
 #define IN_KIND_GOSSIP (3)
 #define IN_KIND_IPECHO (4)
 #define IN_KIND_SHRED  (5)
+#define IN_KIND_SIGN   (6)
 
 #define OUT_IDX 0 /* only a single out link tower_out */
 
@@ -559,6 +569,8 @@ publish_slot_done( fd_tower_tile_t *            ctx,
     FD_TEST( !fd_tower_vote_empty( ctx->tower->votes ) );
     FD_TEST( txn->payload_sz && txn->payload_sz<=FD_TPU_MTU );
     fd_memcpy( msg->vote_txn, txn->payload, txn->payload_sz );
+    FD_TEST( fd_txn_parse_simple_vote( TXN(txn), txn->payload, &ctx->compact_tower_sync_serde ) );
+    ctx->tower_file_pending = out->vote_slot;
     msg->vote_txn_sz        = txn->payload_sz;
     msg->authority_idx      = authority_idx;
     msg->vote_created_nanos = fd_log_wallclock();
@@ -1061,6 +1073,135 @@ query_voters( fd_tower_tile_t *            ctx,
 }
 
 static void
+clear_votes( fd_tower_t * tower ) {
+  for( ulong i=0UL; i<tower->blk_max; i++ ) tower->blk_pool[ i ].voted = 0; /* blocks stay voted after their votes expire */
+  fd_tower_vote_remove_all( tower->votes );
+}
+
+static ulong
+vote_history_ahead( fd_tower_t *            tower,
+                    fd_ghost_t *            ghost,
+                    fd_tower_file_t const * file ) {
+  fd_tower_blk_t const * root_blk = fd_tower_blocks_query( tower, file->root );
+  int   ahead   = file->root>tower->root && ( !root_blk || !fd_ghost_query( ghost, &root_blk->replayed_block_id ) );
+  ulong wait    = file->votes[ file->votes_cnt-1UL ].slot+1UL;
+  int   missing = 0;
+  for( ulong i=0UL; i<file->votes_cnt; i++ ) {
+    fd_tower_vote_t const * vote = &file->votes[ i ];
+    fd_tower_blk_t  const * blk  = fd_tower_blocks_query( tower, vote->slot );
+    missing |= vote->slot>tower->root && ( !blk || !fd_ghost_query( ghost, &blk->replayed_block_id ) );
+    if( missing ) {
+      ahead = 1;
+      wait  = fd_ulong_max( wait, vote->slot+(1UL<<vote->conf)+1UL );
+    }
+  }
+  return ahead ? wait : 0UL;
+}
+
+static ulong
+vote_history_floor( fd_tower_t const *             tower,
+                    fd_tower_file_t const *        file,
+                    fd_slot_history_view_t const * slot_history ) {
+  ulong floor = 0UL;
+  for( ulong i=0UL; i<file->votes_cnt; i++ ) {
+    fd_tower_vote_t const * vote = &file->votes[ i ];
+    if( vote->slot<=tower->root && fd_sysvar_slot_history_find_slot( slot_history, vote->slot )==FD_SLOT_HISTORY_SLOT_NOT_FOUND ) {
+      floor = fd_ulong_max( floor, vote->slot+(1UL<<vote->conf)+1UL );
+    }
+  }
+  return floor;
+}
+
+static void
+adopt_vote_history( fd_tower_tile_t * ctx ) {
+  /* A minor note is that adopt_vote_history ignores the tower
+     file's latest vote timestamp. The only downside of this is that
+     if the Firedancer validator's wallclock is behind the tower
+     file's latest vote timestamp, its votes will land, but will not
+     execute successfully.  This will self-heal when the wallclock of
+     the switched-to validator catches up to the tower file's latest
+     vote timestamp. */
+
+  fd_tower_t *            tower = ctx->tower;
+  fd_tower_file_t const * file  = &ctx->vote_history;
+  ulong                   last  = file->votes[ file->votes_cnt-1UL ].slot;
+
+  /* The old validator may have voted for a different copy of this slot
+     than the one we replayed.  Agave only compares slot numbers: so we
+     keep the vote and treat it as a vote for our copy. */
+  fd_tower_blk_t const * last_blk = fd_tower_blocks_query( tower, last );
+  if( FD_UNLIKELY( last_blk && !fd_hash_eq( &last_blk->bank_hash, &file->bank_hash ) ) ) {
+    FD_LOG_WARNING(( "set-identity: last vote %lu in vote history is for a different bank than we replayed", last ));
+  }
+
+  fd_tower_vote_remove_all( ctx->scratch_tower );
+  for( ulong i=0UL; i<file->votes_cnt; i++ ) {
+    fd_tower_vote_t const * vote = &file->votes[ i ];
+    fd_tower_blk_t  const * blk  = fd_tower_blocks_query( tower, vote->slot );
+    if( FD_UNLIKELY( vote->slot>tower->root && ( !blk || !fd_ghost_query( ctx->ghost, &blk->replayed_block_id ) ) ) ) break;
+    fd_tower_vote_push_tail( ctx->scratch_tower, *vote );
+  }
+  if( FD_LIKELY( !fd_tower_vote_empty( ctx->scratch_tower ) && !fd_tower_vote_empty( tower->votes ) &&
+                 fd_tower_vote_peek_tail_const( tower->votes )->slot<=fd_tower_vote_peek_tail_const( ctx->scratch_tower )->slot ) ) clear_votes( tower );
+  fd_tower_blk_t const * root_blk = fd_tower_blocks_query( tower, file->root );
+  int root_replayed = file->root<=tower->root || ( root_blk && fd_ghost_query( ctx->ghost, &root_blk->replayed_block_id ) );
+  fd_tower_reconcile( tower, ctx->scratch_tower, root_replayed ? file->root : tower->root );
+}
+
+/* check_vote_history runs on each replayed slot while a vote history
+   is pending.  Our tower takes the history's votes on blocks we have
+   replayed as they arrive.  The history stops pending once all of its
+   votes and root are replayed, or it is behind our root, or its
+   missing blocks still haven't been replayed when their lockouts
+   expire.  We don't vote until votes that are missing, or were on an
+   abandoned fork, would no longer lock us out. */
+
+static void
+check_vote_history( fd_tower_tile_t *                  ctx,
+                    fd_replay_slot_completed_t const * slot_completed ) {
+  fd_tower_t *            tower = ctx->tower;
+  fd_tower_file_t const * file  = &ctx->vote_history;
+  ulong                   last  = file->votes[ file->votes_cnt-1UL ].slot;
+
+  /* If the tower file has votes that are behind our view of the root,
+     and has votes which were on abandoned forks, then we may need to
+     wait to vote to avoid violating lockout. */
+  ulong floor = 0UL;
+  fd_bank_t * bank = fd_banks_bank_query( ctx->banks, slot_completed->bank_idx );
+  FD_TEST( bank );
+  ulong                  sz;
+  uchar const *          data = fd_sysvar_cache_data_query( &bank->f.sysvar_cache, &fd_sysvar_slot_history_id, &sz );
+  fd_slot_history_view_t slot_history[1];
+  if( FD_LIKELY( data && fd_sysvar_slot_history_view( slot_history, data, sz ) ) ) floor = vote_history_floor( tower, file, slot_history );
+
+  /* If the tower file is ahead of what we have replayed, we need to
+     wait to catch up (or for lockout to expire) to make sure we aren't
+     accidentally violating lockout or double voting. */
+  ulong wait = vote_history_ahead( tower, ctx->ghost, file );
+  if( FD_LIKELY( last>tower->root ) ) adopt_vote_history( ctx );
+  if( FD_UNLIKELY( wait && slot_completed->slot<wait ) ) {
+    ulong wait_to_vote_slot = fd_ulong_max( wait, floor );
+    if( FD_UNLIKELY( tower->wait_to_vote_slot!=wait_to_vote_slot ) ) FD_LOG_INFO(( "set-identity: vote history is ahead of replay, not voting below slot %lu", wait_to_vote_slot ));
+    tower->wait_to_vote_slot = wait_to_vote_slot;
+    return;
+  }
+
+/* Either:
+   1. The tower file is behind our root, so drop it.
+   2. The tower file was ahead, but its missing blocks never arrived
+      and their lockouts have expired, so drop the votes on them.
+   3. All of its blocks are replayed, so it is fully adopted.
+
+   In every case we still don't vote until any of its votes on
+   abandoned forks stop locking us out. */
+  if     ( FD_UNLIKELY( last<=tower->root ) ) FD_LOG_NOTICE(( "set-identity: vote history is behind root %lu (last vote %lu)", tower->root, last ));
+  else if( FD_UNLIKELY( wait              ) ) FD_LOG_WARNING(( "set-identity: vote history blocks were never replayed, dropping the votes on them" ));
+  else                                        FD_LOG_NOTICE(( "set-identity: restored vote history, last vote %lu, root %lu", last, tower->root ));
+  ctx->vote_history_pending = 0;
+  tower->wait_to_vote_slot  = fd_ulong_max( wait, floor );
+}
+
+static void
 replay_slot_completed( fd_tower_tile_t *            ctx,
                        fd_replay_slot_completed_t * slot_completed,
                        ulong                        tsorig,
@@ -1270,6 +1411,8 @@ replay_slot_completed( fd_tower_tile_t *            ctx,
   int hfork_flag = fd_hfork_record_our_bank_hash( ctx->hfork, &slot_completed->block_id, &slot_completed->bank_hash, fd_ulong_if( lsched->epoch==ctx->root_epoch, ctx->root_epoch_total_stake, ctx->next_epoch_total_stake ) );
   update_metrics_hfork( ctx, hfork_flag, slot_completed->slot, &slot_completed->block_id );
 
+  if( FD_UNLIKELY( ctx->vote_history_pending ) ) check_vote_history( ctx, slot_completed );
+
   /* Determine reset, vote, and root slots.  There may not be a vote or
      root slot but there is always a reset slot. */
 
@@ -1291,30 +1434,31 @@ replay_slot_completed( fd_tower_tile_t *            ctx,
       FD_LOG_CRIT(( "invariant violation: root block id is null at slot %lu", out.root_slot ));
     }
 
-    fd_tower_blk_t * oldr_tower_blk = fd_tower_blocks_query( ctx->tower, ctx->tower->root );
     fd_tower_blk_t * newr_tower_blk = fd_tower_blocks_query( ctx->tower, out.root_slot );
-    FD_TEST( oldr_tower_blk );
     FD_TEST( newr_tower_blk );
 
     /* It is a Solana consensus protocol invariant that a validator must
        make at least one root in an epoch, so the root's epoch cannot
-       advance by more than one.  */
+       advance by more than one.  Compare against root_epoch, the epoch
+       voters were last indexed for, since reconcile can move tower->root
+       into the next epoch without publishing a root. */
 
-    FD_TEST( oldr_tower_blk->epoch==newr_tower_blk->epoch || oldr_tower_blk->epoch+1==newr_tower_blk->epoch  ); /* root can only move forward one epoch */
+    FD_TEST( ctx->root_epoch==newr_tower_blk->epoch || ctx->root_epoch+1==newr_tower_blk->epoch  ); /* root can only move forward one epoch */
 
     /* Publish votes: 1. reindex if it's a new epoch. 2. publish the new
        root to votes. */
 
-    if( FD_UNLIKELY( oldr_tower_blk->epoch+1==newr_tower_blk->epoch ) ) {
+    if( FD_UNLIKELY( ctx->root_epoch+1==newr_tower_blk->epoch ) ) {
       FD_TEST( newr_tower_blk->epoch==slot_completed->epoch ); /* new root's epoch must be same as current slot_completed */
       QUERY_VOTERS( ctx, slot_completed, newr_tower_blk->epoch );
     }
     fd_votes_publish( ctx->votes, out.root_slot );
 
     /* Publish tower_blocks and tower_stakes by removing any entries
-       older than the new root. */
+       older than the new root.  Start from the ghost root, which trails
+       tower->root when reconcile moved it. */
 
-    for( ulong slot = ctx->tower->root; slot < out.root_slot; slot++ ) {
+    for( ulong slot = fd_ghost_root( ctx->ghost )->slot; slot < out.root_slot; slot++ ) {
       fd_tower_blocks_remove( ctx->tower, slot );
       fd_tower_lockos_remove( ctx->tower, slot );
       fd_tower_stakes_remove( ctx->tower, slot );
@@ -1499,6 +1643,8 @@ init_choreo( void                 * scratch,
   memset( ctx->duplicate_chunks, 0, sizeof(ctx->duplicate_chunks) );
   memset( &ctx->compact_tower_sync_serde, 0, sizeof(ctx->compact_tower_sync_serde) );
   memset( ctx->vote_txn, 0, sizeof(ctx->vote_txn) );
+  ctx->vote_history_pending = 0;
+  ctx->tower_file_pending   = 0UL;
 
   ctx->halt_signing    = 0;
   ctx->hard_fork_fatal = tile->tower.hard_fork_fatal;
@@ -1508,13 +1654,83 @@ init_choreo( void                 * scratch,
   ctx->root_epoch      = ULONG_MAX;
 
   memset( &ctx->metrics, 0, sizeof(ctx->metrics) );
-  ctx->metrics.last_vote_slot = ULONG_MAX;
+  ctx->metrics.last_vote_slot  = ULONG_MAX;
+  ctx->metrics.tower_file_slot = ULONG_MAX;
 
   return ctx;
 }
 
+/* tower_file_write saves our last vote the way Agave does, so an
+   operator can move it to another validator with set-identity.  The
+   file is signed by the identity, so it is only written while the sign
+   tile is known to hold the same identity key as we do.
+
+   The first write after a set-identity gives the files the name of
+   the new identity.  A file that already has that name, e.g. the
+   tower file passed to set-identity, is kept under a free .old name,
+   not replaced. */
+
+static void
+tower_file_write( fd_tower_tile_t * ctx ) {
+  FD_BASE58_ENCODE_32_BYTES( ctx->identity_key->uc, identity_key_b58 );
+  char name[ 2 ][ PATH_MAX ];
+  FD_TEST( fd_cstr_printf_check( name[ 1 ], PATH_MAX, NULL, "tower-1_9-%s.bin",     identity_key_b58 ) );
+  FD_TEST( fd_cstr_printf_check( name[ 0 ], PATH_MAX, NULL, "tower-1_9-%s.bin.new", identity_key_b58 ) );
+
+  /* Handle the case around an identity switch.  Swap the name of the
+     files and handle naming collisions. */
+  if( FD_UNLIKELY( strcmp( name[ 1 ], ctx->tower_name[ 1 ] ) ) ) {
+    for( ulong i=0UL; i<2UL; i++ ) { /* [0] staging, [1] live */
+      if( FD_LIKELY( !syscall( SYS_renameat2, ctx->tower_dir_fd, ctx->tower_name[ i ], ctx->tower_dir_fd, name[ i ], RENAME_NOREPLACE ) ) ) continue;
+      if( FD_UNLIKELY( errno!=EEXIST ) ) FD_LOG_ERR(( "renameat2(%s, %s) failed (%i-%s)", ctx->tower_name[ i ], name[ i ], errno, fd_io_strerror( errno ) ));
+
+      char old[ PATH_MAX ];
+      for( ulong j=0UL;; j++ ) {
+        if( j ) FD_TEST( fd_cstr_printf_check( old, PATH_MAX, NULL, "%s.old.%lu", name[ i ], j ) );
+        else    FD_TEST( fd_cstr_printf_check( old, PATH_MAX, NULL, "%s.old",     name[ i ]    ) );
+        if( FD_LIKELY( !syscall( SYS_renameat2, ctx->tower_dir_fd, name[ i ], ctx->tower_dir_fd, old, RENAME_NOREPLACE ) ) ) break;
+        if( FD_UNLIKELY( errno!=EEXIST ) ) FD_LOG_ERR(( "renameat2(%s, %s) failed (%i-%s)", name[ i ], old, errno, fd_io_strerror( errno ) ));
+      }
+      FD_LOG_WARNING(( "tower file %s already existed, moved it to %s", name[ i ], old ));
+      if( FD_UNLIKELY( syscall( SYS_renameat2, ctx->tower_dir_fd, ctx->tower_name[ i ], ctx->tower_dir_fd, name[ i ], RENAME_NOREPLACE ) ) )
+        FD_LOG_ERR(( "renameat2(%s, %s) failed (%i-%s)", ctx->tower_name[ i ], name[ i ], errno, fd_io_strerror( errno ) ));
+    }
+    FD_LOG_NOTICE(( "tower file %s renamed to %s for the new identity", ctx->tower_name[ 1 ], name[ 1 ] ));
+    memcpy( ctx->tower_name, name, sizeof(name) );
+  }
+
+  /* Produce and sign the contents of a valid tower file. */
+  uchar buf[ FD_TOWER_FILE_MAX ];
+  ulong sz = fd_tower_file_ser( &ctx->compact_tower_sync_serde, ctx->identity_key, buf );
+  fd_keyguard_client_sign( ctx->keyguard_client, buf+FD_TOWER_FILE_SIG_OFF, buf+FD_TOWER_FILE_DATA_OFF, sz-FD_TOWER_FILE_DATA_OFF, FD_KEYGUARD_SIGN_TYPE_ED25519 );
+
+  /* Write and truncate staging file */
+  for( ulong off=0UL; off<sz; ) {
+    long n = pwritev2( ctx->tower_fd[ 0 ], &(struct iovec){ .iov_base=buf+off, .iov_len=sz-off }, 1, (long)off, 0 );
+    if( FD_UNLIKELY( -1==n && errno==EINTR ) ) continue;
+    if( FD_UNLIKELY( n<=0 ) ) FD_LOG_ERR(( "pwritev2(%s) failed (%i-%s)", ctx->tower_name[ 0 ], errno, fd_io_strerror( errno ) ));
+    off += (ulong)n;
+  }
+  while( FD_UNLIKELY( ftruncate( ctx->tower_fd[ 0 ], (long)sz ) ) ) {
+    if( FD_UNLIKELY( errno!=EINTR ) ) FD_LOG_ERR(( "ftruncate(%s) failed (%i-%s)", ctx->tower_name[ 0 ], errno, fd_io_strerror( errno ) ));
+  }
+
+  /* The exchange makes the new tower live atomically.  Files cannot be
+     opened after boot, so old live file is now the staging file. */
+  if( FD_UNLIKELY( syscall( SYS_renameat2, ctx->tower_dir_fd, ctx->tower_name[ 0 ], ctx->tower_dir_fd, ctx->tower_name[ 1 ], RENAME_EXCHANGE ) ) )
+    FD_LOG_ERR(( "renameat2(%s, %s) failed (%i-%s)", ctx->tower_name[ 0 ], ctx->tower_name[ 1 ], errno, fd_io_strerror( errno ) ));
+  int staging = ctx->tower_fd[ 0 ]; ctx->tower_fd[ 0 ] = ctx->tower_fd[ 1 ]; ctx->tower_fd[ 1 ] = staging;
+
+  ctx->metrics.tower_file_write++;
+  ctx->metrics.tower_file_slot = ctx->tower_file_pending;
+  ctx->metrics.tower_file_sz   = sz;
+  ctx->tower_file_pending      = 0UL;
+}
+
 static void
 during_housekeeping( fd_tower_tile_t * ctx ) {
+  if( FD_UNLIKELY( ctx->tower_file_pending && !ctx->halt_signing && ctx->tower_dir_fd!=-1 ) ) tower_file_write( ctx );
+
   if( FD_UNLIKELY( fd_keyswitch_state_query( ctx->auth_vtr_keyswitch )==FD_KEYSWITCH_STATE_UNHALT_PENDING ) ) {
     if( fd_keyswitch_param_query( ctx->auth_vtr_keyswitch )==FD_KEYSWITCH_PARAM_AV_CLEAR ) ctx->halt_signing = 0;
     fd_keyswitch_state( ctx->auth_vtr_keyswitch, FD_KEYSWITCH_STATE_UNLOCKED );
@@ -1542,19 +1758,6 @@ during_housekeeping( fd_tower_tile_t * ctx ) {
     fd_keyswitch_state( ctx->auth_vtr_keyswitch, FD_KEYSWITCH_STATE_COMPLETED );
   }
 
-  /* FIXME: Currently, the tower tile doesn't support set-identity with
-     a tower file.  When support for a tower file is added, we need to
-     swap the file that is running and sync it to the local state of
-     the tower.  Because a tower file is not supported, if another
-     validator was running with the identity that was switched to, then
-     it is possible that the original validator and the fallback (this
-     node), may have tower files which are out of sync.  This could lead
-     to consensus violations such as double voting or duplicate
-     confirmations.  Currently it is unsafe for a validator operator to
-     switch identities without a 512 slot delay: the reason for this
-     delay is to account for the worst case number of slots a vote
-     account can be locked out for. */
-
   if( FD_UNLIKELY( fd_keyswitch_state_query( ctx->identity_keyswitch )==FD_KEYSWITCH_STATE_UNHALT_PENDING ) ) {
     FD_LOG_DEBUG(( "keyswitch: unhalting signing" ));
     FD_CHECK_CRIT( ctx->halt_signing, "state machine corruption" );
@@ -1570,7 +1773,14 @@ during_housekeeping( fd_tower_tile_t * ctx ) {
     ctx->halt_signing = 1;
     if( FD_UNLIKELY( !publishes_empty( ctx->publishes ) ) ) return;
 
+    int identity_changed = !!memcmp( ctx->identity_key, ctx->identity_keyswitch->bytes, 32UL );
     memcpy( ctx->identity_key, ctx->identity_keyswitch->bytes, 32UL );
+    if( identity_changed ) {
+      clear_votes( ctx->tower );
+      ctx->tower->wait_to_vote_slot = 0UL;
+      ctx->vote_history_pending     = !!FD_LOAD( ulong, ctx->identity_keyswitch->bytes+32UL );
+      if( ctx->vote_history_pending ) memcpy( &ctx->vote_history, ctx->identity_keyswitch->bytes+40UL, sizeof(fd_tower_file_t) );
+    }
     FD_BASE58_ENCODE_32_BYTES( ctx->identity_key->uc, pubkey_str );
     FD_LOG_INFO(( "my identity key: %s (key switched)", pubkey_str ));
     ctx->identity_keyswitch->result = ctx->out_seq;
@@ -1595,6 +1805,10 @@ metrics_write( fd_tower_tile_t * ctx ) {
 
   FD_MCNT_ENUM_COPY( TOWER, FORK_DECISION, ctx->metrics.fork );
   FD_MCNT_ENUM_COPY( TOWER, VOTE_GATE,     ctx->metrics.gate );
+
+  FD_MCNT_SET  ( TOWER, TOWER_FILE_WRITE,      ctx->metrics.tower_file_write );
+  FD_MGAUGE_SET( TOWER, TOWER_FILE_SLOT,       ctx->metrics.tower_file_slot  );
+  FD_MGAUGE_SET( TOWER, TOWER_FILE_SIZE_BYTES, ctx->metrics.tower_file_sz    );
 
   FD_MCNT_ENUM_COPY( TOWER, VOTE_TXN,               ctx->metrics.votes      );
   FD_MCNT_ENUM_COPY( TOWER, VOTE_SLOT_COUNTED,      ctx->metrics.vote_slots );
@@ -1796,18 +2010,21 @@ privileged_init( fd_topo_t const *      topo,
   }
   ctx->auth_vtr_path_cnt = tile->tower.authorized_voter_paths_cnt;
 
-  /* The tower file is used to checkpt and restore the state of the
-     local tower. */
+  ctx->tower_dir_fd  = -1;
+  ctx->tower_fd[ 0 ] = -1;
+  ctx->tower_fd[ 1 ] = -1;
+  if( FD_LIKELY( tile->tower.tower_path[ 0 ] ) ) {
+    FD_BASE58_ENCODE_32_BYTES( ctx->identity_key->uc, identity_key_b58 );
+    FD_TEST( fd_cstr_printf_check( ctx->tower_name[ 1 ], PATH_MAX, NULL, "tower-1_9-%s.bin",     identity_key_b58 ) );
+    FD_TEST( fd_cstr_printf_check( ctx->tower_name[ 0 ], PATH_MAX, NULL, "tower-1_9-%s.bin.new", identity_key_b58 ) );
 
-  char path[ PATH_MAX ];
-  FD_BASE58_ENCODE_32_BYTES( ctx->identity_key->uc, identity_key_b58 );
-  FD_TEST( fd_cstr_printf_check( path, sizeof(path), NULL, "%s/tower-1_9-%s.bin.new", tile->tower.base_path, identity_key_b58 ) );
-  ctx->checkpt_fd = open( path, O_WRONLY|O_CREAT|O_TRUNC, 0600 );
-  if( FD_UNLIKELY( -1==ctx->checkpt_fd ) ) FD_LOG_ERR(( "open(`%s`) failed (%i-%s)", path, errno, fd_io_strerror( errno ) ));
-
-  FD_TEST( fd_cstr_printf_check( path, sizeof(path), NULL, "%s/tower-1_9-%s.bin", tile->tower.base_path, identity_key_b58 ) );
-  ctx->restore_fd = open( path, O_RDONLY );
-  if( FD_UNLIKELY( -1==ctx->restore_fd && errno!=ENOENT ) ) FD_LOG_ERR(( "open(`%s`) failed (%i-%s)", path, errno, fd_io_strerror( errno ) ));
+    ctx->tower_dir_fd = open( tile->tower.tower_path, O_RDONLY|O_DIRECTORY );
+    if( FD_UNLIKELY( -1==ctx->tower_dir_fd ) ) FD_LOG_ERR(( "open(`%s`) failed (%i-%s)", tile->tower.tower_path, errno, fd_io_strerror( errno ) ));
+    for( ulong i=0UL; i<2UL; i++ ) {
+      ctx->tower_fd[ i ] = openat( ctx->tower_dir_fd, ctx->tower_name[ i ], O_WRONLY|O_CREAT, 0644 );
+      if( FD_UNLIKELY( -1==ctx->tower_fd[ i ] ) ) FD_LOG_ERR(( "open(`%s/%s`) failed (%i-%s)", tile->tower.tower_path, ctx->tower_name[ i ], errno, fd_io_strerror( errno ) ));
+    }
+  }
 }
 
 static void
@@ -1837,10 +2054,11 @@ unprivileged_init( fd_topo_t const *      topo,
 
     if     ( FD_LIKELY( !strcmp( link->name, "dedup_resolv"  ) ) ) ctx->in_kind[ i ] = IN_KIND_DEDUP;
     else if( FD_LIKELY( !strcmp( link->name, "replay_epoch"  ) ) ) ctx->in_kind[ i ] = IN_KIND_EPOCH;
-    else if( FD_LIKELY( !strcmp( link->name, "gossip_out"    ) ) ) ctx->in_kind[ i ] = IN_KIND_GOSSIP;
+    else if( FD_LIKELY( !strcmp( link->name, "gossip_misc"   ) ) ) ctx->in_kind[ i ] = IN_KIND_GOSSIP;
     else if( FD_LIKELY( !strcmp( link->name, "ipecho_out"    ) ) ) ctx->in_kind[ i ] = IN_KIND_IPECHO;
     else if( FD_LIKELY( !strcmp( link->name, "replay_out"    ) ) ) ctx->in_kind[ i ] = IN_KIND_REPLAY;
     else if( FD_LIKELY( !strcmp( link->name, "shred_out"     ) ) ) ctx->in_kind[ i ] = IN_KIND_SHRED;
+    else if( FD_LIKELY( !strcmp( link->name, "sign_tower"    ) ) ) ctx->in_kind[ i ] = IN_KIND_SIGN;
     else FD_LOG_ERR(( "tower tile has unexpected input link %lu %s", i, link->name ));
 
     ctx->in[ i ].mcache_only = !link->mtu;
@@ -1859,6 +2077,18 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->out_seq       = 0UL;
   ctx->replay_in_seq = 0UL;
 
+  ulong sign_in_idx  = fd_topo_find_tile_in_link ( topo, tile, "sign_tower", tile->kind_id );
+  ulong sign_out_idx = fd_topo_find_tile_out_link( topo, tile, "tower_sign", tile->kind_id );
+  if( FD_LIKELY( sign_in_idx!=ULONG_MAX && sign_out_idx!=ULONG_MAX ) ) {
+    fd_topo_link_t const * sign_in  = &topo->links[ tile->in_link_id [ sign_in_idx  ] ];
+    fd_topo_link_t const * sign_out = &topo->links[ tile->out_link_id[ sign_out_idx ] ];
+    fd_sleep_t * sleep = topo->sleep_obj_id!=ULONG_MAX ? fd_sleep_join( fd_topo_obj_laddr( topo, topo->sleep_obj_id ) ) : NULL;
+    FD_TEST( fd_keyguard_client_join( fd_keyguard_client_new( ctx->keyguard_client, sign_out->mcache, sign_out->dcache, sign_in->mcache, sign_in->dcache,
+                                                              sign_out->mtu, sign_in->mtu, sleep, sign_out->id, fd_topo_find_link_consumer( topo, sign_out ) ) ) );
+  } else {
+    ctx->tower_dir_fd = -1; /* no signer (forktest), the tower file is not written */
+  }
+
   FD_BASE58_ENCODE_32_BYTES( ctx->vote_account->uc, vote_account_b58 );
   FD_BASE58_ENCODE_32_BYTES( ctx->identity_key->uc, identity_key_b58 );
   FD_LOG_INFO(( "my vote account: %s", vote_account_b58 ));
@@ -1874,7 +2104,7 @@ populate_allowed_seccomp( fd_topo_t const *      topo,
   FD_SCRATCH_ALLOC_INIT( l, scratch );
   fd_tower_tile_t * ctx = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_tower_tile_t), sizeof(fd_tower_tile_t) );
 
-  populate_sock_filter_policy_fd_tower_tile( out_cnt, out, (uint)fd_log_private_logfile_fd(), (uint)ctx->checkpt_fd, (uint)ctx->restore_fd, FD_ACCDB_FD_RW );
+  populate_sock_filter_policy_fd_tower_tile( out_cnt, out, (uint)fd_log_private_logfile_fd(), (uint)ctx->tower_dir_fd, (uint)ctx->tower_fd[ 0 ], (uint)ctx->tower_fd[ 1 ], FD_ACCDB_FD_RW );
   return sock_filter_policy_fd_tower_tile_instr_cnt;
 }
 
@@ -1887,14 +2117,17 @@ populate_allowed_fds( fd_topo_t const *      topo,
   FD_SCRATCH_ALLOC_INIT( l, scratch );
   fd_tower_tile_t * ctx = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_tower_tile_t), sizeof(fd_tower_tile_t) );
 
-  if( FD_UNLIKELY( out_fds_cnt<5UL ) ) FD_LOG_ERR(( "out_fds_cnt %lu", out_fds_cnt ));
+  if( FD_UNLIKELY( out_fds_cnt<6UL ) ) FD_LOG_ERR(( "out_fds_cnt %lu", out_fds_cnt ));
 
   ulong out_cnt = 0UL;
   out_fds[ out_cnt++ ] = 2; /* stderr */
   if( FD_LIKELY( -1!=fd_log_private_logfile_fd() ) )
     out_fds[ out_cnt++ ] = fd_log_private_logfile_fd(); /* logfile */
-  if( FD_LIKELY( ctx->checkpt_fd!=-1 ) ) out_fds[ out_cnt++ ] = ctx->checkpt_fd;
-  if( FD_LIKELY( ctx->restore_fd!=-1 ) ) out_fds[ out_cnt++ ] = ctx->restore_fd;
+  if( FD_LIKELY( -1!=ctx->tower_dir_fd ) ) {
+    out_fds[ out_cnt++ ] = ctx->tower_dir_fd;
+    out_fds[ out_cnt++ ] = ctx->tower_fd[ 0 ];
+    out_fds[ out_cnt++ ] = ctx->tower_fd[ 1 ];
+  }
   out_fds[ out_cnt++ ] = FD_ACCDB_FD_RW; /* accounts database */
 
   return out_cnt;
@@ -1921,6 +2154,7 @@ max_event_sz( fd_topo_tile_t const * tile FD_PARAM_UNUSED ) {
 
 fd_topo_run_tile_t fd_tile_tower = {
   .name                     = "tower",
+  .allow_renameat           = 1, /* tower_file_write */
   .max_event_sz             = max_event_sz,
   .populate_allowed_seccomp = populate_allowed_seccomp,
   .populate_allowed_fds     = populate_allowed_fds,

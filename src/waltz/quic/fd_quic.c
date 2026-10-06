@@ -490,6 +490,8 @@ fd_quic_init( fd_quic_t * quic ) {
 
     .alpn                  = config->alpn,
     .alpn_sz               = config->alpn_sz,
+
+    .req_client_cert       = config->req_client_cert,
   };
 
   /* State: Initialize handshake pool */
@@ -2833,6 +2835,7 @@ fd_quic_tls_cb_handshake_complete( fd_quic_tls_hs_t * hs,
   switch( conn->state ) {
     case FD_QUIC_CONN_STATE_ABORT:
     case FD_QUIC_CONN_STATE_CLOSE_PENDING:
+    case FD_QUIC_CONN_STATE_PEER_CLOSE:
     case FD_QUIC_CONN_STATE_DEAD:
       /* ignore */
       return;
@@ -5147,9 +5150,14 @@ fd_quic_handle_new_token_frame(
     fd_quic_new_token_frame_t * data,
     uchar const *               p    FD_PARAM_UNUSED,
     ulong                       p_sz FD_PARAM_UNUSED ) {
-  /* FIXME A server MUST treat receipt of a NEW_TOKEN frame as a connection error of type PROTOCOL_VIOLATION. */
   (void)data;
   FD_DTRACE_PROBE_1( quic_handle_new_token_frame, context->conn->our_conn_id );
+  /* A server MUST treat receipt of a NEW_TOKEN frame as a connection
+     error of type PROTOCOL_VIOLATION. (RFC 9000 Section 19.7) */
+  if( FD_UNLIKELY( context->conn->server ) ) {
+    fd_quic_frame_error( context, FD_QUIC_CONN_REASON_PROTOCOL_VIOLATION, __LINE__ );
+    return FD_QUIC_PARSE_FAIL;
+  }
   return 0UL;
 }
 
