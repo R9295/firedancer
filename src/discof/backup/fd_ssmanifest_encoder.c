@@ -10,22 +10,27 @@ ENCODE_FN {
 
   switch( enc->state ) {
   case STATE_BLOCKHASH_QUEUE: {
-    fd_blockhashes_t const *    bhq = &bank->f.block_hash_queue;
-    fd_blockhash_info_t const * deq = bhq->d.deque;
-    ulong total    = fd_blockhash_deq_cnt( deq );
-    ulong to_write = fd_ulong_min( total, FD_BLOCKHASHES_MAX );
-    ulong to_skip  = total - to_write;
-    PUSH_VAL( ulong, to_write-1UL ); /* last hash index */
-    fd_hash_t const * last_hash = fd_blockhashes_peek_last_hash( bhq );
-    PUSH_VAL( uchar, !!last_hash );
-    if( last_hash ) PUSH_VAL( fd_hash_t, *last_hash );
+    fd_blockhashes_t const *    bhq   = &bank->f.block_hash_queue;
+    fd_blockhash_info_t const * deq   = bhq->d.deque;
+    ulong                       total = fd_blockhash_deq_cnt( deq );
 
-    PUSH_VAL( ulong, to_write );
-    for( ulong i=0UL; i<to_write; i++ ) {
-      fd_blockhash_info_t const * ele = fd_blockhash_deq_peek_index_const( deq, to_skip+i );
+    /* Write the newest FD_BLOCKHASHES_MAX entries by count, each at its
+       own absolute hash_index. with skipped indices it can keep an
+       entry older than max_age. */
+    ulong cnt     = fd_ulong_min( total, FD_BLOCKHASHES_MAX );
+    ulong to_skip = total - cnt;
+
+    fd_blockhash_info_t const * last = fd_blockhashes_peek_last( bhq );
+    PUSH_VAL( ulong, last ? last->hash_index : 0UL ); /* last hash index */
+    PUSH_VAL( uchar, !!last );
+    if( last ) PUSH_VAL( fd_hash_t, last->hash );
+
+    PUSH_VAL( ulong, cnt );
+    for( ulong i=to_skip; i<total; i++ ) {
+      fd_blockhash_info_t const * ele = fd_blockhash_deq_peek_index_const( deq, i );
       PUSH_VAL( fd_hash_t, ele->hash );
       PUSH_VAL( ulong,     ele->lamports_per_signature );
-      PUSH_VAL( ulong,     i );
+      PUSH_VAL( ulong,     ele->hash_index );
       PUSH_VAL( ulong,     0UL ); /* timestamp, ignored */
     }
     PUSH_VAL( ulong, FD_BLOCKHASHES_MAX-1UL ); /* max_age */
@@ -183,12 +188,13 @@ ENCODE_FN {
   case STATE_EPOCH_STAKES_STAKES: {
     int iter_kind = epoch_stakes_iter_kind( bank, enc->epoch_idx );
 
-    fd_pubkey_t pubkey       = {0};
-    ulong       stake        = 0UL;
-    fd_pubkey_t node_account = {0};
-    ushort      commission   = 0;
-    ulong       ec_cnt       = 0UL;
+    fd_pubkey_t pubkey            = {0};
+    ulong       stake             = 0UL;
+    fd_pubkey_t node_account      = {0};
+    ushort      commission        = 0;
+    ulong       ec_cnt            = 0UL;
     fd_epoch_credits_t const * ec = NULL;
+    ulong ag_marker_idx           = ULONG_MAX;
     uchar bls_key[ FD_BLS_PUB_COMPRESSED_SZ ] = {0};
 
     fd_collector_overrides_t * overrides = fd_bank_collector_overrides( bank );
@@ -211,6 +217,13 @@ ENCODE_FN {
       ec = find_epoch_credits( enc->bank, &pubkey );
       FD_TEST( ec );
       ec_cnt = ec->cnt;
+      if( FD_UNLIKELY( ec->has_ag_migration_marker ) ) {
+        ulong ag_migration_slot  = bank->f.alpenglow_migration_slot;
+        FD_TEST( ag_migration_slot!=ULONG_MAX );
+        ulong ag_migration_epoch = fd_slot_to_epoch( &bank->f.epoch_schedule, ag_migration_slot, NULL );
+        ag_marker_idx            = fd_epoch_credits_ag_marker_idx( ec, ag_migration_epoch );
+        ec_cnt++;
+      }
       co_epoch = bank->f.epoch;
     } else if( iter_kind==FD_VOTE_STAKES_ITER_T_2 ) {
       co_epoch = fd_ulong_sat_sub( bank->f.epoch, 1UL );
@@ -266,10 +279,17 @@ ENCODE_FN {
 
     /* Epoch credits */
     PUSH_VAL( ulong, ec_cnt );
-    for( ulong j=0UL; j<ec_cnt; j++ ) {
+    for( ulong k=0UL, j=0UL; k<ec_cnt; k++ ) {
+      if( FD_UNLIKELY( k==ag_marker_idx ) ) {
+        PUSH_VAL( ulong, ULONG_MAX );
+        PUSH_VAL( ulong, ULONG_MAX );
+        PUSH_VAL( ulong, ULONG_MAX );
+        continue;
+      }
       PUSH_VAL( ulong, (ulong)ec->epoch[j] );
       PUSH_VAL( ulong, ec->base_credits + (ulong)ec->credits_delta[j] );
       PUSH_VAL( ulong, ec->base_credits + (ulong)ec->prev_credits_delta[j] );
+      j++;
     }
 
     PUSH_VAL( ulong, 0UL ); /* last_timestamp_slot */

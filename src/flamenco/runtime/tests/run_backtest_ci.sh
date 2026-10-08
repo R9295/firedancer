@@ -44,3 +44,15 @@ src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-legacy-vote-ixs -
 src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-deactivated-stake --alpenglow -m 2000000 -e 810
 src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-leader-credits --alpenglow -m 2000000 -e 3915
 src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-alpenclock-lamports --alpenglow -m 2000000 -e 280
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-migration-epoch-end --alpenglow -m 2000000 -e 1087 --zst
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-migration-no-ag-credits --alpenglow -m 2000000 -e 1087 --zst
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-migration-epoch-start --alpenglow -m 2000000 -e 1599 --zst
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-migration-ag-only-voter --alpenglow -m 2000000 -e 1087 --zst
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-migration-no-tower-points --alpenglow -m 2000000 -e 1125 --zst
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-migration-vote-recreate --alpenglow -m 2000000 -e 1637 --zst
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-migration-validators --alpenglow -m 2000000 -e 2112 --zst
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-migration-validators-boundary-snap --alpenglow -m 2000000 -e 1600 --zst
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-migration-validators-mid-payout --alpenglow -m 2000000 -e 1600 --zst
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-block-revenue-sharing-agave-v4.4-57a35916-pr15795 --alpenglow -m 2000000 -e 1400
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-remove-inactive-stakes-agave-v4.4-6afe9919 --alpenglow -m 2000000 -e 1100
+src/flamenco/runtime/tests/run_ledger_backtest.sh -l alpenglow-block-revenue-sharing-remove-inactive-stakes-agave-v4.4-57a35916-pr15795 --alpenglow -m 2000000 -e 1400

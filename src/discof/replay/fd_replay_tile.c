@@ -597,9 +597,12 @@ publish_replay_out( fd_replay_tile_t *  ctx,
                     ulong               sz ) {
   ulong tspub = fd_frag_meta_ts_comp( fd_tickcount() );
   if( FD_UNLIKELY( sig!=REPLAY_SIG_TXN_EXECUTED ) ) {
-    fd_memcpy( fd_chunk_to_laddr( ctx->slot_out->mem, ctx->slot_out->chunk ), fd_chunk_to_laddr_const( ctx->replay_out->mem, ctx->replay_out->chunk ), sz );
-    fd_stem_publish( stem, ctx->slot_out->idx, sig, ctx->slot_out->chunk, sz, 0UL, 0UL, tspub );
-    ctx->slot_out->chunk = fd_dcache_compact_next( ctx->slot_out->chunk, sz, ctx->slot_out->chunk0, ctx->slot_out->wmark );
+    fd_replay_out_link_t * out = sig==REPLAY_SIG_MISSING_FEC ? ctx->rotor_out : ctx->slot_out;
+    if( FD_LIKELY( out->idx!=ULONG_MAX ) ) { /* backtest has no rotor */
+      fd_memcpy( fd_chunk_to_laddr( out->mem, out->chunk ), fd_chunk_to_laddr_const( ctx->replay_out->mem, ctx->replay_out->chunk ), sz );
+      fd_stem_publish( stem, out->idx, sig, out->chunk, sz, 0UL, 0UL, tspub );
+      out->chunk = fd_dcache_compact_next( out->chunk, sz, out->chunk0, out->wmark );
+    }
   }
   fd_stem_publish( stem, ctx->replay_out->idx, sig, ctx->replay_out->chunk, sz, 0UL, 0UL, tspub );
   ctx->replay_out->chunk = fd_dcache_compact_next( ctx->replay_out->chunk, sz, ctx->replay_out->chunk0, ctx->replay_out->wmark );
@@ -688,8 +691,8 @@ replay_block_start( fd_replay_tile_t * ctx,
 
 static void
 cost_tracker_snap( fd_bank_t * bank, fd_replay_slot_completed_t * slot_info ) {
-  if( FD_LIKELY( bank->cost_tracker_pool_idx!=ULONG_MAX ) ) {
-    fd_cost_tracker_t const * cost_tracker = fd_bank_cost_tracker_query( bank );
+  if( FD_LIKELY( bank->cost_tracker_fork_id!=USHORT_MAX ) ) {
+    fd_cost_tracker_t const * cost_tracker = fd_cost_tracker_store_pin( fd_bank_cost_tracker( bank ), bank->cost_tracker_fork_id );
     if( FD_UNLIKELY( cost_tracker->block_cost_limit==0UL ) ) {
       memset( &slot_info->cost_tracker, -1 /* ULONG_MAX */, sizeof(slot_info->cost_tracker) );
     } else {
@@ -698,10 +701,11 @@ cost_tracker_snap( fd_bank_t * bank, fd_replay_slot_completed_t * slot_info ) {
       slot_info->cost_tracker.block_cost_limit             = cost_tracker->block_cost_limit;
       slot_info->cost_tracker.account_cost_limit           = cost_tracker->account_cost_limit;
     }
+    fd_cost_tracker_store_unpin( fd_bank_cost_tracker( bank ), bank->cost_tracker_fork_id );
   } else {
     memset( &slot_info->cost_tracker, -1 /* ULONG_MAX */, sizeof(slot_info->cost_tracker) );
   }
-  slot_info->cost_tracker.pool_idx = bank->cost_tracker_pool_idx;
+  slot_info->cost_tracker.pool_idx = fd_ulong_if( bank->cost_tracker_fork_id==USHORT_MAX, ULONG_MAX, bank->cost_tracker_fork_id );
 }
 
 static int
@@ -888,12 +892,13 @@ block_completed_event_fill_bank( fd_replay_tile_t *           ctx,
   ev->block_completed_time             = (ulong)bank->block_completed_nanos;
   ev->parent_block_completed_time      = parent_bank ? (ulong)parent_bank->block_completed_nanos : 0UL;
 
-  if( FD_UNLIKELY( bank->cost_tracker_pool_idx!=ULONG_MAX ) ) {
-    fd_cost_tracker_t const * ct = fd_bank_cost_tracker_query( bank );
+  if( FD_UNLIKELY( bank->cost_tracker_fork_id!=USHORT_MAX ) ) {
+    fd_cost_tracker_t const * ct = fd_cost_tracker_store_pin( fd_bank_cost_tracker( bank ), bank->cost_tracker_fork_id );
     ev->cost_tracker_block_cost                   = ct->block_cost;
     ev->cost_tracker_allocated_accounts_data_size = ct->allocated_accounts_data_size;
     ev->cost_tracker_block_cost_limit             = ct->block_cost_limit;
     ev->cost_tracker_account_cost_limit           = ct->account_cost_limit;
+    fd_cost_tracker_store_unpin( fd_bank_cost_tracker( bank ), bank->cost_tracker_fork_id );
   }
 
   ev->bank_idx = bank->idx;
@@ -906,7 +911,7 @@ block_completed_event_fill_bank( fd_replay_tile_t *           ctx,
     ev->stake_rewards_fork_id       = bank->stake_rewards_fork_id;
     ev->epoch_credits_fork_id       = bank->epoch_credits_fork_id;
     ev->stake_delegations_fork_id   = bank->stake_delegations_fork_id;
-    ev->cost_tracker_pool_idx       = bank->cost_tracker_pool_idx;
+    ev->cost_tracker_pool_idx       = fd_ulong_if( bank->cost_tracker_fork_id==USHORT_MAX, ULONG_MAX, bank->cost_tracker_fork_id );
   }
 
   block_completed_event_fill_reception( ctx, ev, bank->idx, &ctx->block_id_arr[ bank->idx ].latest_mr, slot );
@@ -1457,6 +1462,9 @@ prepare_leader_bank( fd_replay_tile_t * ctx,
     FD_LOG_CRIT(( "invariant violation: bank is NULL for slot %lu", slot ));
   }
 
+  /* pin the cost tracker for the duration of the leader slot */
+  fd_cost_tracker_store_pin( fd_bank_cost_tracker( ctx->leader_bank ), ctx->leader_bank->cost_tracker_fork_id );
+
   ctx->leader_bank->preparation_begin_nanos = now;
 
   ctx->leader_bank->f.slot = slot;
@@ -1789,7 +1797,7 @@ try_become_leader_ag( fd_replay_tile_t *  ctx,
   msg->total_skipped_ticks = 0UL; /* even when slots are skipped, ticks increment by exactly one for every block */
   msg->epoch = fd_slot_to_epoch( &bank->f.epoch_schedule, ctx->next_leader_slot, NULL );
 
-  fd_cost_tracker_t const * cost_tracker = fd_bank_cost_tracker_query( bank );
+  fd_cost_tracker_t const * cost_tracker = fd_cost_tracker_store_peek( fd_bank_cost_tracker( bank ), bank->cost_tracker_fork_id );
 
   msg->limits.slot_max_cost                     = cost_tracker->block_cost_limit;
   msg->limits.slot_max_vote_cost                = FD_PACK_MAX_VOTE_COST_PER_BLOCK_UPPER_BOUND;
@@ -2351,7 +2359,7 @@ try_become_leader( fd_replay_tile_t *  ctx,
   msg->total_skipped_ticks = msg->ticks_per_slot*(ctx->next_leader_slot-ctx->reset_slot);
   msg->epoch = fd_slot_to_epoch( &bank->f.epoch_schedule, ctx->next_leader_slot, NULL );
 
-  fd_cost_tracker_t const * cost_tracker = fd_bank_cost_tracker_query( bank );
+  fd_cost_tracker_t const * cost_tracker = fd_cost_tracker_store_peek( fd_bank_cost_tracker( bank ), bank->cost_tracker_fork_id );
 
   msg->limits.slot_max_cost                     = cost_tracker->block_cost_limit;
   msg->limits.slot_max_vote_cost                = FD_PACK_MAX_VOTE_COST_PER_BLOCK_UPPER_BOUND;
@@ -2429,6 +2437,9 @@ process_poh_message( fd_replay_tile_t *                 ctx,
     ctx->leader_stats.pack_end_nanos   = slot_ended->pack_end_ns;
     ctx->leader_stats.timing_table_idx = slot_ended->timing_table_idx;
   }
+
+  /* unpin when we know leader bank done executing txns */
+  fd_cost_tracker_store_unpin( fd_bank_cost_tracker( ctx->leader_bank ), ctx->leader_bank->cost_tracker_fork_id );
 
   if( FD_UNLIKELY( !slot_ended->completed ) ) {
     /* The leader slot was aborted by a reset mid-production.  The
@@ -2887,6 +2898,8 @@ dispatch_task( fd_replay_tile_t *  ctx,
       }
 
       bank->refcnt++;
+
+      fd_cost_tracker_store_pin( fd_bank_cost_tracker( bank ), bank->cost_tracker_fork_id );
 
       if( FD_UNLIKELY( !bank->first_transaction_scheduled_nanos ) ) bank->first_transaction_scheduled_nanos = fd_clock_tile_now( ctx->clock );
 
@@ -4144,7 +4157,10 @@ process_exec_task_done( fd_replay_tile_t *          ctx,
 
   switch( sig>>32 ) {
     case FD_EXECRP_TT_TXN_EXEC: {
-      ulong txn_idx = msg->txn_exec->txn_idx;
+      ulong txn_idx           = msg->txn_exec->txn_idx;
+      ulong max_compute_units = fd_cost_tracker_store_peek( fd_bank_cost_tracker( bank ), bank->cost_tracker_fork_id )->block_cost_limit;
+      fd_cost_tracker_store_unpin( fd_bank_cost_tracker( bank ), bank->cost_tracker_fork_id );
+
       if( FD_UNLIKELY( !ctx->identity_vote_rooted ) ) {
         /* Query the txn signature against our recently generated vote
            txn signatures.  If the query is successful, then we have
@@ -4201,10 +4217,7 @@ process_exec_task_done( fd_replay_tile_t *          ctx,
       txn_info->tick_commit_end        = msg->txn_exec->tick_commit_end;
 
       txn_info->compute_units_consumed = msg->txn_exec->compute_units_consumed;
-      if( FD_LIKELY( bank->cost_tracker_pool_idx!=ULONG_MAX ) ) {
-        fd_cost_tracker_t const * cost_tracker = fd_bank_cost_tracker_query( bank );
-        txn_info->max_compute_units = cost_tracker->block_cost_limit ? cost_tracker->block_cost_limit : ULONG_MAX;
-      }
+      txn_info->max_compute_units      = max_compute_units;
       txn_info->transaction_fee        = msg->txn_exec->transaction_fee;
       txn_info->priority_fee           = msg->txn_exec->priority_fee;
       txn_info->tips                   = msg->txn_exec->tips;
@@ -4705,7 +4718,16 @@ update_metric_vote_account( fd_replay_tile_t *  ctx,
   /* Unstaked voters are never admitted; don't flag them.  Once set,
      sticky until an epoch boundary actually admits the account. */
   int admitted = fd_vote_stakes_query_t_1( fd_bank_vote_stakes( bank ), bank->vote_stakes_fork_id, vote_key, NULL, NULL, NULL );
-  if( FD_UNLIKELY( !fd_stakes_vote_account_is_admissible( bank, ro.lamports, ro.owner, ro.data, ro.data_len ) ) ) {
+  /* SIMD-0123: delegator rewards do not count towards the balance
+     https://github.com/anza-xyz/agave/blob/v4.4/vote/src/vote_account.rs#L225-L234 */
+  ulong available_balance = ro.lamports;
+  if( FD_FEATURE_ACTIVE_BANK( bank, block_revenue_sharing ) ) {
+    ulong pending_delegator_rewards = 0UL;
+    if( FD_LIKELY( !fd_vote_account_pending_delegator_rewards( ro.data, ro.data_len, &pending_delegator_rewards ) ) ) {
+      available_balance = fd_ulong_sat_sub( ro.lamports, pending_delegator_rewards );
+    }
+  }
+  if( FD_UNLIKELY( !fd_stakes_vote_account_is_admissible( bank, available_balance, ro.owner, ro.data, ro.data_len ) ) ) {
     ctx->vote_account_inadmissible = ctx->vote_account_staked || admitted;
   } else if( FD_UNLIKELY( ctx->vote_account_inadmissible ) ) {
     ctx->vote_account_inadmissible = ctx->vote_account_staked && !admitted;
@@ -4876,6 +4898,10 @@ snapmk_start( fd_replay_tile_t *  ctx,
   ctx->snapmk.bank_idx    = bank->idx;
   ctx->snapmk.incremental = !!incremental;
 
+  /* Snapmk reads the bank's epoch credits in place, so they stay
+     pinned in memory until snapmk_done. */
+  FD_TEST( fd_epoch_credits_view_init( ctx->snapmk.epoch_credits_view, fd_bank_epoch_credits( bank ), bank->epoch_credits_fork_id ) );
+
   /* Send SNAP_START message to snapmk. */
   fd_pubkey_t const * leader = fd_epoch_leaders_get( fd_bank_epoch_leaders_query( bank, bank->f.epoch ), bank->f.slot );
   FD_CHECK_CRIT( leader, "no leader for snapshot slot" );
@@ -4936,6 +4962,7 @@ snapmk_done( fd_replay_tile_t *  ctx,
     }
   }
 
+  fd_epoch_credits_view_fini( ctx->snapmk.epoch_credits_view );
   bank->refcnt--;
   ctx->snapmk.active = 0;
 }
@@ -5734,6 +5761,7 @@ unprivileged_init( fd_topo_t const *      topo,
   *ctx->epoch_out  = out1( topo, tile, "replay_epoch" ); FD_TEST( ctx->epoch_out->idx!=ULONG_MAX );
   *ctx->replay_out = out1( topo, tile, "replay_out"   ); FD_TEST( ctx->replay_out->idx!=ULONG_MAX );
   *ctx->slot_out   = out1( topo, tile, "replay_slot"  ); FD_TEST( ctx->slot_out->idx!=ULONG_MAX );
+  *ctx->rotor_out  = out1( topo, tile, "replay_rotor" ); FD_TEST( ctx->rotor_out->idx==ULONG_MAX || ctx->alpenglow ); /* backtest has no rotor */
   *ctx->snapmk_out = out1( topo, tile, "replay_snapmk" ); FD_TEST( ctx->snapmk.supported == (ctx->snapmk_out->idx!=ULONG_MAX) );
 
   ctx->exec_cnt = 0UL;
@@ -5819,7 +5847,7 @@ populate_allowed_seccomp( fd_topo_t const *      topo,
   void * scratch = fd_topo_obj_laddr( topo, tile->tile_obj_id );
   FD_SCRATCH_ALLOC_INIT( l, scratch );
   fd_replay_tile_t * ctx = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_replay_tile_t), sizeof(fd_replay_tile_t) );
-  populate_sock_filter_policy_fd_replay_tile( out_cnt, out, (uint)fd_log_private_logfile_fd(), FD_ACCDB_FD_RW, (uint)ctx->store_disk_fd, FD_STAKE_DELEGATIONS_FD );
+  populate_sock_filter_policy_fd_replay_tile( out_cnt, out, (uint)fd_log_private_logfile_fd(), FD_ACCDB_FD_RW, (uint)ctx->store_disk_fd, FD_STAKE_DELEGATIONS_FD, FD_EPOCH_CREDITS_FD, FD_COST_TRACKER_FD );
   return sock_filter_policy_fd_replay_tile_instr_cnt;
 }
 
@@ -5831,7 +5859,7 @@ populate_allowed_fds( fd_topo_t const *      topo,
   void * scratch = fd_topo_obj_laddr( topo, tile->tile_obj_id );
   FD_SCRATCH_ALLOC_INIT( l, scratch );
   fd_replay_tile_t * ctx = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_replay_tile_t), sizeof(fd_replay_tile_t) );
-  if( FD_UNLIKELY( out_fds_cnt<5UL ) ) FD_LOG_ERR(( "out_fds_cnt %lu", out_fds_cnt ));
+  if( FD_UNLIKELY( out_fds_cnt<7UL ) ) FD_LOG_ERR(( "out_fds_cnt %lu", out_fds_cnt ));
 
   ulong out_cnt = 0UL;
   out_fds[ out_cnt++ ] = 2; /* stderr */
@@ -5839,6 +5867,8 @@ populate_allowed_fds( fd_topo_t const *      topo,
     out_fds[ out_cnt++ ] = fd_log_private_logfile_fd(); /* logfile */
   out_fds[ out_cnt++ ] = FD_ACCDB_FD_RW; /* accounts db */
   out_fds[ out_cnt++ ] = FD_STAKE_DELEGATIONS_FD; /* stake delegation disk spill */
+  out_fds[ out_cnt++ ] = FD_EPOCH_CREDITS_FD; /* epoch credits disk spill */
+  out_fds[ out_cnt++ ] = FD_COST_TRACKER_FD; /* cost tracker disk spill */
   if( FD_LIKELY( ctx->store_disk_fd>=0 ) )
     out_fds[ out_cnt++ ] = ctx->store_disk_fd;
 

@@ -6,10 +6,10 @@
 #include "../stakes/fd_stake_delegations.h"
 #include "../stakes/fd_vote_stakes.h"
 #include "../stakes/fd_collector_overrides.h"
-#include "../progcache/fd_progcache_xid.h"
+#include "../stakes/fd_epoch_credits.h"
 #include "../fd_rwlock.h"
 #include "fd_blockhashes.h"
-#include "fd_cost_tracker.h"
+#include "fd_cost_tracker_store.h"
 #include "fd_slot_params.h"
 #include "sysvar/fd_sysvar_cache.h"
 #include "../../ballet/lthash/fd_lthash.h"
@@ -206,12 +206,6 @@ FD_PROTOTYPES_BEGIN
   patterns vary and are documented below.
 */
 
-struct fd_bank_cost_tracker {
-  ulong next;
-  uchar data[FD_COST_TRACKER_FOOTPRINT] __attribute__((aligned(FD_COST_TRACKER_ALIGN)));
-};
-typedef struct fd_bank_cost_tracker fd_bank_cost_tracker_t;
-
 /* The banks follow a state machine that generally transitions forward:
    All banks start off as INACTIVE.  Once a bank is provisioned (when
    the first FEC is received from the reassembler), it is in the state
@@ -274,7 +268,7 @@ struct fd_bank {
   ushort                 stake_rewards_fork_id;
   ushort                 stake_delegations_fork_id;
   ushort                 epoch_credits_fork_id;
-  ulong                  cost_tracker_pool_idx;
+  ushort                 cost_tracker_fork_id;
 
   ulong banks_data_offset; /* offset from this fd_bank_t back to fd_banks_t */
 
@@ -386,9 +380,9 @@ struct fd_banks {
 
   ulong curr_fork_width;
 
-  ulong pool_offset;        /* offset of pool from banks */
+  ulong pool_offset; /* offset of pool from banks */
 
-  ulong cost_tracker_pool_offset; /* offset of cost tracker pool from banks */
+  ulong cost_tracker_offset; /* offset of cost tracker pool from banks */
 
   ulong collector_overrides_offset;
 
@@ -396,20 +390,7 @@ struct fd_banks {
 
   ulong dead_banks_offset;
 
-  /* The epoch credits of every rewarded vote account are captured when a
-     bank crosses an epoch boundary, and are read again for the rest of
-     the epoch: by a recalculation that repositions a stake rewards
-     window, and by snapshot creation.  Sibling banks crossing the same
-     boundary capture different sets, so the store holds one set per
-     boundary-crossing fork, inherited by descendants and reference
-     counted so that a set lives exactly as long as the banks reading it.
-     There is one more set than max_fork_width because a bank sitting
-     behind a boundary still holds the previous epoch's set while every
-     fork crosses. */
-
   ulong epoch_credits_offset;
-  ulong epoch_credits_len_offset;
-  ulong epoch_credits_refcnt_offset;
 
   /* The set of epoch leaders for the current and previous epochs is
      allocated out-of-line and tracked by epoch_leaders_offset.  Only
@@ -441,20 +422,8 @@ fd_bank_report_runtime_diffs( fd_bank_t const * bank ) {
 /* Bank accessors and mutators.  Different accessors are emitted for
    different types depending on if the field has a lock or not. */
 
-/* fd_bank_epoch_credits{,_len} return the epoch credits of the fork the
-   bank belongs to.  fd_bank_epoch_credits_new_fork acquires a fresh set
-   for the bank and must be called before the bank captures new epoch
-   credits, i.e. when it crosses an epoch boundary or restores a
-   snapshot. */
-
-fd_epoch_credits_t *
-fd_bank_epoch_credits( fd_bank_t * bank );
-
-ulong *
-fd_bank_epoch_credits_len( fd_bank_t * bank );
-
-void
-fd_bank_epoch_credits_new_fork( fd_bank_t * bank );
+fd_epoch_credits_store_t *
+fd_bank_epoch_credits( fd_bank_t const * bank );
 
 fd_collector_overrides_t *
 fd_bank_collector_overrides( fd_bank_t const * bank );
@@ -476,11 +445,8 @@ fd_bank_epoch_leaders_modify( fd_bank_t * bank,
 fd_vote_stakes_t *
 fd_bank_vote_stakes( fd_bank_t const * bank );
 
-fd_cost_tracker_t *
-fd_bank_cost_tracker_modify( fd_bank_t * bank );
-
-fd_cost_tracker_t const *
-fd_bank_cost_tracker_query( fd_bank_t * bank );
+fd_cost_tracker_store_t *
+fd_bank_cost_tracker( fd_bank_t const * bank );
 
 fd_lthash_value_t const *
 fd_bank_lthash_locking_query( fd_bank_t * bank );

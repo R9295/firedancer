@@ -241,6 +241,7 @@ for ((i=0; i<proc_count; i++)); do
       '    genesis_download = false' \
       '' \
       '[consensus]' \
+      '    alpenglow = true' \
       "    expected_genesis_hash = \"$genesis_hash\"" \
       '    wait_for_vote_to_start_leader = false' \
       '' \
@@ -319,8 +320,6 @@ for ((i=0; i<proc_count; i++)); do
       "    repair_client_listen_port = $((base+71))" \
       '    slot_max = 128' \
       '' \
-      '[tiles.rotor]' \
-      '    slot_max = 4096' \
       '' \
       '[tiles.rserve]' \
       "    repair_serve_listen_port = $((base+72))" \
@@ -339,7 +338,6 @@ for ((i=0; i<proc_count; i++)); do
       '    enabled = false' \
       '' \
       '[development]' \
-      '    alpenglow = true' \
       '    bootstrap = true' \
       '' \
       '[development.runtime]' \

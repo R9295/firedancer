@@ -131,6 +131,20 @@ fd_config_fillf( fd_config_t * config ) {
     FD_TEST( fd_cstr_printf_check( config->paths.stake_delegations, sizeof(config->paths.stake_delegations), NULL, "%s/stakedelegations.db", config->paths.base ) );
   }
 
+  if( FD_UNLIKELY( strcmp( config->paths.epoch_credits, "" ) ) ) {
+    replace( config->paths.epoch_credits, "{user}", config->user );
+    replace( config->paths.epoch_credits, "{name}", config->name );
+  } else {
+    FD_TEST( fd_cstr_printf_check( config->paths.epoch_credits, sizeof(config->paths.epoch_credits), NULL, "%s/epochcredits.db", config->paths.base ) );
+  }
+
+  if( FD_UNLIKELY( strcmp( config->paths.cost_tracker, "" ) ) ) {
+    replace( config->paths.cost_tracker, "{user}", config->user );
+    replace( config->paths.cost_tracker, "{name}", config->name );
+  } else {
+    FD_TEST( fd_cstr_printf_check( config->paths.cost_tracker, sizeof(config->paths.cost_tracker), NULL, "%s/costtracker.db", config->paths.base ) );
+  }
+
   if( FD_UNLIKELY( strcmp( config->paths.shredb, "" ) ) ) {
     replace( config->paths.shredb, "{user}", config->user );
     replace( config->paths.shredb, "{name}", config->name );
@@ -145,11 +159,11 @@ fd_config_fillf( fd_config_t * config ) {
     FD_TEST( fd_cstr_printf_check( config->paths.guidb, sizeof(config->paths.guidb), NULL, "%s/gui.db", config->paths.base ) );
   }
 
-  if( FD_UNLIKELY( strcmp( config->paths.tower, "" ) ) ) {
-    replace( config->paths.tower, "{user}", config->user );
-    replace( config->paths.tower, "{name}", config->name );
+  if( FD_UNLIKELY( strcmp( config->paths.vote_history, "" ) ) ) {
+    replace( config->paths.vote_history, "{user}", config->user );
+    replace( config->paths.vote_history, "{name}", config->name );
   } else {
-    fd_cstr_ncpy( config->paths.tower, config->paths.base, sizeof(config->paths.tower) );
+    fd_cstr_ncpy( config->paths.vote_history, config->paths.base, sizeof(config->paths.vote_history) );
   }
 
   for( ulong i=0UL; i<config->firedancer.paths.authorized_voter_paths_cnt; i++ ) {
@@ -689,7 +703,6 @@ fd_config_validate( fd_config_t const * config ) {
 
   if( config->is_firedancer ) {
     CFG_HAS_POW2( tiles.repair.slot_max );
-    CFG_HAS_NON_ZERO( tiles.rotor.slot_max );
   }
 
   if( FD_UNLIKELY( config->tiles.bundle.keepalive_interval_millis <    3000 ||

@@ -7,6 +7,7 @@
 #include "../fd_system_ids.h"
 #include "../fd_runtime_stack_tmpl.h"
 #include "../../stakes/fd_stake_types.h"
+#include "../program/vote/fd_vote_codec.h"
 #include "../sysvar/fd_sysvar_epoch_schedule.h"
 #include "../../progcache/fd_progcache_admin.h"
 #include "../../log_collector/fd_log_collector.h"
@@ -69,6 +70,15 @@ fd_solfuzz_block_update_prev_epoch_stakes( fd_vote_stakes_t *                 vo
     uchar const no_bls[ FD_BLS_PUBKEY_COMPRESSED_SZ ] = {0};
     if( use_t_1 ) fd_vote_stakes_snap_insert_t_1( vote_stakes, vote_stakes_fork_id, &vote_pubkey, &node_pubkey, stake, commission, no_bls );
     else          fd_vote_stakes_snap_insert_t_2( vote_stakes, vote_stakes_fork_id, &vote_pubkey, &node_pubkey, stake, commission, no_bls );
+
+    /* SIMD-0123 fields exist in v4 state only; older versions keep the
+       100% default and no pending rewards. */
+    if( vote_accounts[i].version == FD_EXEC_TEST_VOTE_ACCOUNT_VERSION_V4 ) {
+      ushort block_revenue_commission_bps = (ushort)vote_accounts[i].block_revenue_commission_bps;
+      ulong  pending_delegator_rewards    = vote_accounts[i].pending_delegator_rewards;
+      if( use_t_1 ) fd_vote_stakes_set_block_revenue_t_1( vote_stakes, vote_stakes_fork_id, &vote_pubkey, block_revenue_commission_bps, pending_delegator_rewards );
+      else          fd_vote_stakes_set_block_revenue_t_2( vote_stakes, vote_stakes_fork_id, &vote_pubkey, block_revenue_commission_bps, pending_delegator_rewards );
+    }
   }
 }
 
@@ -336,6 +346,8 @@ fd_solfuzz_pb_block_ctx_create( fd_solfuzz_runner_t *                runner,
   /* Use epoch_credits from the proto if available (captured at epoch
      boundary time), otherwise fall back to the vote account in accdb. */
   ulong epoch_credits_len = 0UL;
+  fd_epoch_credits_view_t epoch_credits_view[1];
+  FD_TEST( fd_epoch_credits_view_init( epoch_credits_view, fd_bank_epoch_credits( bank ), bank->epoch_credits_fork_id ) );
   for( uint i=0U; i<block_bank->vote_accounts_t_1_count; i++ ) {
     fd_exec_test_prev_vote_account_t const * prev_vote_accs = &block_bank->vote_accounts_t_1[i];
 
@@ -343,18 +355,22 @@ fd_solfuzz_pb_block_ctx_create( fd_solfuzz_runner_t *                runner,
                                                 NULL, NULL, NULL ) ) ) continue;
 
     FD_TEST( prev_vote_accs->epoch_credits_count<=FD_EPOCH_CREDITS_MAX );
-    fd_epoch_credits_t * ec = &fd_bank_epoch_credits( bank )[epoch_credits_len++];
+    fd_epoch_credits_t * ec = &epoch_credits_view->credits[epoch_credits_len++];
     fd_memcpy( ec->pubkey, prev_vote_accs->address, sizeof(fd_pubkey_t) );
 
     /* Alpenglow migration markers are not credits records: skip them so
        base_credits comes from the first real entry (subtracting a
        ULONG_MAX base would underflow every delta) and cnt counts only
        real entries.  Mirrors fd_ssload.c / get_vote_credits(). */
-    ulong cnt        = 0UL;
-    ec->base_credits = 0UL;
+    ulong cnt                   = 0UL;
+    ec->base_credits            = 0UL;
+    ec->has_ag_migration_marker = 0;
     for( ulong j=0UL; j<prev_vote_accs->epoch_credits_count; j++ ) {
       fd_exec_test_epoch_credit_t const * epc = &prev_vote_accs->epoch_credits[j];
-      if( FD_UNLIKELY( fd_solfuzz_epoch_credit_is_alpenglow_marker( epc ) ) ) continue;
+      if( FD_UNLIKELY( fd_solfuzz_epoch_credit_is_alpenglow_marker( epc ) ) ) {
+        ec->has_ag_migration_marker = 1;
+        continue;
+      }
       if( FD_UNLIKELY( !cnt ) ) ec->base_credits = epc->prev_credits;
       ec->epoch[ cnt ]              = (ushort)epc->epoch;
       ec->credits_delta[ cnt ]      = epc->credits      - ec->base_credits;
@@ -364,7 +380,8 @@ fd_solfuzz_pb_block_ctx_create( fd_solfuzz_runner_t *                runner,
     ec->cnt          = (uchar)cnt; /* <=FD_EPOCH_CREDITS_MAX tested above */
     ec->fast_path_ok = fd_epoch_credits_fast_path_ok( ec );
   }
-  *fd_bank_epoch_credits_len( bank ) = epoch_credits_len;
+  epoch_credits_view->len = epoch_credits_len;
+  fd_epoch_credits_view_fini( epoch_credits_view );
 
   /* Update leader schedule */
   fd_runtime_update_leaders( bank, runtime_stack );
@@ -680,7 +697,7 @@ fd_solfuzz_pb_block_run( fd_solfuzz_runner_t * runner,
     fd_memcpy( effects->bank_hash, bank_hash.hash, sizeof(fd_hash_t) );
 
     /* Capture cost tracker */
-    fd_cost_tracker_t const * cost_tracker = fd_bank_cost_tracker_query( runner->bank );
+    fd_cost_tracker_t const * cost_tracker = fd_cost_tracker_store_peek( fd_bank_cost_tracker( runner->bank ), runner->bank->cost_tracker_fork_id );
     effects->has_cost_tracker = 1;
     effects->cost_tracker = (fd_exec_test_cost_tracker_t) {
       .block_cost = cost_tracker ? cost_tracker->block_cost : 0UL,

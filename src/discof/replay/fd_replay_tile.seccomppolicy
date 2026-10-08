@@ -5,7 +5,13 @@
 #              tiles may need to pull accounts into the cache from disk,
 #              or purge out of cache to the disk to make forward
 #              progress.
-uint logfile_fd, uint accounts_fd, uint store_fd, uint stake_spill_fd
+#
+# epoch_credits_fd: Disk backing for epoch-credit sets beyond the
+#                   in-memory cache.
+#
+# cost_tracker_fd: Disk backing for cost trackers beyond the in-memory
+#                  cache.
+uint logfile_fd, uint accounts_fd, uint store_fd, uint stake_spill_fd, uint epoch_credits_fd, uint cost_tracker_fd
 
 # logging: all log messages are written to a file and/or pipe
 #
@@ -68,10 +74,14 @@ restart_syscall
 
 # store disk layer: rare reads of spilled FEC payloads
 #
-# stake delegations: full root and fork-delta records spilled beyond
-# the in-memory delegation pools.
+# stake delegations, epoch credits and cost trackers: records spilled
+# beyond their in-memory caches.
 pread64: (or (eq (arg 0) store_fd)
-             (eq (arg 0) stake_spill_fd))
+             (eq (arg 0) stake_spill_fd)
+             (eq (arg 0) epoch_credits_fd)
+             (eq (arg 0) cost_tracker_fd))
 
-# stake delegations: full-record disk spill
-pwrite64: (eq (arg 0) stake_spill_fd)
+# stake delegations, epoch credits and cost trackers: disk spill
+pwrite64: (or (eq (arg 0) stake_spill_fd)
+              (eq (arg 0) epoch_credits_fd)
+              (eq (arg 0) cost_tracker_fd))

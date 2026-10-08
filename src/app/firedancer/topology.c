@@ -17,6 +17,7 @@
 #include "../../disco/store/fd_store.h"
 #include "../../discof/repair/fd_repair_tile.h"
 #include "../../discof/rotor/fd_rotor_tile.h"
+#include "../../choreo/rotor/fd_rotor.h"
 #include "../../disco/net/fd_net_tile.h"
 #include "../../discof/backup/fd_backup.h"
 #include "../../discof/restore/fd_snapct_tile.h"
@@ -284,8 +285,8 @@ fd_topo_initialize( config_t * config ) {
   int telemetry_enabled   = config->telemetry && strcmp( config->tiles.event.url, "" );
   int leader_enabled      = !!config->firedancer.layout.enable_block_production;
   int rserve_enabled      = config->tiles.rserve.enabled;
-  int alpenglow_enabled   = config->firedancer.development.alpenglow;
-  int tower_file_enabled  = !alpenglow_enabled && config->tiles.tower.write_tower_file;
+  int alpenglow_enabled   = config->firedancer.consensus.alpenglow;
+  int tower_file_enabled  = !alpenglow_enabled && config->tiles.tower.write_vote_history_file;
   int efficient_mode      = !strcmp( config->firedancer.layout.mode, "efficient" );
   int gossip_vote_enabled = leader_enabled || ( rpc_enabled && !alpenglow_enabled );
 
@@ -465,6 +466,14 @@ fd_topo_initialize( config_t * config ) {
 
   ulong shred_depth = 65536UL; /* from fdctl/topology.c shred_store link. MAKE SURE TO KEEP IN SYNC. */
 
+  /* Under Alpenglow, rotor redelivers every FEC set replay can hold when
+     replay loses a parent bank, and polls nothing until that is
+     published, so repair_out holds all of it. */
+
+  ulong repair_out_depth = fd_ulong_if( alpenglow_enabled,
+                                        fd_ulong_pow2_up( config->firedancer.runtime.max_live_slots * (config->limits.max_shreds_per_block/FD_FEC_SHRED_CNT) ),
+                                        shred_depth );
+
   /*                                  topo, link_name,       wksp_name,       depth,                                    mtu,                           burst */
   /**/                 fd_topob_link( topo, "gossip_net",    "net_gossip",    32768UL,                                  FD_NET_MTU,                    1UL );
   FOR(shred_tile_cnt)  fd_topob_link( topo, "shred_net",     "net_shred",     32768UL,                                  FD_NET_MTU,                    1UL );
@@ -530,6 +539,7 @@ fd_topo_initialize( config_t * config ) {
   /**/                 fd_topob_link( topo, "replay_epoch",  "replay_epoch",  16UL,                                     FD_EPOCH_OUT_MTU,              1UL ); /* min pow2 >= replay's STEM_BURST (14); ideally 2, needs per-link burst */
   /**/                 fd_topob_link( topo, "replay_out",    "replay_out",    65536UL,                                  sizeof(fd_replay_message_t),   1UL )->permit_no_consumers = 1;
   /**/                 fd_topob_link( topo, "replay_slot",   "replay_slot",   4096UL,                                   sizeof(fd_replay_message_t),   1UL );
+  if( alpenglow_enabled ) fd_topob_link( topo, "replay_rotor",  "replay_slot",   16UL,                                     sizeof(fd_replay_message_t),   1UL ); /* REPLAY_SIG_MISSING_FEC; min pow2 >= replay's STEM_BURST (15) */
   FOR(execrp_tile_cnt) fd_topob_link( topo, "replay_execrp", "replay_execrp", 256UL,                                    sizeof(fd_execrp_task_msg_t),  1UL );
   /**/                 fd_topob_link( topo, "admin_replay",  "admin_replay",  32UL,                                     0UL,                           1UL );
   /**/                 fd_topob_link( topo, "replay_admin",  "admin_replay",  32UL,                                     0UL,                           1UL );
@@ -563,12 +573,12 @@ fd_topo_initialize( config_t * config ) {
   }
 
   if( tower_file_enabled ) {
-    /**/               fd_topob_link( topo, "tower_sign",    "tower_sign",    128UL,                                    FD_KEYGUARD_SIGN_REQ_MTU,      1UL );
+    /**/               fd_topob_link( topo, "tower_sign",    "tower_sign",    128UL,                                    4096UL,                        1UL );
     /**/               fd_topob_link( topo, "sign_tower",    "sign_tower",    128UL,                                    sizeof(fd_ed25519_sig_t),      1UL );
   }
 
   FOR(shred_tile_cnt)  fd_topob_link( topo, "shred_out",     "shred_out",     shred_depth,                              sizeof(fd_shred_message_t),    FD_SHRED_STEM_BURST );
-  /**/                 fd_topob_link( topo, "repair_out",    "repair_out",    shred_depth,                              sizeof(fd_repair_fec_complete_t), 1UL );
+  /**/                 fd_topob_link( topo, "repair_out",    "repair_out",    repair_out_depth,                         sizeof(fd_repair_fec_complete_t), 1UL );
   if( !alpenglow_enabled ) {
     /**/               fd_topob_link( topo, "tower_out",     "tower_out",     16384UL,                                  sizeof(fd_tower_msg_t),        2UL ); /* conf + slot_done. see explanation in fd_tower_tile.h for link_depth */
     /**/               fd_topob_link( topo, "txsend_out",    "txsend_out",    128UL,                                    FD_TPU_RAW_MTU,                1UL );
@@ -771,7 +781,9 @@ fd_topo_initialize( config_t * config ) {
 
   /**/                 fd_topob_tile_in(    topo, repair,    0UL,          "metric_in", "genesi_out",    0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
   /**/                 fd_topob_tile_in(    topo, repair,    0UL,          "metric_in", "gossip_ciaddr", 0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
+  if( alpenglow_enabled ) fd_topob_tile_in(   topo, repair,    0UL,          "metric_in", "replay_epoch",  0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
   /**/                 fd_topob_tile_in(    topo, repair,    0UL,          "metric_in", "replay_slot",   0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
+  if( alpenglow_enabled ) fd_topob_tile_in(   topo, repair,    0UL,          "metric_in", "replay_rotor",  0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
   FOR(shred_tile_cnt)  fd_topob_tile_in(    topo, repair,    0UL,          "metric_in", "shred_out",     i,            FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
   if( snapshots_enabled ) {
                        fd_topob_tile_in(    topo, repair,    0UL,          "metric_in", "snapin_manif",  0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
@@ -785,6 +797,7 @@ fd_topo_initialize( config_t * config ) {
   /**/                 fd_topob_tile_in (   topo, "replay",  0UL,          "metric_in", "genesi_out",    0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
   /**/                 fd_topob_tile_out(   topo, "replay",  0UL,                       "replay_out",    0UL                                                );
   /**/                 fd_topob_tile_out(   topo, "replay",  0UL,                       "replay_slot",   0UL                                                );
+  if( alpenglow_enabled ) fd_topob_tile_out(  topo, "replay",  0UL,                       "replay_rotor",  0UL                                                );
   /**/                 fd_topob_tile_out(   topo, "replay",  0UL,                       "replay_epoch",  0UL                                                );
   FOR(execrp_tile_cnt) fd_topob_tile_out(   topo, "replay",  0UL,                       "replay_execrp", i                                                  );
   FOR(execrp_tile_cnt) fd_topob_tile_in (   topo, "replay",  0UL,          "metric_in", "execrp_replay", i,            FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
@@ -1204,7 +1217,7 @@ fd_topo_initialize( config_t * config ) {
   if( alpenglow_enabled ) {
     /**/               fd_topob_link( topo, "votor_out",     "votor_out",     1024UL,                                   sizeof(fd_votor_msg_t),                        FD_VOTOR_OUT_BURST );
     /**/               fd_topob_link( topo, "votor_net",     "net_votor",     32768UL,                                  FD_NET_MTU,                                    FD_VOTOR_NET_BURST ); /* as shred_net: fan-out publishes as it goes and rides depth, burst covers only the deferred aio flush */
-    /**/               fd_topob_link( topo, "votor_sign",    "votor_sign",    128UL,                                    130UL,                                         1UL ); /* TLS 1.3 CertificateVerify payload */
+    /**/               fd_topob_link( topo, "votor_sign",    "votor_sign",    128UL,                                    FD_KEYGUARD_SIGN_REQ_MTU,                      1UL ); /* TLS 1.3 CertificateVerify payload or vote history file body */
     /**/               fd_topob_link( topo, "sign_votor",    "sign_votor",    128UL,                                    FD_KEYGUARD_BLS_SIG_SZ,                        1UL ); /* ed25519 sig (TLS) or BLS sig (vote) */
     FOR(net_tile_cnt)  fd_topos_net_rx_link( topo, "net_votor", i, config->net.ingress_buffer_size );
 
@@ -1254,12 +1267,37 @@ fd_topo_initialize( config_t * config ) {
                                                   config->tiles.shred.max_pending_shred_sets );
   ulong store_fec_set_cnt = shred_tile_cnt*fec_set_cnt;
 
-   /* store_fec_max is the maximum number of FEC sets Store retains.
+  /* store_fec_max is the maximum number of FEC sets Store retains.
 
-      This value is derived by first multiplying max_live_slots by the
-      maximum number of FEC sets per slot.  Fixed 32-data-shred sets
-      need 1024; legacy variable sets can contain one data shred and
-      need up to 32768.
+      With Alpenglow, Store is sized to rotor's window of
+      N = max_live_slots slots, each of which can hold up to
+      fec_sets_per_slot FEC sets per version of its block.  The number of versions in the window
+      is bounded as follows.
+
+      Assume 20% of stake is malicious, every malicious leader
+      equivocates AG_EQVOC_BLOCK_HASH_MAX (7) versions of each of its
+      slots, and honest leaders produce one.  The expected number of
+      versions is then (0.8 + 0.2*7)*N = 2.2*N.  In general, bounding
+      P(V > budget) to z standard deviations needs a budget of
+      ~N*(2.2 + 4.8*z/sqrt(N)).
+
+      We size for 2.5*N (FD_ROTOR_BLK_VERSION_NUM/DEN, the same factor
+      rotor sizes its blk pool with, see fd_rotor_blk_max), which leaves
+      0.3*N of headroom, ie. ~0.0625*sqrt(N) standard deviations.  The
+      probability that a window holds more than 2.5*N versions is:
+
+        N =  2048  ~2.5e-3
+        N =  4096  ~4.2e-5
+        N = 30000  ~3e-26
+
+      This is for a uniformly random window.  The leader schedule is
+      known an epoch in advance, so an adversary can target the densest
+      window in the epoch, which is somewhat worse.
+
+      Without Alpenglow, this value is derived by first multiplying
+      max_live_slots by the maximum number of FEC sets per slot.  Fixed
+      32-data-shred sets need 1024; legacy variable sets can contain one
+      data shred and need up to 32768.
 
       However, the downstream structure reasm also has the same bound.
       Replay relies on the guarantee that if a FEC set is present in
@@ -1287,7 +1325,9 @@ fd_topo_initialize( config_t * config ) {
   fd_topo_link_t * repair_out_link = &topo->links[ fd_topo_find_link( topo, "repair_out", 0UL ) ];
   ulong fec_sets_per_slot = fd_ulong_if( config->firedancer.development.fixed_fec_sets,
                                          config->limits.max_shreds_per_block/FD_FEC_SHRED_CNT, config->limits.max_shreds_per_block );
-  ulong store_fec_max = config->firedancer.runtime.max_live_slots * fec_sets_per_slot + (shred_depth * shred_tile_cnt) + repair_out_link->depth + 1;
+  ulong store_fec_max = alpenglow_enabled
+                         ? fd_rotor_blk_max( config->firedancer.runtime.max_live_slots ) * fec_sets_per_slot /* every FEC set of every blk rotor holds */
+                         : config->firedancer.runtime.max_live_slots * fec_sets_per_slot + (shred_depth * shred_tile_cnt) + repair_out_link->depth + 1;
 
   /* 32 shreds * 995 payload bytes = 31840 bytes with fixed_fec_sets = true
      67 shreds * 955 payload bytes = 63985 bytes with fixed_fec_sets = false */
@@ -1509,7 +1549,7 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     tile->net.gossip_listen_port               = config->gossip.port;
     tile->net.repair_client_listen_port        = config->tiles.repair.repair_client_listen_port;
     tile->net.repair_serve_listen_port         = fd_ushort_if( config->tiles.rserve.enabled, config->tiles.rserve.repair_serve_listen_port, 0 );
-    tile->net.txsend_src_port                  = fd_ushort_if( !config->firedancer.development.alpenglow, config->tiles.txsend.txsend_src_port, 0 );
+    tile->net.txsend_src_port                  = fd_ushort_if( !config->firedancer.consensus.alpenglow, config->tiles.txsend.txsend_src_port, 0 );
 
   } else if( FD_UNLIKELY( !strcmp( tile->name, "netlnk" ) ) ) {
 
@@ -1594,7 +1634,7 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     tile->gossip.ports.tpu_quic         = config->tiles.quic.quic_transaction_listen_port;
     tile->gossip.ports.repair           = config->tiles.repair.repair_client_listen_port;
     tile->gossip.ports.rserve           = fd_ushort_if( config->tiles.rserve.enabled, config->tiles.rserve.repair_serve_listen_port, 0 );
-    tile->gossip.ports.votor            = fd_ushort_if( config->firedancer.development.alpenglow, config->firedancer.development.votor.quic_server_listen_port, (ushort)0 );
+    tile->gossip.ports.votor            = fd_ushort_if( config->firedancer.consensus.alpenglow, config->firedancer.development.votor.quic_server_listen_port, (ushort)0 );
 
     tile->gossip.entrypoints_cnt        = config->gossip.entrypoints_cnt;
     for( ulong i=0UL; i<tile->gossip.entrypoints_cnt; i++ ) {
@@ -1647,6 +1687,7 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
 
     tile->snapin.max_live_slots  = config->firedancer.runtime.max_live_slots;
     tile->snapin.max_txn_per_slot = config->limits.max_txn_per_slot;
+    tile->snapin.alpenglow        = config->firedancer.consensus.alpenglow;
     tile->snapin.accdb_obj_id = fd_pod_query_ulong( config->topo.props, "accdb", ULONG_MAX );
     tile->snapin.txncache_obj_id = fd_pod_query_ulong( config->topo.props, "txncache", ULONG_MAX );
     tile->snapin.banks_obj_id = fd_pod_query_ulong( config->topo.props, "banks", ULONG_MAX );
@@ -1668,9 +1709,10 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     fd_cstr_ncpy( tile->repair.identity_key_path, config->paths.identity_key, sizeof(tile->repair.identity_key_path) );
 
   } else if( FD_UNLIKELY( !strcmp( tile->name, "rotor" ) ) ) {
-    tile->rotor.slot_max = config->tiles.rotor.slot_max;
-    tile->rotor.max_shreds_per_block = config->limits.max_shreds_per_block;
+    tile->rotor.slot_max = config->firedancer.runtime.max_live_slots;
+    tile->rotor.fec_max  = fd_pod_queryf_ulong( config->topo.props, ULONG_MAX, "obj.%lu.fec_max", fd_pod_query_ulong( config->topo.props, "store", ULONG_MAX ) ); /* as many FEC sets as Store */
     tile->rotor.repair_client_listen_port = config->tiles.repair.repair_client_listen_port;
+    tile->rotor.allow_private_address = config->development.gossip.allow_private_address;
 
     for( ulong i=0; i<tile->in_cnt; i++ ) {
       if( !strcmp( config->topo.links[ tile->in_link_id[ i ] ].name, "sign_repair" ) ) {
@@ -1684,7 +1726,7 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     tile->rserve.repair_serve_listen_port = config->tiles.rserve.repair_serve_listen_port;
     tile->rserve.max_shreds_per_block = config->limits.max_shreds_per_block;
     tile->rserve.ping_cache_entries = 1UL<<16; /* TODO: Configure this from some global metric? */
-    tile->rserve.blockdb_max = config->firedancer.development.alpenglow ? 1UL<<15 : 0UL; /* ~20.6 KiB each. TODO: make configurable */
+    tile->rserve.blockdb_max = config->firedancer.consensus.alpenglow ? 1UL<<15 : 0UL; /* ~20.6 KiB each. TODO: make configurable */
     if( FD_UNLIKELY( config->firedancer.development.repair.adversarial_response_pct>100U ) )
       FD_LOG_ERR(( "development.repair.adversarial_response_pct is %u, it must be at most 100", config->firedancer.development.repair.adversarial_response_pct ));
     tile->rserve.adversarial_response_pct = config->firedancer.development.repair.adversarial_response_pct;
@@ -1710,7 +1752,7 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
 
     tile->replay.expected_shred_version = config->consensus.expected_shred_version;
     tile->replay.wait_for_vote_to_start_leader = config->consensus.wait_for_vote_to_start_leader;
-    tile->replay.alpenglow = config->firedancer.development.alpenglow;
+    tile->replay.alpenglow = config->firedancer.consensus.alpenglow;
 
     tile->replay.sched_depth = config->tiles.replay.max_transaction_lookahead_buffer_size;
     if( FD_LIKELY( !strcmp( config->firedancer.consensus.wait_for_supermajority_with_bank_hash, "" ) ) ) {
@@ -1777,6 +1819,7 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     tile->votor.ip_addr                 = config->net.ip_addr;
     tile->votor.max_live_slots          = config->firedancer.runtime.max_live_slots;
     fd_cstr_ncpy( tile->votor.identity_key_path, config->paths.identity_key, sizeof(tile->votor.identity_key_path) );
+    fd_cstr_ncpy( tile->votor.vote_history_path, config->tiles.votor.write_vote_history_file ? config->paths.vote_history : "", sizeof(tile->votor.vote_history_path) );
     tile->votor.authorized_voter_paths_cnt = config->firedancer.paths.authorized_voter_paths_cnt;
 
   } else if( FD_UNLIKELY( !strcmp( tile->name, "tower" ) ) ) {
@@ -1792,7 +1835,7 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     tile->tower.max_live_slots     = config->firedancer.runtime.max_live_slots;
     fd_cstr_ncpy( tile->tower.identity_key, config->paths.identity_key, sizeof(tile->tower.identity_key) );
     fd_cstr_ncpy( tile->tower.vote_account, config->paths.vote_account, sizeof(tile->tower.vote_account) );
-    fd_cstr_ncpy( tile->tower.tower_path, config->tiles.tower.write_tower_file ? config->paths.tower : "", sizeof(tile->tower.tower_path) );
+    fd_cstr_ncpy( tile->tower.tower_path, config->tiles.tower.write_vote_history_file ? config->paths.vote_history : "", sizeof(tile->tower.tower_path) );
 
   } else if( FD_UNLIKELY( !strcmp( tile->name, "accdb" ) ) ) {
 
@@ -1908,9 +1951,11 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
 
     tile->shred.fec_exposure                  = FD_SHRED_FIREDANCER_FEC_EXPOSURE;
     tile->shred.fec_resolver_depth            = config->tiles.shred.max_pending_shred_sets;
+    tile->shred.slot_max                      = config->firedancer.runtime.max_live_slots;
     tile->shred.expected_shred_version        = config->consensus.expected_shred_version;
     tile->shred.shred_listen_port             = config->tiles.shred.shred_listen_port;
     tile->shred.max_shreds_per_block          = config->limits.max_shreds_per_block;
+    tile->shred.alpenglow                     = config->firedancer.consensus.alpenglow;
     tile->shred.bench_max_shreds_per_block    = config->development.bench.max_shreds_per_block;
     tile->shred.adtl_dests_retransmit_cnt     = config->tiles.shred.additional_shred_destinations_retransmit_cnt;
     tile->shred.adtl_dests_leader_cnt         = config->tiles.shred.additional_shred_destinations_leader_cnt;
@@ -1966,7 +2011,7 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     tile->gui.listen_port = config->tiles.gui.gui_listen_port;
     tile->gui.max_txn_per_slot = config->limits.max_txn_per_slot;
     tile->gui.is_voting = strcmp( config->paths.vote_account, "" );
-    tile->gui.is_alpenglow = config->firedancer.development.alpenglow;
+    tile->gui.is_alpenglow = config->firedancer.consensus.alpenglow;
     fd_cstr_ncpy( tile->gui.cluster, config->cluster, sizeof(tile->gui.cluster) );
     fd_cstr_ncpy( tile->gui.identity_key_path, config->paths.identity_key, sizeof(tile->gui.identity_key_path) );
     fd_cstr_ncpy( tile->gui.vote_key_path, config->paths.vote_account, sizeof(tile->gui.vote_key_path) );
@@ -1990,7 +2035,7 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     parse_listen_addr( config->tiles.rpc.rpc_listen_address, "tiles.rpc.rpc_listen_address", &tile->rpc.listen_addr );
     tile->rpc.listen_port = config->tiles.rpc.rpc_listen_port;
     tile->rpc.delay_startup = config->tiles.rpc.delay_startup;
-    tile->rpc.alpenglow     = config->firedancer.development.alpenglow;
+    tile->rpc.alpenglow     = config->firedancer.consensus.alpenglow;
     tile->rpc.max_http_connections      = config->tiles.rpc.max_http_connections;
     tile->rpc.max_websocket_connections = config->tiles.rpc.max_websocket_connections;
     tile->rpc.send_buffer_size_mb       = config->tiles.rpc.send_buffer_size_mb;
@@ -2018,7 +2063,7 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
 
   } else if( FD_UNLIKELY( !strcmp( tile->name, "backt" ) ) ) {
 
-    tile->backtest.alpenglow     = config->firedancer.development.alpenglow;
+    tile->backtest.alpenglow     = config->firedancer.consensus.alpenglow;
     tile->backtest.root_distance = config->firedancer.development.backtest.root_distance;
     fd_cstr_ncpy( tile->backtest.ledger_format, config->firedancer.development.ledger_input.format, sizeof(tile->backtest.ledger_format) );
     fd_cstr_ncpy( tile->backtest.ledger_path, config->firedancer.development.ledger_input.path, PATH_MAX );

@@ -506,12 +506,16 @@ get_vote_credits( uchar const *        account_data,
   FD_TEST( cnt<=FD_EPOCH_CREDITS_MAX );
   epoch_credits->commission = commission;
 
-  ulong n    = 0UL;
-  ulong base = 0UL;
+  ulong n             = 0UL;
+  ulong base          = 0UL;
+  uchar has_ag_marker = 0;
   for( ulong i=0UL; i<cnt; i++ ) {
     fd_vote_epoch_credits_t const * ele = &vote_epoch_credits[ i ];
 
-    if( fd_vote_epoch_credits_is_alpenglow_marker( ele ) ) continue;
+    if( fd_vote_epoch_credits_is_alpenglow_marker( ele ) ) {
+      has_ag_marker = 1;
+      continue;
+    }
     if( !n ) base = ele->prev_credits;
 
     FD_TEST( ele->epoch<=USHORT_MAX );           /* Epoch should fit. */
@@ -525,9 +529,10 @@ get_vote_credits( uchar const *        account_data,
     n++;
   }
 
-  epoch_credits->cnt          = (uchar)n;
-  epoch_credits->base_credits = base;
-  epoch_credits->fast_path_ok = fd_epoch_credits_fast_path_ok( epoch_credits );
+  epoch_credits->cnt                     = (uchar)n;
+  epoch_credits->base_credits            = base;
+  epoch_credits->has_ag_migration_marker = has_ag_marker;
+  epoch_credits->fast_path_ok            = fd_epoch_credits_fast_path_ok( epoch_credits );
 }
 
 int
@@ -554,7 +559,7 @@ fd_refresh_vote_accounts( fd_bank_t *                    bank,
                           fd_stake_history_t const *     history,
                           ulong                          rewarded_epoch,
                           ulong *                        new_rate_activation_epoch ) {
-  fd_bank_epoch_credits_new_fork( bank );
+  bank->epoch_credits_fork_id = fd_epoch_credits_store_new_fork( fd_bank_epoch_credits( bank ), bank->epoch_credits_fork_id );
 
   fd_vote_stakes_t * vote_stakes = fd_bank_vote_stakes( bank );
   ulong              fork_id     = bank->vote_stakes_fork_id;
@@ -567,6 +572,7 @@ fd_refresh_vote_accounts( fd_bank_t *                    bank,
   ulong staked_accounts            = 0UL;
   int   use_fixed_point_stake_math = FD_FEATURE_ACTIVE_BANK( bank, upgrade_bpf_stake_program_to_v5_1 );
   int   alpenglow_enabled          = FD_FEATURE_ACTIVE_BANK( bank, alpenglow );
+  int   block_revenue_sharing      = FD_FEATURE_ACTIVE_BANK( bank, block_revenue_sharing );
   int   accumulate_reward_stakes   = alpenglow_enabled && rewarded_epoch!=ULONG_MAX;
 
   fd_stake_accum_t *     stake_accum_pool = runtime_stack->stakes.stake_accum;
@@ -655,7 +661,16 @@ fd_refresh_vote_accounts( fd_bank_t *                    bank,
       continue;
     }
 
-    if( FD_UNLIKELY( !fd_stakes_vote_account_is_admissible( bank, acc.lamports, acc.owner, acc.data, acc.data_len ) ) ) {
+    /* SIMD-0123: delegator rewards do not count towards the balance
+       https://github.com/anza-xyz/agave/blob/v4.4/vote/src/vote_account.rs#L225-L234 */
+    ulong available_balance = acc.lamports;
+    if( block_revenue_sharing ) {
+      ulong pending_delegator_rewards = 0UL;
+      if( FD_LIKELY( !fd_vote_account_pending_delegator_rewards( acc.data, acc.data_len, &pending_delegator_rewards ) ) ) {
+        available_balance = fd_ulong_sat_sub( acc.lamports, pending_delegator_rewards );
+      }
+    }
+    if( FD_UNLIKELY( !fd_stakes_vote_account_is_admissible( bank, available_balance, acc.owner, acc.data, acc.data_len ) ) ) {
       fd_accdb_unread_one( accdb, &acc );
       continue;
     }
@@ -723,6 +738,9 @@ fd_refresh_vote_accounts( fd_bank_t *                    bank,
   fd_vote_rewards_map_reset( vote_reward_map );
   ulong vote_reward_cnt = 0UL;
 
+  fd_epoch_credits_view_t epoch_credits_view[1];
+  FD_TEST( fd_epoch_credits_view_init( epoch_credits_view, fd_bank_epoch_credits( bank ), bank->epoch_credits_fork_id ) );
+
   /* Populate the vote rewards map with the final set of filtered vote
      accounts for the t-1 epoch. */
   bank->f.total_epoch_stake = 0UL;
@@ -758,7 +776,7 @@ fd_refresh_vote_accounts( fd_bank_t *                    bank,
     if( FD_UNLIKELY( vote_reward_cnt>=FD_RUNTIME_MAX_VAT_VOTE_ACCOUNTS ) ) {
       FD_LOG_ERR(( "invariant violation: vote_reward_cnt >= epoch credits max" ));
     }
-    fd_epoch_credits_t * epoch_credits = &fd_bank_epoch_credits( bank )[ vote_reward_cnt ];
+    fd_epoch_credits_t * epoch_credits = &epoch_credits_view->credits[ vote_reward_cnt ];
     fd_memcpy( epoch_credits->pubkey, &pubkey, sizeof(fd_pubkey_t) );
     get_vote_credits( acc.data, acc.data_len, vote_ele->commission, epoch_credits );
     fd_accdb_unread_one( accdb, &acc );
@@ -773,7 +791,8 @@ fd_refresh_vote_accounts( fd_bank_t *                    bank,
     vote_reward_cnt++;
     bank->f.total_epoch_stake += stake;
   }
-  *fd_bank_epoch_credits_len( bank ) = vote_reward_cnt;
+  epoch_credits_view->len = vote_reward_cnt;
+  fd_epoch_credits_view_fini( epoch_credits_view );
   if( FD_UNLIKELY( fd_bank_report_runtime_diffs( bank ) ) ) fd_event_runtime_epoch_votes( staked_accounts, top_votes_eligible );
 }
 

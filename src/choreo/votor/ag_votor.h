@@ -4,6 +4,7 @@
 #include "ag_votor_base.h"
 #include "../../ballet/bls/fd_bls.h"
 #include "ag_pool.h"
+#include "ag_vote_history_file.h"
 
 #define AG_VOTOR_REASON_BLOCK_REPLAYED  (0)
 #define AG_VOTOR_REASON_PARENT_READY    (1)
@@ -97,10 +98,15 @@ ag_votor_set_rank( ag_votor_t * self,
 /* ag_votor_wait_to_vote is called when our identity changes.  Votor
    signs no more votes up to the end of the window of the highest slot
    it voted notar or skip in, since the new identity may have voted in
-   that window on another machine.  Like Agave's --wait-to-vote-slot. */
+   that window on another machine.  It also signs none below
+   wait_to_vote_slot, which the new identity's vote history file gives
+   (0 if none).  Like Agave's --wait-to-vote-slot.  The votes cast so
+   far leave the vote history, so the new identity's file has only its
+   own. */
 
 void
-ag_votor_wait_to_vote( ag_votor_t * self );
+ag_votor_wait_to_vote( ag_votor_t * self,
+                       ulong        wait_to_vote_slot );
 
 /* Algorithm 1, lines 9-25. Votor::handle_pool_event */
 
@@ -138,6 +144,12 @@ ag_votor_poll_vote( ag_votor_t * self,
 int
 ag_votor_poll_cert( ag_votor_t * self,
                     ag_cert_t *  cert );
+
+/* ag_votor_vote_history writes votor's history to out. */
+
+int
+ag_votor_vote_history( ag_votor_t const *       self,
+                       ag_vote_history_file_t * out );
 
 FD_PROTOTYPES_END
 
