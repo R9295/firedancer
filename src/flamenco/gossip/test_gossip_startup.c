@@ -24,6 +24,9 @@ typedef struct {
   ulong            ping_cnt;
   uchar            ping_token[32];
   fd_ip4_port_t    ping_addr;
+  uchar            sign_sig[ FD_GOSSIP_SIGN_PEND_MAX ][ 64 ]; /* answers queued by sign_message, in request order */
+  ulong            sign_head;
+  ulong            sign_cnt;
 } fixture_t;
 
 /* Replace only tile publication, not the gossip/CRDS state machines. */
@@ -43,15 +46,31 @@ fd_gossip_tx_publish_chunk( fd_gossip_out_ctx_t * ctx,
   (void)ctx; (void)stem; (void)sig; (void)sz; (void)now;
 }
 
+/* Signing is asynchronous: queue the signature as the sign tile would
+   and answer it from drain_signs. */
+
 static void
 sign_message( void *        ctx,
               uchar const * data,
               ulong         sz,
-              int           sign_type,
-              uchar *       signature ) {
+              int           sign_type ) {
   fixture_t * f = ctx;
   FD_TEST( sign_type==FD_KEYGUARD_SIGN_TYPE_ED25519 );
-  fd_ed25519_sign( signature, data, sz, f->public_key, f->private_key, f->sha );
+  FD_TEST( f->sign_cnt<FD_GOSSIP_SIGN_PEND_MAX );
+  ulong idx = (f->sign_head+f->sign_cnt)%FD_GOSSIP_SIGN_PEND_MAX;
+  fd_ed25519_sign( f->sign_sig[ idx ], data, sz, f->public_key, f->private_key, f->sha );
+  f->sign_cnt++;
+}
+
+static void
+drain_signs( fixture_t * f,
+             long        now ) {
+  while( f->sign_cnt ) {
+    uchar const * sig = f->sign_sig[ f->sign_head ];
+    f->sign_head = (f->sign_head+1UL)%FD_GOSSIP_SIGN_PEND_MAX;
+    f->sign_cnt--;
+    fd_gossip_sign_response( f->gossip, sig, f->stem, now );
+  }
 }
 
 static void
@@ -116,9 +135,10 @@ fixture_init( fixture_t * f,
   ci.sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_GOSSIP ].ip4  = FD_IP4_ADDR( 127, 0, 0, 1 );
   ci.sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_GOSSIP ].port = fd_ushort_bswap( 8001U );
   static fd_gossip_out_ctx_t out;
+  uchar ping_seed[ 32 ] = {0};
   void * mem = aligned_alloc( fd_gossip_align(), fd_gossip_footprint( 128UL, 0UL ) );
   FD_TEST( mem );
-  f->gossip = fd_gossip_join( fd_gossip_new( mem, f->rng, 128UL, 0UL, NULL, f->public_key, &ci, START_NS,
+  f->gossip = fd_gossip_join( fd_gossip_new( mem, f->rng, ping_seed, 128UL, 0UL, NULL, f->public_key, &ci, START_NS,
                                            send_message, f, sign_message, f, ping_changed, NULL,
                                            activity_changed, NULL, &out, &out ) );
   FD_TEST( f->gossip );
@@ -128,6 +148,7 @@ fixture_init( fixture_t * f,
 
   int busy = 0;
   fd_gossip_advance( f->gossip, START_NS, f->stem, &busy );
+  drain_signs( f, START_NS );
   FD_TEST( busy );
   FD_TEST( !f->own_push_cnt ); /* no peers, and never send to self */
   FD_TEST( f->gossip->timers.next_contact_info_refresh==START_NS+7500L*MS );
@@ -163,6 +184,7 @@ receive_contact_info( fixture_t * f,
   uchar failed[1] = {0};
   long results[17];
   rx_values( f->gossip, 1UL, &value, serialized, failed, f->stem, now, results );
+  drain_signs( f, now );
   FD_TEST( results[0]>=0L );
 }
 
@@ -180,6 +202,7 @@ receive_pong( fixture_t * f,
   fd_sha256_hash( preimage, sizeof(preimage), pong.hash );
   if( !valid ) pong.hash[0] ^= 1U;
   rx_pong( f->gossip, &pong, f->ping_addr, now );
+  drain_signs( f, now );
 }
 
 static void
@@ -187,6 +210,7 @@ advance( fixture_t * f,
          long        now ) {
   int busy = 0;
   fd_gossip_advance( f->gossip, now, f->stem, &busy );
+  drain_signs( f, now );
 }
 
 static void
