@@ -166,11 +166,11 @@ test_shmem_delete( void ) {
 
 static fd_accdb_t *
 join_new( void ) {
-  ulong accdb_fp = fd_accdb_footprint( T_MAX_LIVE_SLOTS );
+  ulong accdb_fp = fd_accdb_footprint( T_MAX_LIVE_SLOTS, 1 );
   FD_TEST( accdb_fp );
   void * mem = aligned_alloc( fd_accdb_align(), accdb_fp );
   FD_TEST( mem );
-  fd_accdb_t * accdb = fd_accdb_join( fd_accdb_new( mem, g_shmem, g_fd, 0UL, NULL ) );
+  fd_accdb_t * accdb = fd_accdb_join( fd_accdb_new( mem, g_shmem, g_fd, 0UL, NULL, NULL, 0UL, 1 ) );
   FD_TEST( accdb );
   return accdb;
 }
@@ -367,7 +367,7 @@ fiber_acquire_expect( fiber_t *          fiber,
   fiber->acquire.fork_id         = fork_id;
   fiber->acquire.expect_lamports = expect_lamports;
   memcpy( fiber->acquire.pubkey, pubkey, 32UL );
-  fd_racesan_async_new( fiber->async, fiber->stack+FIBER_STACK_MAX, FIBER_STACK_MAX, fiber_acquire_exec, fiber );
+  fd_racesan_async_new( fiber->async, fiber->stack, FIBER_STACK_MAX, fiber_acquire_exec, fiber );
   return fiber->async;
 }
 
@@ -407,7 +407,7 @@ fiber_release_write( fiber_t *          fiber,
   fiber->release_write.fork_id = fork_id;
   fiber->release_write.lamports = lamports;
   memcpy( fiber->release_write.pubkey, pubkey, 32UL );
-  fd_racesan_async_new( fiber->async, fiber->stack+FIBER_STACK_MAX, FIBER_STACK_MAX, fiber_release_write_exec, fiber );
+  fd_racesan_async_new( fiber->async, fiber->stack, FIBER_STACK_MAX, fiber_release_write_exec, fiber );
   return fiber->async;
 }
 
@@ -454,7 +454,7 @@ fiber_acquire_consistent( fiber_t *          fiber,
   fiber->accdb                     = accdb;
   fiber->acquire_consistent.fork_id = fork_id;
   memcpy( fiber->acquire_consistent.pubkey, pubkey, 32UL );
-  fd_racesan_async_new( fiber->async, fiber->stack+FIBER_STACK_MAX, FIBER_STACK_MAX, fiber_acquire_consistent_exec, fiber );
+  fd_racesan_async_new( fiber->async, fiber->stack, FIBER_STACK_MAX, fiber_acquire_consistent_exec, fiber );
   return fiber->async;
 }
 
@@ -492,7 +492,7 @@ fiber_overwrite( fiber_t *          fiber,
   fiber->overwrite.fork_id = fork_id;
   fiber->overwrite.state   = state;
   memcpy( fiber->overwrite.pubkey, pubkey, 32UL );
-  fd_racesan_async_new( fiber->async, fiber->stack+FIBER_STACK_MAX, FIBER_STACK_MAX, fiber_overwrite_exec, fiber );
+  fd_racesan_async_new( fiber->async, fiber->stack, FIBER_STACK_MAX, fiber_overwrite_exec, fiber );
   return fiber->async;
 }
 
@@ -527,7 +527,7 @@ fiber_overwrite_full( fiber_t *          fiber,
   fiber->accdb             = accdb;
   fiber->overwrite.fork_id = fork_id;
   memcpy( fiber->overwrite.pubkey, pubkey, 32UL );
-  fd_racesan_async_new( fiber->async, fiber->stack+FIBER_STACK_MAX, FIBER_STACK_MAX, fiber_overwrite_full_exec, fiber );
+  fd_racesan_async_new( fiber->async, fiber->stack, FIBER_STACK_MAX, fiber_overwrite_full_exec, fiber );
   return fiber->async;
 }
 
@@ -545,7 +545,7 @@ static fd_racesan_async_t *
 fiber_background( fiber_t *    fiber,
                   fd_accdb_t * accdb ) {
   fiber->accdb = accdb;
-  fd_racesan_async_new( fiber->async, fiber->stack+FIBER_STACK_MAX, FIBER_STACK_MAX, fiber_background_exec, fiber );
+  fd_racesan_async_new( fiber->async, fiber->stack, FIBER_STACK_MAX, fiber_background_exec, fiber );
   return fiber->async;
 }
 
@@ -608,7 +608,7 @@ fiber_nocache( fiber_t *          fiber,
   fiber->nocache.expect_data_len = expect_data_len;
   fiber->nocache.expect_data_fill = expect_data_fill;
   memcpy( fiber->nocache.pubkey, pubkey, 32UL );
-  fd_racesan_async_new( fiber->async, fiber->stack+FIBER_STACK_MAX, FIBER_STACK_MAX, fiber_nocache_exec, fiber );
+  fd_racesan_async_new( fiber->async, fiber->stack, FIBER_STACK_MAX, fiber_nocache_exec, fiber );
   return fiber->async;
 }
 
@@ -631,7 +631,7 @@ fiber_compact_loop( fiber_t *    fiber,
                     int          steps ) {
   fiber->accdb              = accdb;
   fiber->compact_loop.steps = steps;
-  fd_racesan_async_new( fiber->async, fiber->stack+FIBER_STACK_MAX, FIBER_STACK_MAX, fiber_compact_loop_exec, fiber );
+  fd_racesan_async_new( fiber->async, fiber->stack, FIBER_STACK_MAX, fiber_compact_loop_exec, fiber );
   return fiber->async;
 }
 
@@ -660,7 +660,7 @@ fiber_probe( fiber_t *          fiber,
   fiber->accdb          = accdb;
   fiber->probe.fork_id  = fork_id;
   memcpy( fiber->probe.pubkey, pubkey, 32UL );
-  fd_racesan_async_new( fiber->async, fiber->stack+FIBER_STACK_MAX, FIBER_STACK_MAX, fiber_probe_exec, fiber );
+  fd_racesan_async_new( fiber->async, fiber->stack, FIBER_STACK_MAX, fiber_probe_exec, fiber );
   return fiber->async;
 }
 
@@ -692,7 +692,7 @@ fiber_pd_commit( fiber_t *          fiber,
   fiber->pd_commit.fork_id  = fork_id;
   fiber->pd_commit.pd_write = pd_write;
   memcpy( fiber->pd_commit.pubkey, pubkey, 32UL );
-  fd_racesan_async_new( fiber->async, fiber->stack+FIBER_STACK_MAX, FIBER_STACK_MAX, fiber_pd_commit_exec, fiber );
+  fd_racesan_async_new( fiber->async, fiber->stack, FIBER_STACK_MAX, fiber_pd_commit_exec, fiber );
   return fiber->async;
 }
 
@@ -713,9 +713,8 @@ fiber_acquire_ab_exec( void * _ctx ) {
   fd_accdb_acquire_a( f->accdb, f->acquire_ab.fork_w, 1UL, pka, wra, acc_a );
 
   uchar const * pkb[1] = { f->acquire_ab.pubkey_d };
-  int           wrb[1] = { 0 };
   fd_acc_t acc_b[1]; memset( acc_b, 0, sizeof(acc_b) );
-  fd_accdb_acquire_b( f->accdb, f->acquire_ab.fork_r, 1UL, 1UL, pkb, wrb, acc_b );
+  fd_accdb_acquire_b( f->accdb, f->acquire_ab.fork_r, 1UL, 1UL, pkb, acc_b );
 
   if( f->acquire_ab.expect_lamports ) {
     FD_TEST( acc_b[0].lamports==f->acquire_ab.expect_lamports );
@@ -746,7 +745,7 @@ fiber_acquire_ab( fiber_t *          fiber,
   fiber->acquire_ab.expect_owner0   = expect_owner0;
   memcpy( fiber->acquire_ab.pubkey_x, pubkey_x, 32UL );
   memcpy( fiber->acquire_ab.pubkey_d, pubkey_d, 32UL );
-  fd_racesan_async_new( fiber->async, fiber->stack+FIBER_STACK_MAX, FIBER_STACK_MAX, fiber_acquire_ab_exec, fiber );
+  fd_racesan_async_new( fiber->async, fiber->stack, FIBER_STACK_MAX, fiber_acquire_ab_exec, fiber );
   return fiber->async;
 }
 
@@ -780,13 +779,21 @@ fiber_overwrite_n( fiber_t *          fiber,
   fiber->overwrite_n.fork_id = fork_id;
   fiber->overwrite_n.rounds  = rounds;
   memcpy( fiber->overwrite_n.pubkey, pubkey, 32UL );
-  fd_racesan_async_new( fiber->async, fiber->stack+FIBER_STACK_MAX, FIBER_STACK_MAX, fiber_overwrite_n_exec, fiber );
+  fd_racesan_async_new( fiber->async, fiber->stack, FIBER_STACK_MAX, fiber_overwrite_n_exec, fiber );
   return fiber->async;
 }
 
 static void
 fiber_done( fiber_t * fiber ) {
   fd_racesan_async_delete( fiber->async );
+}
+
+static void
+async_finish( fd_racesan_async_t * async ) {
+  for( ulong step=0UL; step<STEP_MAX; step++ ) {
+    if( fd_racesan_async_step( async )==FD_RACESAN_ASYNC_RET_EXIT ) return;
+  }
+  FD_LOG_ERR(( "async did not exit within %lu steps", STEP_MAX ));
 }
 
 /* ------------------------------------------------------------------ */
@@ -1649,6 +1656,79 @@ test_compact_reloc_integrity( void ) {
   test_shmem_delete();
 }
 
+/* test_compact_batch: a compaction pass relocates a run of live
+   records with one pwritev2, skips the dead ones inside the run, and
+   a run longer than the bounce buffer splits across passes.  Records
+   are 3 MiB (class 7): the tiny cache holds eight, so writing the
+   seven and then eight fillers pushes all seven to disk in order in
+   a 24 MiB partition.  Rewriting three of them frees 37%, above the
+   compaction threshold, leaving live records 0, 2, 3, 4 with dead
+   ones at 1, 5, 6; five records fit the 16 MiB bounce so the run
+   splits after record 4.  Every record is then cold read and checked
+   byte for byte. */
+
+#define BATCH_REC_CNT  (7UL)
+#define BATCH_REC_DATA (3UL<<20)
+
+static void
+test_compact_batch( void ) {
+  test_shmem_new_cfg2( test_tiny_cache_footprint(), TEST_TINY_CACHE_MIN_RESERVED, 24UL<<20 );
+  fd_accdb_t * ctl = join_new();
+  fd_accdb_t * jc  = join_new();
+
+  fd_accdb_fork_id_t root = fd_accdb_attach_child( ctl, SENTINEL );
+  static int const dead[ BATCH_REC_CNT ] = { 0, 1, 0, 0, 0, 1, 1 };
+
+  uchar keys[ BATCH_REC_CNT ][ 32UL ];
+  for( ulong i=0UL; i<BATCH_REC_CNT; i++ ) {
+    mk_key( 3100UL+i, keys[ i ] );
+    uchar owner[ 32UL ]; memset( owner, 0, 32UL ); owner[0] = (uchar)(0x40+i);
+    seq_write_data( ctl, root, keys[ i ], 1000UL+i, owner, BATCH_REC_DATA, (uchar)(0xA0+i) );
+  }
+  /* evict the seven to disk (partition 0) and move the write head on */
+  for( ulong e=0UL; e<12UL; e++ ) {
+    uchar t[ 32UL ]; mk_key( 3200UL+e, t );
+    seq_write_data( ctl, root, t, 1UL, NULL, BIG_DATA, 0xEE );
+  }
+  /* same-fork rewrites free the old records */
+  for( ulong i=0UL; i<BATCH_REC_CNT; i++ ) {
+    if( !dead[ i ] ) continue;
+    uchar owner[ 32UL ]; memset( owner, 0, 32UL ); owner[0] = (uchar)(0xD0+i);
+    seq_write_data( ctl, root, keys[ i ], 2000UL+i, owner, BATCH_REC_DATA, (uchar)(0xB0+i) );
+  }
+  fd_accdb_shmem_metrics_t const * m = fd_accdb_shmetrics( ctl );
+  ulong before_rel = m->accounts_relocated;
+  ulong before_ops = fd_accdb_metrics( jc )->copy_ops;
+  for( int s=0; s<256; s++ ) drain_background( jc );
+  ulong relocated = m->accounts_relocated-before_rel;
+  ulong writes    = fd_accdb_metrics( jc )->copy_ops-before_ops;
+  FD_LOG_NOTICE(( "  test_compact_batch: %lu records relocated by %lu pwritev2 calls in %lu compactions", relocated, writes, m->compactions_completed ));
+  FD_TEST( writes<relocated ); /* batched: fewer writes than records */
+
+  /* evict again, then cold read every record from wherever it lives */
+  for( ulong e=0UL; e<32UL; e++ ) {
+    uchar t[ 32UL ]; mk_key( 3300UL+e, t );
+    seq_write_data( ctl, root, t, 1UL, NULL, BIG_DATA, 0xCC );
+  }
+  for( ulong i=0UL; i<BATCH_REC_CNT; i++ ) {
+    ulong lamports = 0UL; int executable = 0; ulong data_len = 0UL;
+    uchar owner[ 32UL ]; memset( owner, 0xEE, 32UL );
+    g_cold_data[0] = 0xEE; g_cold_data[ BATCH_REC_DATA-1UL ] = 0xEE;
+    fd_accdb_read_one_nocache( ctl, root, keys[ i ], &lamports, &executable, owner, g_cold_data, &data_len );
+    uchar want_fill = dead[ i ] ? (uchar)(0xB0+i) : (uchar)(0xA0+i);
+    ulong want_lamp = dead[ i ] ? 2000UL+i : 1000UL+i;
+    uchar want_own  = dead[ i ] ? (uchar)(0xD0+i) : (uchar)(0x40+i);
+    FD_TEST( lamports==want_lamp && owner[0]==want_own && data_len==BATCH_REC_DATA );
+    for( ulong z=0UL; z<data_len; z+=4093UL ) FD_TEST( g_cold_data[ z ]==want_fill );
+    FD_TEST( g_cold_data[ data_len-1UL ]==want_fill );
+  }
+  FD_TEST( relocated>=4UL ); /* the live records of partition 0 */
+
+  join_delete( ctl );
+  join_delete( jc );
+  test_shmem_delete();
+}
+
 /* test_compact_vs_overwrite: relocate K while a same-fork overwrite of K
    commits concurrently.  After the weave, K MUST read back as the
    overwritten value (LAMP_B/TAG_B) — the newer commit always wins; the
@@ -1926,11 +2006,11 @@ test_setup( int * out_fd,
   test_shmem_mem = shmem_mem;
   test_shmem     = shmem;
 
-  ulong accdb_fp = fd_accdb_footprint( max_live_slots );
+  ulong accdb_fp = fd_accdb_footprint( max_live_slots, 1 );
   FD_TEST( accdb_fp );
   void * accdb_mem = aligned_alloc( fd_accdb_align(), accdb_fp );
   FD_TEST( accdb_mem );
-  fd_accdb_t * accdb = fd_accdb_join( fd_accdb_new( accdb_mem, shmem, fd, 0UL, NULL ) );
+  fd_accdb_t * accdb = fd_accdb_join( fd_accdb_new( accdb_mem, shmem, fd, 0UL, NULL, NULL, 0UL, 1 ) );
   FD_TEST( accdb );
   return accdb;
 }
@@ -1942,10 +2022,10 @@ test_setup( int * out_fd,
    invariant holds because each tile has its own handle. */
 static fd_accdb_t *
 test_join_extra( void ) {
-  ulong accdb_fp = fd_accdb_footprint( test_max_live_slots );
+  ulong accdb_fp = fd_accdb_footprint( test_max_live_slots, 1 );
   void * accdb_mem = aligned_alloc( fd_accdb_align(), accdb_fp );
   FD_TEST( accdb_mem );
-  fd_accdb_t * accdb = fd_accdb_join( fd_accdb_new( accdb_mem, test_shmem, test_fd, 0UL, NULL ) );
+  fd_accdb_t * accdb = fd_accdb_join( fd_accdb_new( accdb_mem, test_shmem, test_fd, 0UL, NULL, NULL, 0UL, 1 ) );
   FD_TEST( accdb );
   return accdb;
 }
@@ -2142,6 +2222,61 @@ static void
 evict_fiber_exec( void * _ctx ) {
   evict_fiber_t * f = _ctx;
   fd_accdb_debug_clock_evict_line( f->accdb, f->size_class, f->line_idx );
+}
+
+/* test_tombstone_recreate_vs_evict closes and re-creates an account on
+   the same fork while the tombstone is being written back.  The
+   re-create must wait for the writeback, else the evictor's offset
+   publish lands on the new account and disk reads return the
+   tombstone's owner. */
+static void
+test_tombstone_recreate_vs_evict( void ) {
+  test_shmem_new_tiny();
+  fd_accdb_t * ctl = join_new();
+  fd_accdb_t * je  = join_new();
+  fd_accdb_t * jw  = join_new();
+  fd_accdb_t * jr  = join_new();
+
+  uchar key[ 32UL ];   mk_key( 7UL, key );
+  uchar owner[ 32UL ]; memset( owner, 0, 32UL ); owner[0] = TAG_A;
+
+  fd_accdb_fork_id_t root = fd_accdb_attach_child( ctl, SENTINEL );
+  fd_accdb_fork_id_t F    = fd_accdb_attach_child( ctl, root );
+
+  write_acc( ctl, root, key, LAMP_A, owner, NULL, 0UL );
+  fd_accdb_debug_force_preevict( ctl );
+  write_acc( ctl, F, key, 0UL, owner, NULL, 0UL );
+
+  /* Park an evictor on the tombstone line before it writes back */
+  static evict_fiber_t e[1];
+  e->accdb = je;
+  FD_TEST( fd_accdb_debug_find_line( ctl, key, &e->size_class, &e->line_idx ) );
+  void * e_stack = fd_racesan_stack_create( EVICT_FIBER_STACK_SZ );
+  fd_racesan_async_new( e->async, e_stack, EVICT_FIBER_STACK_SZ, evict_fiber_exec, e );
+  FD_TEST( fd_racesan_async_step_until( e->async, "clock_evict:pre_synth", STEP_MAX )==FD_RACESAN_ASYNC_RET_HOOK );
+
+  /* Re-create must block on the in-flight writeback */
+  fd_racesan_async_t * w = fiber_overwrite( &g_fiber[0], jw, F, key, 1 );
+  FD_TEST( fd_racesan_async_step_until( w, "accdb_acquire:offset_wait", STEP_MAX )==FD_RACESAN_ASYNC_RET_HOOK );
+
+  async_finish( e->async );
+  async_finish( w );
+  fiber_done( &g_fiber[0] );
+
+  /* Flush the new version and read it back from disk */
+  fd_accdb_debug_force_preevict( ctl );
+  ulong cls, idx;
+  FD_TEST( !fd_accdb_debug_find_line( ctl, key, &cls, &idx ) );
+  async_finish( fiber_nocache( &g_fiber[1], jr, F, key, LAMP_B, TAG_B, 0UL, 0 ) );
+  fiber_done( &g_fiber[1] );
+
+  fd_racesan_async_delete( e->async );
+  fd_racesan_stack_destroy( e_stack, EVICT_FIBER_STACK_SZ );
+  join_delete( ctl );
+  join_delete( je  );
+  join_delete( jw  );
+  join_delete( jr  );
+  test_shmem_delete();
 }
 
 /* test_sentinel_unlink_no_poison proves the acc_unlink EVICT_SENTINEL
@@ -3296,11 +3431,13 @@ main( int     argc,
     TEST( test_epoch_reclaim_pin ),
     TEST( test_nocache_vs_compaction ),
     TEST( test_compact_reloc_integrity ),
+    TEST( test_compact_batch ),
     TEST( test_compact_vs_overwrite ),
     TEST( test_compact_vs_coldread ),
     TEST( test_coldload_vs_overwrite ),
     TEST( test_commit_owner_vs_reader ),
     TEST( test_tombstone_orphan_ebr_poison ),
+    TEST( test_tombstone_recreate_vs_evict ),
     TEST( test_sentinel_unlink_no_poison ),
     TEST( test_step14_orphan_no_hang ),
     TEST( test_stray_pin_vs_freepop ),

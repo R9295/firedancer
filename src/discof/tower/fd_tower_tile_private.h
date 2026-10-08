@@ -11,8 +11,10 @@
 #include "../../choreo/hfork/fd_hfork.h"
 #include "../../choreo/votes/fd_votes.h"
 #include "../../choreo/tower/fd_tower.h"
+#include "../../choreo/tower/fd_tower_file.h"
 #include "../../choreo/tower/fd_tower_serdes.h"
 #include "../../choreo/tower/fd_tower_stakes.h"
+#include "../../disco/keyguard/fd_keyguard_client.h"
 #include "../../disco/keyguard/fd_keyswitch.h"
 #include "../../disco/metrics/fd_metrics.h"
 #include "../../disco/fd_txn_m.h"
@@ -106,8 +108,6 @@ typedef struct epoch_vtr epoch_vtr_t;
 #define MAP_NEXT               next
 #include "../../util/tmpl/fd_map_chain.c"
 
-#define AUTH_VOTERS_MAX (16UL)
-
 struct in_ctx {
   int         mcache_only;
   fd_wksp_t * mem;
@@ -119,8 +119,6 @@ typedef struct in_ctx in_ctx_t;
 
 struct fd_tower_tile {
   ulong            seed; /* map seed */
-  int              checkpt_fd;
-  int              restore_fd;
   fd_pubkey_t      identity_key[1];
   fd_pubkey_t      vote_account[1];
   ulong            auth_vtr_path_cnt;  /* number of authorized voter paths passed to tile */
@@ -129,10 +127,19 @@ struct fd_tower_tile {
 
   /* owned joins */
 
-  fd_wksp_t *      wksp; /* workspace */
-  fd_keyswitch_t * identity_keyswitch;
-  auth_vtr_t *     auth_vtr;
-  fd_keyswitch_t * auth_vtr_keyswitch; /* authorized voter keyswitch */
+  fd_wksp_t *          wksp; /* workspace */
+  fd_keyswitch_t *     identity_keyswitch;
+  auth_vtr_t *         auth_vtr;
+  fd_keyswitch_t *     auth_vtr_keyswitch; /* authorized voter keyswitch */
+  fd_keyguard_client_t keyguard_client[1];
+
+  /* The tower file.  Each write goes to the staging file, then the two
+     names are exchanged, so the live file is always a complete file. */
+
+  int   tower_dir_fd;
+  int   tower_fd  [ 2 ];      /* [0] staging (<name>.new), [1] live (<name>), -1 if not written */
+  char  tower_name[ 2 ][ PATH_MAX ];
+  ulong tower_file_pending;   /* newest vote slot not yet written, 0 if none (slot 0 is never voted on) */
 
   fd_eqvoc_t * eqvoc;
   fd_ghost_t * ghost;
@@ -157,8 +164,11 @@ struct fd_tower_tile {
   fd_pubkey_t                   vote_accs[VTR_MAX]; /* vote account addresses */
   ulong                         vtr_cnt;            /* actual cnt of elements in above arrays */
   fd_gossip_duplicate_shred_t   duplicate_chunks[FD_EQVOC_CHUNK_CNT];
-  fd_compact_tower_sync_serde_t compact_tower_sync_serde;
+  fd_compact_tower_sync_serde_t compact_tower_sync_serde; /* our last vote, for the tower file */
   uchar                         vote_txn[FD_TPU_PARSED_MTU];
+  fd_tower_file_t               vote_history;
+  int                           vote_history_pending; /* vote history not yet adopted or dropped */
+  ulong                         vote_history_last;    /* last vote of the vote history from the last switch, 0 if none or behind our root */
 
   uchar __attribute__((aligned(FD_MULTI_EPOCH_LEADERS_ALIGN))) mleaders_mem[ FD_MULTI_EPOCH_LEADERS_FOOTPRINT ];
   uchar __attribute__((aligned(FD_VOTE_STAKES_ITER_ALIGN))) iter_mem[ FD_VOTE_STAKES_ITER_FOOTPRINT ];
@@ -189,6 +199,7 @@ struct fd_tower_tile {
   ulong       out_wmark;
   ulong       out_chunk;
   ulong       out_seq;
+  ulong       replay_in_seq;
 
   /* metrics */
 
@@ -208,6 +219,10 @@ struct fd_tower_tile {
 
     ulong fork[ FD_METRICS_ENUM_TOWER_FORK_DECISION_CNT ];
     ulong gate[ FD_METRICS_ENUM_TOWER_VOTE_GATE_CNT ];
+
+    ulong tower_file_write;
+    ulong tower_file_slot;
+    ulong tower_file_sz;
 
     ulong votes     [ FD_METRICS_ENUM_VOTE_TXN_RESULT_CNT         ];
     ulong vote_slots[ FD_METRICS_ENUM_VOTE_SLOT_RESULT_CNT        ];

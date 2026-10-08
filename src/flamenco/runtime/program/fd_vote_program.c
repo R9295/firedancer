@@ -1704,15 +1704,11 @@ fd_vote_program_execute( fd_exec_instr_ctx_t * ctx ) {
   ulong               signers_cnt                   = 0UL;
   fd_exec_instr_ctx_get_signers( ctx, signers, &signers_cnt );
 
-  /* Some of these features are not implemented yet. As such, they are
-     not in feature_map.json.
-
-     TODO: don't hardcode these when the features are implemented. */
   int bls_pubkey_management_in_vote_account = FD_FEATURE_ACTIVE_BANK( ctx->bank, bls_pubkey_management_in_vote_account );
   int delay_commission_updates              = FD_FEATURE_ACTIVE_BANK( ctx->bank, delay_commission_updates );
   int commission_rate_in_basis_points       = FD_FEATURE_ACTIVE_BANK( ctx->bank, commission_rate_in_basis_points );
   int custom_commission_collector           = FD_FEATURE_ACTIVE_BANK( ctx->bank, custom_commission_collector );
-  int block_revenue_sharing                 = 0;
+  int block_revenue_sharing                 = FD_FEATURE_ACTIVE_BANK( ctx->bank, block_revenue_sharing );
   int vote_account_initialize_v2            = 0;
 
   /* https://github.com/anza-xyz/agave/blob/v4.1.0-alpha.0/programs/vote/src/vote_processor.rs#L72-L76 */
@@ -2402,26 +2398,20 @@ fd_vote_program_execute( fd_exec_instr_ctx_t * ctx ) {
     break;
   }
 
-  /* DepositDelegatorRewards
+  /* DepositDelegatorRewards (SIMD-0123)
    *
    * Instruction:
    * https://github.com/anza-xyz/solana-sdk/blob/vote-interface%40v5.0.0/vote-interface/src/instruction.rs#L223-L228
    *
    * Processor:
-   * https://github.com/anza-xyz/agave/blob/v4.0.0-alpha.0/programs/vote/src/vote_processor.rs#L377-L395
+   * https://github.com/anza-xyz/agave/blob/b76028e061ed3bc794d1d802429b3315f02e5a51/programs/vote/src/vote_processor.rs#L391-L393
    *
    * Notes:
-   * - Unimplemented (gated on block_revenue_sharing)
+   * - Disabled, always fails with InvalidInstructionData
    */
   case fd_vote_instruction_enum_deposit_delegator_rewards: {
-    if( FD_UNLIKELY( !commission_rate_in_basis_points
-                  || !custom_commission_collector
-                  || !block_revenue_sharing ) ) {
-      return FD_EXECUTOR_INSTR_ERR_INVALID_INSTR_DATA;
-    }
-
-    /* TODO: fill in when implementing block_revenue_sharing */
-    FD_LOG_CRIT(( "unimplemented: deposit_delegator_rewards" ));
+    rc = FD_EXECUTOR_INSTR_ERR_INVALID_INSTR_DATA;
+    break;
   }
 
   default:

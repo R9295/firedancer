@@ -3,9 +3,25 @@
 
 #include "ag_votor_base.h"
 #include "../../ballet/bls/fd_bls.h"
-#include "ag_event.h"
+#include "ag_pool.h"
+#include "ag_vote_history_file.h"
+
+#define AG_VOTOR_REASON_BLOCK_REPLAYED  (0)
+#define AG_VOTOR_REASON_PARENT_READY    (1)
+#define AG_VOTOR_REASON_BLOCK_NOTARIZED (2)
+#define AG_VOTOR_REASON_TIMEOUT         (3)
+#define AG_VOTOR_REASON_SAFE_TO_NOTAR   (4)
+#define AG_VOTOR_REASON_SAFE_TO_SKIP    (5)
 
 typedef struct ag_votor ag_votor_t;
+
+struct ag_votor_metrics {
+  ulong slot_state_pool_used;
+  ulong slot_state_pool_free;
+  ulong highest_final_cert_slot;
+  ulong vote_events_cnt;
+};
+typedef struct ag_votor_metrics ag_votor_metrics_t;
 
 FD_PROTOTYPES_BEGIN
 
@@ -29,59 +45,109 @@ ag_votor_leave( ag_votor_t const * votor );
 void *
 ag_votor_delete( void * mem );
 
+/* ag_votor_init starts votor at root, a finalized block that is
+   treated as notarized (Section 2.9). */
+
 void
-ag_votor_init( ag_votor_t *   self,
-               ulong          slot,
-               long           now,
-               ushort         shred_version,
-               fd_bls_sign_fn sign_fn,
-               void *         sign_ctx );
+ag_votor_init( ag_votor_t *          self,
+               ag_block_id_t const * root,
+               long                  now,
+               long                  ns_per_slot,
+               ushort                shred_version,
+               fd_bls_sign_fn        sign_fn,
+               void *                sign_ctx );
 
 void
 ag_votor_fini( ag_votor_t * self );
 
+FD_FN_PURE ag_votor_metrics_t
+ag_votor_metrics( ag_votor_t const * self );
+
+/* ag_votor_advance_epoch is called at boot and the epoch boundary and
+   updates the rank and BLS key that is used for voting.  A NULL bls
+   pubkey will disable voting for the epoch corresponding to the
+   epoch_slot. */
+
 void
-ag_votor_advance_epoch( ag_votor_t * self,
-                        ulong        epoch_rank,
-                        ulong        epoch_slot );
+ag_votor_advance_epoch( ag_votor_t *       self,
+                        long               ns_per_slot,
+                        ulong              epoch_rank,
+                        ulong              epoch_slot,
+                        ag_bls_key_t const bls_key );
+
+/* ag_votor_set_bls_key updates the BLS key that is used for voting,
+   or stops voting if the BLS key is NULL.  It should be called when
+   authorized voters change.  Votes made while there was no key are
+   never sent. */
+
+void
+ag_votor_set_bls_key( ag_votor_t *       self,
+                      ulong              epoch_slot,
+                      ag_bls_key_t const bls_key );
+
+/* Replaces our rank in the epoch starting at epoch_slot, for when our
+   identity changes after the epoch advanced. */
+
+void
+ag_votor_set_rank( ag_votor_t * self,
+                   ulong        epoch_slot,
+                   ulong        epoch_rank );
+
+/* ag_votor_wait_to_vote is called when our identity changes.  Votor
+   signs no more votes up to the end of the window of the highest slot
+   it voted notar or skip in, since the new identity may have voted in
+   that window on another machine.  It also signs none below
+   wait_to_vote_slot, which the new identity's vote history file gives
+   (0 if none).  Like Agave's --wait-to-vote-slot.  The votes cast so
+   far leave the vote history, so the new identity's file has only its
+   own. */
+
+void
+ag_votor_wait_to_vote( ag_votor_t * self,
+                       ulong        wait_to_vote_slot );
 
 /* Algorithm 1, lines 9-25. Votor::handle_pool_event */
 
 void
 ag_votor_handle_pool_event( ag_votor_t *            self,
-                            ag_event_pool_t const * event,
+                            ag_pool_event_t const * event,
                             long                    now );
-
-/* Votor::handle_blockstore_event, FirstShred and InvalidBlock */
-
-void
-ag_votor_handle_block_event( ag_votor_t *             self,
-                             ag_event_block_t const * event );
 
 /* Algorithm 1, lines 1-5. Votor::handle_blockstore_event, Block */
 
 void
-ag_votor_handle_replay_event( ag_votor_t *              self,
-                              ag_event_replay_t const * event );
+ag_votor_process_replay( ag_votor_t *            self,
+                         ulong                   slot,
+                         ag_block_info_t const * block_info );
 
 /* Algorithm 1, lines 6-8. Votor::handle_timeout_event */
 
 void
-ag_votor_handle_timeout_event( ag_votor_t *               self,
-                               ag_event_timeout_t const * event );
+ag_votor_handle_skip_timeout( ag_votor_t * self,
+                              ulong        slot );
 
 int
-ag_votor_poll_timeout_event( ag_votor_t *         self,
-                             long                 now,
-                             ag_event_timeout_t * event );
+ag_votor_poll_skip_timeout( ag_votor_t * self,
+                            long         now,
+                            ulong *      slot );
+
+FD_FN_PURE long
+ag_votor_next_skip_timeout( ag_votor_t const * self );
 
 int
-ag_votor_poll_vote_event( ag_votor_t *      self,
-                          ag_event_vote_t * event );
+ag_votor_poll_vote( ag_votor_t * self,
+                    ag_vote_t *  vote,
+                    uchar *      reason );
 
 int
-ag_votor_poll_cert_event( ag_votor_t *      self,
-                          ag_event_cert_t * event );
+ag_votor_poll_cert( ag_votor_t * self,
+                    ag_cert_t *  cert );
+
+/* ag_votor_vote_history writes votor's history to out. */
+
+int
+ag_votor_vote_history( ag_votor_t const *       self,
+                       ag_vote_history_file_t * out );
 
 FD_PROTOTYPES_END
 

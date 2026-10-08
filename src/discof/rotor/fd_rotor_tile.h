@@ -28,42 +28,21 @@
    is set to the correct value starting from fec 0. For these blocks,
    the verified bit is 1.
 
-   There is a race in the case no equivocation occurred, but we
-   suffered some network disconnection and are slow to complete the
-   block (but we get a votor event for the block_id).  Then we would be
-   simultaneously completing the same block through turbine and ag
-   block_id repair, and the turbine copy's slot-complete FEC would
-   re-key its replay bank from {slot, 0} to a {slot, block_id} that the
-   verified copy's bank already occupies.
-
-   The chainer keeps the turbine version active when a votor-driven
-   version appears.  This preserves positional repair as a fallback if
-   block-id repair is unsupported or unanswered.  Both versions may
-   therefore complete, and replay must resolve them by block_id.
-
-   Consider this case:
-   Slot A (started receiving through turbine): received FEC 0, 1, and 5
-   shreds of FEC 2. FEC 0 and 1 are delivered to replay with {verified=0, block_id=null}
-
-   *blip*
-
-   Get a notar fallback for slot A'. No equivocation occurred, but we
-   can't tell, so we also start repairing A' using ag block id repair,
-   while the turbine version continues positional repair.  Slot A' is
-   immediately able to complete FEC 0 and 1 (the shreds are local), and
-   they are re-delivered to replay with {verified=1, block_id=A'}.
-   Remaining shreds of FEC 2 -- whether they arrive through turbine or
-   ShredForBlockId repair -- fill the shared FEC, and FEC 2 is delivered
-   for each active version that owns it.
-
-   The effect is that in time of network blips, replay ends up
-   allocating up to two banks for the same slot/block.  Root publication
-   identifies the canonical block_id and prunes the other version.
+   A slot's turbine version (the eager blk, keyed {slot, 0} by replay)
+   and its votor-driven versions (notar blks, keyed {slot, block_id})
+   coexist, each delivered as its FECs complete.  FEC sets with the
+   same merkle root are shared between versions.  When the turbine
+   version completes and its DMR matches a notar blk, the notar blk is
+   merged into it and freed (see dedup in fd_rotor.c).  So in time of
+   network blips replay may allocate two banks for the same block; the
+   notar one never completes and is eventually evicted or pruned.
 
    INPUTS: REPLAY
 
    Rotor tile consumes from replay tile the sigs
-   REPLAY_SIG_ROOT_ADVANCED and REPLAY_SIG_MISSING_FEC.
+   REPLAY_SIG_ROOT_ADVANCED, REPLAY_SIG_SLOT_DEAD and
+   REPLAY_SIG_MISSING_FEC.  REPLAY_SIG_SLOT_DEAD frees the dead blk; if
+   it was the turbine version, turbine does not rebuild it.
 
    Pruning:
 
@@ -76,8 +55,8 @@
    finalization arrives for slot N.
 
    Replay tile updates its consensus root, but can't advance to it yet,
-   because the bank for it has not been executed.  Rotor has no
-   eviction, and thus could root from the finalized message immediately.
+   because the bank for it has not been executed.  Rotor never evicts a
+   blk, and thus could root from the finalized message immediately.
    This is clearly a problem; replay needs the consensus root data
    re-delivered for execution, so rotor cannot immediately prune based
    on the finalized message.
@@ -97,12 +76,12 @@
    immediately replay, since it has evicted an ancestor.  When that
    occurs, replay should drain the rotor in-link dcache and send a
    REPLAY_SIG_MISSING_FEC to rotor.  Rotor then sends it's next FEC set
-   with the full lineage starting from the chainer root.  It does this
+   with the full lineage starting from the rotor root.  It does this
    only for the next FEC set to deliver.  If repeated evictions occur,
    rotor can expect repeated REPLAY_SIG_MISSING_FEC messages to arrive,
    and many redundant FECs to be delivered.
 
-   We assume currently that chainer will not require eviction.  The
+   We assume currently that rotor will not require eviction.  The
    default size is bounded to the Agave cap on future certs it tracks.
    We can bound rotor even tighter once dynamic vote timeouts are
    implemented, and thus rotor should always have all the data replay
@@ -120,7 +99,7 @@
    regular shreds. Thus the net tile routes them directly to the rotor
    tile.  The routing is done entirely by packet size, so rotor tile
    filters and validates aggressively.  The responses are matches by
-   nonce and verified before being ingested by the chainer. */
+   nonce and verified before being ingested by the rotor. */
 
 /* keep in line with repair tile sigs */
 #define REPAIR_SIG_FEC         (0UL)
@@ -128,12 +107,14 @@
 #define REPAIR_SIG_FEC_INVALID (2UL)
 /* alpenglow type - replayable fec */
 #define ROTOR_SIG_FEC_REPLAY  (3UL)
+/* alpenglow type - completed block metadata, on rotor_rserve */
+#define ROTOR_SIG_BLOCK       (4UL)
 
 struct fd_rotor_fec_metrics {
   uint  stats_valid;        /* 1 if the counters below are populated */
 
   /* 1 if the FEC was delivered under a votor-driven version of its slot
-     -- one the chainer created from a cert and filled by block id
+     -- one the rotor created from a cert and filled by block id
      repair -- and 0 if it was delivered under the slot's turbine
      version, our own leader blocks included. */
   uchar votor_repaired;
@@ -159,6 +140,8 @@ struct fd_rotor_fec_metrics {
   ulong blk_last_shred_ts_nanos;       /* block: when the block became contiguous, 0 if it has not */
   ulong blk_first_req_ts_nanos;        /* block: when the first specific-shred repair request was sent, 0 if none */
   ulong blk_last_repair_resp_ts_nanos; /* block: when the most recent matched repair response arrived, 0 if none */
+
+  long  fec_completed_ts_nanos; /* this FEC: network arrival (wallclock ns) of the shred that completed it, 0 if unavailable */
 
   /* Highest slot rotor has completed a FEC set for off the network, our
      own leader FEC sets excluded: the cluster tip.  Not a per-block
@@ -202,5 +185,21 @@ struct fd_rotor_replay_fec {
    fd_rotor_fec_metrics_t metrics;
 };
 typedef struct fd_rotor_replay_fec fd_rotor_replay_fec_t;
+
+/* fd_rotor_block is published to rserve when a block's slot-complete
+   FEC is delivered.  merkle_roots holds the first 20B of each FEC
+   root.  The frag is variable length, see FD_ROTOR_BLOCK_SZ. */
+
+struct fd_rotor_block {
+  ulong     slot;
+  fd_hash_t block_id;
+  ulong     parent_slot;
+  fd_hash_t parent_block_id;
+  uint      fec_set_cnt;
+  uchar     merkle_roots[ FD_FEC_BLK_MAX ][ FD_SHRED_MERKLE_NODE_SZ ];
+};
+typedef struct fd_rotor_block fd_rotor_block_t;
+
+#define FD_ROTOR_BLOCK_SZ(fec_set_cnt) (offsetof(fd_rotor_block_t, merkle_roots) + (ulong)(fec_set_cnt)*FD_SHRED_MERKLE_NODE_SZ)
 
 #endif /* HEADER_fd_src_discof_rotor_fd_rotor_tile_h */

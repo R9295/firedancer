@@ -27,6 +27,13 @@ static char const cfg_str_4[] =
 static char const cfg_str_5[] =
   "[development.genesis]\n"
   "  max_file_size_mib = 33";
+static char const cfg_str_vote_history[] =
+  "[paths]\n"
+  "  vote_history = \"/data/{name}/vote_history\"\n"
+  "[tiles.tower]\n"
+  "  write_vote_history_file = false\n"
+  "[tiles.votor]\n"
+  "  write_vote_history_file = true";
 
 extern uchar const fdctl_default_config[];
 extern ulong const fdctl_default_config_sz;
@@ -40,6 +47,27 @@ genesis_max_file_size_is_valid( config_t * config,
     config->firedancer.development.genesis.max_file_size_mib = max_file_size_mib;
     fd_config_validate( config );
     _exit( 0 );
+  }
+
+  int status = 0;
+  FD_TEST( waitpid( pid, &status, 0 )==pid );
+  return WIFEXITED( status ) && !WEXITSTATUS( status );
+}
+
+static int
+vote_history_path_is_valid( char const * path ) {
+  int pid = fork();
+  FD_TEST( pid>=0 );
+  if( FD_UNLIKELY( !pid ) ) {
+    char toml[ 256 ];
+    FD_TEST( fd_cstr_printf_check( toml, sizeof(toml), NULL, "[paths]\n  vote_history = \"%s\"", path ) );
+    static uchar pod_mem[ 1UL<<16 ];
+    static uchar scratch[ 4096 ];
+    static config_t config[1];
+    config->is_firedancer = 1;
+    uchar * pod = fd_pod_join( fd_pod_new( pod_mem, sizeof(pod_mem) ) );
+    FD_TEST( fd_toml_parse( toml, strlen( toml ), pod, scratch, sizeof(scratch), NULL )==FD_TOML_SUCCESS );
+    _exit( fd_config_extract_pod( pod, config )!=config ); /* exits 1 on an invalid path */
   }
 
   int status = 0;
@@ -66,7 +94,7 @@ main( int     argc,
   FD_TEST( config->gossip.entrypoints_cnt == 1 );
   FD_TEST( 0==strcmp( config->gossip.entrypoints[0], "208.91.106.45:8080" ) );
 
-  /* Maximum-sized URL values survive config extraction. */
+  /* Maximum-sized URLs and shred destinations survive config extraction. */
 
   char endpoint[ FD_URL_MAX ];
   fd_memcpy( endpoint, "https://", 8UL );
@@ -80,8 +108,11 @@ main( int     argc,
                                 "[snapshots.sources]\n"
                                 "servers = [\"%s\"]\n"
                                 "[tiles.bundle]\n"
-                                "url = \"%s\"\n",
-                                endpoint, endpoint ) );
+                                "url = \"%s\"\n"
+                                "[tiles.shred]\n"
+                                "additional_shred_destinations_retransmit = [\"%s\"]\n"
+                                "additional_shred_destinations_leader = [\"%s\"]\n",
+                                endpoint, endpoint, endpoint+8UL, endpoint+8UL ) );
 
   memset( config, 0, sizeof(config_t) );
   config->is_firedancer = 1;
@@ -91,6 +122,10 @@ main( int     argc,
   FD_TEST( config->firedancer.snapshots.sources.servers_cnt==1UL );
   FD_TEST( !strcmp( config->firedancer.snapshots.sources.servers[0], endpoint ) );
   FD_TEST( !strcmp( config->tiles.bundle.url, endpoint ) );
+  FD_TEST( config->tiles.shred.additional_shred_destinations_retransmit_cnt==1UL &&
+           !strcmp( config->tiles.shred.additional_shred_destinations_retransmit[ 0 ], endpoint+8UL ) );
+  FD_TEST( config->tiles.shred.additional_shred_destinations_leader_cnt==1UL &&
+           !strcmp( config->tiles.shred.additional_shred_destinations_leader[ 0 ], endpoint+8UL ) );
 
   /* Reject invalid direct and aliased array elements. */
 
@@ -142,7 +177,7 @@ main( int     argc,
   config->firedancer.accounts.cache_size_gib                   = 1UL;
   config->firedancer.runtime.program_cache_size_mib            = 32UL;
   config->tiles.repair.slot_max                                   = 1UL;
-  config->tiles.rotor.slot_max                                    = 1UL;
+  strcpy( config->firedancer.layout.mode, "performance" );
 
   FD_TEST(  genesis_max_file_size_is_valid( config, 4055UL ) );
   FD_TEST( !genesis_max_file_size_is_valid( config, 4056UL ) );
@@ -181,6 +216,23 @@ main( int     argc,
   FD_TEST( fd_toml_parse( cfg_str_5, sizeof(cfg_str_5)-1, pod, scratch, sizeof(scratch), NULL ) == FD_TOML_SUCCESS );
   FD_TEST( fd_config_extract_pod( pod, config ) == config );
   FD_TEST( config->firedancer.development.genesis.max_file_size_mib == 33UL );
+
+  /* Parse the vote history file options */
+
+  memset( config, 0, sizeof(config_t) );
+  config->is_firedancer = 1;
+  config->tiles.tower.write_vote_history_file = 1;
+  pod = fd_pod_join( fd_pod_new( pod_mem, sizeof(pod_mem) ) );
+  FD_TEST( fd_toml_parse( cfg_str_vote_history, sizeof(cfg_str_vote_history)-1, pod, scratch, sizeof(scratch), NULL ) == FD_TOML_SUCCESS );
+  FD_TEST( fd_config_extract_pod( pod, config ) == config );
+  FD_TEST( !strcmp( config->paths.vote_history, "/data/{name}/vote_history" ) );
+  FD_TEST( !config->tiles.tower.write_vote_history_file );
+  FD_TEST(  config->tiles.votor.write_vote_history_file );
+
+  FD_TEST(  vote_history_path_is_valid( ""                   ) ); /* default */
+  FD_TEST(  vote_history_path_is_valid( "/data/vote_history" ) );
+  FD_TEST(  vote_history_path_is_valid( "/data/"             ) );
+  FD_TEST( !vote_history_path_is_valid( "data/vote_history"  ) ); /* relative */
 
   FD_LOG_NOTICE(( "pass" ));
   fd_halt();

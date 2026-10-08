@@ -244,6 +244,33 @@ fd_bpf_loader_finalize_v3_check( int           feature_active,
   return FD_EXECUTOR_INSTR_SUCCESS;
 }
 
+/* SIMD-0433 ProgramData sizing for the Loader V3 Upgrade instruction.
+   https://github.com/anza-xyz/agave/blob/v4.4.0-alpha.6/programs/bpf_loader/src/lib.rs#L443-L468 */
+int
+fd_bpf_loader_v3_upgrade_sizing( int               set_programdata_to_elf_len,
+                                 ulong             programdata_current_len,
+                                 ulong             buffer_data_len,
+                                 fd_rent_t const * rent,
+                                 ulong *           out_programdata_len,
+                                 ulong *           out_balance_required ) {
+  ulong programdata_len;
+  if( set_programdata_to_elf_len ) {
+    programdata_len      = fd_ulong_sat_add( PROGRAMDATA_METADATA_SIZE, buffer_data_len );
+    *out_programdata_len = programdata_len;
+    if( FD_UNLIKELY( programdata_len>MAX_PERMITTED_DATA_LENGTH ) ) {
+      return FD_EXECUTOR_INSTR_ERR_INVALID_ACC_DATA;
+    }
+  } else {
+    programdata_len      = programdata_current_len;
+    *out_programdata_len = programdata_len;
+    if( FD_UNLIKELY( programdata_len<fd_ulong_sat_add( PROGRAMDATA_METADATA_SIZE, buffer_data_len ) ) ) {
+      return FD_EXECUTOR_INSTR_ERR_ACC_DATA_TOO_SMALL;
+    }
+  }
+  *out_balance_required = fd_ulong_max( 1UL, fd_rent_exempt_minimum_balance( rent, programdata_len ) );
+  return FD_EXECUTOR_INSTR_SUCCESS;
+}
+
 /* https://github.com/anza-xyz/agave/blob/574bae8fefc0ed256b55340b9d87b7689bcdf222/programs/bpf_loader/src/lib.rs#L195-L218 */
 static int
 write_program_data( fd_exec_instr_ctx_t *   instr_ctx,
@@ -417,9 +444,9 @@ fd_bpf_execute( fd_exec_instr_ctx_t *      instr_ctx,
 
   /* https://github.com/anza-xyz/agave/blob/574bae8fefc0ed256b55340b9d87b7689bcdf222/programs/bpf_loader/src/lib.rs#L1362-L1368 */
   ulong                   input_sz                                 = 0UL;
-  ulong                   pre_lens[256]                            = {0};
-  fd_vm_input_region_t    input_mem_regions[1000]                  = {0}; /* We can have a max of (3 * num accounts + 1) regions */
-  fd_vm_acc_region_meta_t acc_region_metas[256]                    = {0}; /* instr acc idx to idx */
+  ulong                   pre_lens[256];
+  fd_vm_input_region_t    input_mem_regions[1000]; /* We can have a max of (3 * num accounts + 1) regions */
+  fd_vm_acc_region_meta_t acc_region_metas[256];   /* instr acc idx to idx */
   uint                    input_mem_regions_cnt                    = 0U;
   int                     direct_mapping                           = FD_FEATURE_ACTIVE_BANK( instr_ctx->bank, account_data_direct_mapping );
   int                     syscall_parameter_address_restrictions   = FD_FEATURE_ACTIVE_BANK( instr_ctx->bank, syscall_parameter_address_restrictions );
@@ -502,7 +529,7 @@ fd_bpf_execute( fd_exec_instr_ctx_t *      instr_ctx,
   }
 
   if( FD_UNLIKELY( instr_ctx->runtime->log.enable_vm_tracing && instr_ctx->runtime->log.tracing_mem ) ) {
-    vm->trace = fd_vm_trace_join( fd_vm_trace_new( instr_ctx->runtime->log.tracing_mem + ((instr_ctx->runtime->instr.stack_sz-1UL) * FD_RUNTIME_VM_TRACE_STATIC_FOOTPRINT), FD_RUNTIME_VM_TRACE_EVENT_MAX, FD_RUNTIME_VM_TRACE_EVENT_DATA_MAX ));
+    vm->trace = fd_vm_trace_join( fd_vm_trace_new( instr_ctx->runtime->log.tracing_mem + ((instr_ctx->runtime->instr.stack_sz-1UL) * FD_RUNTIME_VM_TRACE_STATIC_FOOTPRINT), FD_RUNTIME_VM_TRACE_EVENT_MAX ));
     if( FD_UNLIKELY( !vm->trace ) ) FD_LOG_ERR(( "unable to create trace; make sure you've compiled with sufficient spad size " ));
   }
 
@@ -528,8 +555,8 @@ fd_bpf_execute( fd_exec_instr_ctx_t *      instr_ctx,
   }
 
   /* Log consumed compute units and return data.
-     https://github.com/anza-xyz/agave/blob/v2.0.6/programs/bpf_loader/src/lib.rs#L1418-L1429 */
-  fd_log_collector_program_consumed( instr_ctx, pre_insn_cus-vm->cu, pre_insn_cus );
+     https://github.com/anza-xyz/agave/blob/v4.3.0/program-runtime/src/vm.rs#L347-L353 */
+  fd_log_collector_program_consumed( instr_ctx, pre_insn_cus-heap_cost-vm->cu, pre_insn_cus );
   if( FD_UNLIKELY( instr_ctx->txn_out->details.return_data.len ) ) {
     fd_log_collector_program_return( instr_ctx );
   }
@@ -1565,17 +1592,29 @@ process_loader_upgradeable_instruction( fd_exec_instr_ctx_t * instr_ctx ) {
       /* Verify ProgramData account */
 
       ulong programdata_data_offset      = PROGRAMDATA_METADATA_SIZE;
+      ulong programdata_len              = 0UL;
       ulong programdata_balance_required = 0UL;
 
       /* https://github.com/anza-xyz/agave/blob/v2.1.4/programs/bpf_loader/src/lib.rs#L778-L779 */
       fd_guarded_borrowed_account_t programdata = {0};
       FD_TRY_BORROW_INSTR_ACCOUNT_DEFAULT_ERR_CHECK( instr_ctx, 0UL, &programdata );
 
-      programdata_balance_required = fd_ulong_max( 1UL, fd_rent_exempt_minimum_balance( rent, fd_borrowed_account_get_data_len( &programdata ) ) );
-
-      if( FD_UNLIKELY( fd_borrowed_account_get_data_len( &programdata )<fd_ulong_sat_add( PROGRAMDATA_METADATA_SIZE, buffer_data_len ) ) ) {
+      /* SIMD-0433: ProgramData account is resized to hold the new ELF */
+      err = fd_bpf_loader_v3_upgrade_sizing(
+          FD_FEATURE_ACTIVE_BANK( instr_ctx->bank, loader_v3_set_program_data_to_elf_length ),
+          fd_borrowed_account_get_data_len( &programdata ),
+          buffer_data_len,
+          rent,
+          &programdata_len,
+          &programdata_balance_required );
+      if( FD_UNLIKELY( err==FD_EXECUTOR_INSTR_ERR_INVALID_ACC_DATA ) ) {
+        fd_log_collector_printf_dangerous_max_127( instr_ctx,
+          "Resized ProgramData length of %lu bytes exceeds max account data length", programdata_len );
+        return err;
+      }
+      if( FD_UNLIKELY( err==FD_EXECUTOR_INSTR_ERR_ACC_DATA_TOO_SMALL ) ) {
         fd_log_collector_msg_literal( instr_ctx, "ProgramData account not large enough" );
-        return FD_EXECUTOR_INSTR_ERR_ACC_DATA_TOO_SMALL;
+        return err;
       }
       if( FD_UNLIKELY( fd_ulong_sat_add( fd_borrowed_account_get_lamports( &programdata ), buffer_lamports )<programdata_balance_required ) ) {
         fd_log_collector_msg_literal( instr_ctx, "Buffer account balance too low to fund upgrade" );
@@ -1641,6 +1680,11 @@ process_loader_upgradeable_instruction( fd_exec_instr_ctx_t * instr_ctx ) {
       /* https://github.com/anza-xyz/agave/blob/574bae8fefc0ed256b55340b9d87b7689bcdf222/programs/bpf_loader/src/lib.rs#L846-L874 */
       /* Update the ProgramData account, record the upgraded data, and zero the rest in a local scope */
       do {
+        err = fd_borrowed_account_set_data_length( &programdata, programdata_len );
+        if( FD_UNLIKELY( err!=FD_EXECUTOR_INSTR_SUCCESS ) ) {
+          return err;
+        }
+
         programdata_state->discriminant                                     = FD_BPF_STATE_PROGRAM_DATA;
         programdata_state->inner.program_data.slot                          = clock->slot;
         programdata_state->inner.program_data.has_upgrade_authority_address = 1;

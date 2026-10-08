@@ -261,8 +261,10 @@ telemetry = false
 [tiles.rpc]
     enabled = false
 
-[development]
+[consensus]
     alpenglow = true
+
+[development]
     bootstrap = true
 
 [development.runtime]

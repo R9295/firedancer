@@ -244,7 +244,7 @@ after_credit( fd_backt_tile_t *   ctx,
   fd_hash_t mr = { .ul[0] = shred->slot, .ul[1] = ctx->out_fec_set_idx };
   if( FD_UNLIKELY( begins_fec_set ) ) {
     fd_store_fec_t * new_fec;
-    FD_TEST( !fd_store_insert( ctx->store, ctx->map_join, &mr, &new_fec ) && new_fec );
+    FD_TEST( !fd_store_insert( ctx->store, ctx->map_join, &mr, shred->slot, 0UL, &new_fec ) && new_fec );
     FD_TEST( fd_store_fec_data_acquire( ctx->store, ctx->store_disk_fd, new_fec ) );
   }
 
@@ -526,6 +526,11 @@ returnable_frag( fd_backt_tile_t *   ctx,
         return 0;
       }
 
+      for( ulong idx=0UL; !ctx->alpenglow && idx<=msg->block_id.ul[ 1 ]; idx+=FD_FEC_SHRED_CNT ) { /* replay publishes Alpenglow slots */
+        fd_hash_t mr = { .ul[ 0 ] = msg->slot, .ul[ 1 ] = idx };
+        fd_store_remove( ctx->store, ctx->map_join, &mr );
+      }
+
       long prior_completion_timestamp = ctx->prior_completion_timestamp ? ctx->prior_completion_timestamp : msg->preparation_begin_nanos;
 
       fd_backt_slot_info_t slot_info;
@@ -747,7 +752,7 @@ unprivileged_init( fd_topo_t const *      topo,
     ctx->in[ i ].wmark  = fd_dcache_compact_wmark ( ctx->in[ i ].mem, link->dcache, link->mtu );
     ctx->in[ i ].mtu    = link->mtu;
 
-    if(      !strcmp( link->name, "replay_out"   ) ) ctx->in_kind[ i ] = IN_KIND_REPLAY;
+    if(      !strcmp( link->name, "replay_slot"  ) ) ctx->in_kind[ i ] = IN_KIND_REPLAY;
     else if( !strcmp( link->name, "snapin_manif" ) ) ctx->in_kind[ i ] = IN_KIND_SNAP;
     else if( !strcmp( link->name, "genesi_out"   ) ) ctx->in_kind[ i ] = IN_KIND_GENESI;
     else FD_LOG_ERR(( "backtest tile has unexpected input link %s", link->name ));

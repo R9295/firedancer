@@ -20,13 +20,19 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#if __has_include(<gnu/libc-version.h>)
 #include <gnu/libc-version.h>
+#else
+/* Internal musl symbol that the static libc provides. */
+extern char const __libc_version[];
+#endif
 #include <linux/ethtool.h>
 #include <linux/sockios.h>
 #include <net/if.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/statvfs.h>
+#include <sys/syscall.h>
 #include <sys/utsname.h>
 
 static int
@@ -206,8 +212,13 @@ collect_os( fd_boot_report_t * r ) {
     }
   }
 
-  r->libc_kind = 1; /* glibc: the only supported libc */
+#if __has_include(<gnu/libc-version.h>)
+  r->libc_kind = 1; /* glibc */
   fd_cstr_printf( r->libc_version, sizeof(r->libc_version), NULL, "%s", gnu_get_libc_version() );
+#else
+  r->libc_kind = 2; /* musl */
+  fd_cstr_printf( r->libc_version, sizeof(r->libc_version), NULL, "%s", __libc_version );
+#endif
 
   static char const * const machine_tbl[] = {
     "native", "linux_gcc_x86_64", "linux_gcc_zen2", "linux_gcc_zen3", "linux_gcc_zen4",
@@ -385,6 +396,44 @@ collect_cpu( fd_boot_report_t * r ) {
     if( disabled ) continue;
     FD_TEST( fd_cstr_printf_check( path, sizeof(path), NULL, "/sys/devices/system/cpu/cpu0/cpuidle/state%lu/name", s ) );
     read_cstr( path, r->cpu_max_enabled_cstate, sizeof(r->cpu_max_enabled_cstate) );
+  }
+}
+
+/* Last-level cache domain per logical cpu: the level-3 cache's id under
+   cpuN/cache/indexM, keyed with the package (ids repeat per socket) and
+   renumbered from 0 in first-seen order. Offline cpus read USHORT_MAX;
+   the map is left empty if any online cpu lacks its package or level-3
+   entry, so a partial map never reads as topology. */
+
+static void
+collect_l3( fd_boot_report_t * r ) {
+  long key[ 1024 ];
+  ulong key_cnt = 0UL;
+  for( ulong cpu=0UL; cpu<r->numa_cpu_to_node_cnt; cpu++ ) {
+    char path[ 128 ];
+    ulong online = 1UL; /* cpu0 has no online file: it cannot go offline */
+    FD_TEST( fd_cstr_printf_check( path, sizeof(path), NULL, "/sys/devices/system/cpu/cpu%lu/online", cpu ) );
+    if( cpu && FD_UNLIKELY( read_ulong( path, &online ) ) ) online = 1UL;
+    if( !online ) { r->l3_cpu_to_domain[ cpu ] = USHORT_MAX; r->l3_cpu_to_domain_cnt = cpu+1UL; continue; }
+    ulong pkg = 0UL;
+    FD_TEST( fd_cstr_printf_check( path, sizeof(path), NULL, "/sys/devices/system/cpu/cpu%lu/topology/physical_package_id", cpu ) );
+    if( FD_UNLIKELY( read_ulong( path, &pkg ) ) ) { r->l3_cpu_to_domain_cnt = 0UL; return; }
+    long id = -1L;
+    for( ulong index=0UL; index<8UL; index++ ) {
+      ulong level, cid;
+      FD_TEST( fd_cstr_printf_check( path, sizeof(path), NULL, "/sys/devices/system/cpu/cpu%lu/cache/index%lu/level", cpu, index ) );
+      if( read_ulong( path, &level ) ) break;
+      if( level!=3UL ) continue;
+      FD_TEST( fd_cstr_printf_check( path, sizeof(path), NULL, "/sys/devices/system/cpu/cpu%lu/cache/index%lu/id", cpu, index ) );
+      if( !read_ulong( path, &cid ) ) id = (long)((pkg<<32) | cid);
+      break;
+    }
+    if( FD_UNLIKELY( id<0L ) ) { r->l3_cpu_to_domain_cnt = 0UL; return; }
+    ulong d = 0UL;
+    while( d<key_cnt && key[ d ]!=id ) d++;
+    if( d==key_cnt ) key[ key_cnt++ ] = id;
+    r->l3_cpu_to_domain[ cpu ] = (ushort)d;
+    r->l3_cpu_to_domain_cnt = cpu+1UL;
   }
 }
 
@@ -982,7 +1031,7 @@ collect_nvme( fd_boot_report_t * r ) {
       .data_len = 512U,
       .cdw10    = 0x02U | ( ( 512U/4U-1U )<<16 ), /* smart / health, numdl */
     };
-    if( 0==ioctl( fd, NVME_IOCTL_ADMIN_CMD_, &cmd ) ) {
+    if( 0==syscall( SYS_ioctl, fd, NVME_IOCTL_ADMIN_CMD_, &cmd ) ) {
       d->critical_warning    = log[ 0 ];
       d->available_spare_pct = log[ 3 ];
       d->percentage_used     = log[ 5 ];
@@ -1229,6 +1278,7 @@ fd_boot_report_collect( fd_boot_report_t *     r,
   collect_os( r );
   collect_cpu( r );
   collect_mem( r );
+  collect_l3( r ); /* after collect_mem: sized by the numa cpu map */
   collect_dimms( r );
   collect_net( r, tile->event.net_interface );
   collect_platform( r, tile->event.net_interface );
@@ -1512,6 +1562,7 @@ fd_boot_report_publish( fd_boot_report_t *  r,
   if( r->memory_normal_pages )     ok &= !!fd_pb_push_uint64( encoder, 73U, r->memory_normal_pages );
   if( r->process_start_time_nanos ) ok &= !!fd_pb_push_uint64( encoder, 74U, r->process_start_time_nanos );
   if( r->feature_set_id )           ok &= !!fd_pb_push_uint32( encoder, 75U, r->feature_set_id );
+  for( ulong i=0UL; i<r->l3_cpu_to_domain_cnt; i++ ) ok &= !!fd_pb_push_uint32( encoder, 76U, r->l3_cpu_to_domain[ i ] );
 
   ok &= !!fd_pb_submsg_close( encoder );
   ok &= !!fd_pb_submsg_close( encoder );

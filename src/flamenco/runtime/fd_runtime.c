@@ -65,6 +65,9 @@ fd_runtime_update_next_leaders( fd_bank_t *          bank,
   ulong epoch    = fd_slot_to_epoch ( epoch_schedule, bank->f.slot, NULL ) + 1UL;
   ulong slot0    = fd_epoch_slot0   ( epoch_schedule, epoch );
   ulong slot_cnt = fd_epoch_slot_cnt( epoch_schedule, epoch );
+  if( FD_UNLIKELY( slot_cnt>FD_RUNTIME_SLOTS_PER_EPOCH ) ) {
+    FD_LOG_ERR(( "epoch %lu has %lu slots, but the maximum supported is %lu", epoch, slot_cnt, FD_RUNTIME_SLOTS_PER_EPOCH ));
+  }
 
   fd_vote_stakes_t const * vote_stakes      = fd_bank_vote_stakes( bank );
   fd_vote_stake_weight_t * epoch_weights    = runtime_stack->stakes.stake_weights;
@@ -101,6 +104,9 @@ fd_runtime_update_leaders( fd_bank_t *          bank,
   ulong epoch    = fd_slot_to_epoch ( epoch_schedule, bank->f.slot, NULL );
   ulong slot0    = fd_epoch_slot0   ( epoch_schedule, epoch );
   ulong slot_cnt = fd_epoch_slot_cnt( epoch_schedule, epoch );
+  if( FD_UNLIKELY( slot_cnt>FD_RUNTIME_SLOTS_PER_EPOCH ) ) {
+    FD_LOG_ERR(( "epoch %lu has %lu slots, but the maximum supported is %lu", epoch, slot_cnt, FD_RUNTIME_SLOTS_PER_EPOCH ));
+  }
 
   fd_vote_stakes_t const * vote_stakes      = fd_bank_vote_stakes( bank );
   fd_vote_stake_weight_t * epoch_weights    = runtime_stack->stakes.stake_weights;
@@ -194,6 +200,145 @@ fd_runtime_validate_block_revenue_collector( fd_bank_t const *   bank,
          ( !FD_FEATURE_ACTIVE_BANK( bank, relax_post_exec_min_balance_check ) || !pre_lamports );
 }
 
+/* Deposits fees into the collector account.
+   Returns 0 on deposit, 1 to burn.
+   https://github.com/anza-xyz/agave/blob/v4.4.0-alpha.5/runtime/src/bank/fee_distribution.rs#L248 */
+
+static int
+fd_runtime_deposit_fees( fd_bank_t *         bank,
+                         fd_accdb_t *        accdb,
+                         fd_capture_ctx_t *  capture_ctx,
+                         fd_pubkey_t const * collector_id,
+                         fd_pubkey_t const * leader_vote,
+                         ulong               fees ) {
+  fd_accdb_svm_update_t update[1];
+  fd_acc_t acc = fd_accdb_svm_open_rw( bank, accdb, update, collector_id, 1 );
+  int burn;
+  if( FD_FEATURE_ACTIVE_BANK( bank, custom_commission_collector ) ) {
+    /* https://github.com/anza-xyz/agave/blob/v4.4.0-alpha.5/runtime/src/bank/fee_distribution.rs#L254-L267 */
+    ulong pre_lamports = acc.lamports;
+    burn = __builtin_uaddl_overflow( pre_lamports, fees, &acc.lamports );
+    /* The vote account itself is always a valid collector. */
+    if( !burn && !fd_pubkey_eq( collector_id, leader_vote ) ) {
+      burn = fd_runtime_validate_block_revenue_collector( bank, collector_id, pre_lamports, &acc );
+    }
+    if( FD_UNLIKELY( burn ) ) acc.lamports = pre_lamports;
+  } else {
+    /* https://github.com/anza-xyz/agave/blob/v4.4.0-alpha.5/runtime/src/bank/fee_distribution.rs#L269-L291 */
+    burn = fd_runtime_validate_fee_collector( bank, &acc, fees );
+    if( FD_LIKELY( !burn ) ) {
+      acc.lamports += fees; /* guaranteed to not overflow, checked above */
+    }
+  }
+  if( FD_LIKELY( !burn ) ) fd_stakes_update_stake_delegation( collector_id, &acc, bank, NULL );
+  fd_accdb_svm_close_rw( bank, accdb, capture_ctx, &acc, update );
+  return burn;
+}
+
+/* Deposits delegator fees into the leader's vote account and increments
+   pending delegator rewards (SIMD-0123).
+   Returns 0 on deposit, 1 to burn.
+   https://github.com/anza-xyz/agave/blob/v4.4.0-alpha.5/runtime/src/bank/fee_distribution.rs#L303 */
+
+static int
+fd_runtime_deposit_delegator_fees( fd_bank_t *         bank,
+                                   fd_accdb_t *        accdb,
+                                   fd_capture_ctx_t *  capture_ctx,
+                                   fd_pubkey_t const * vote_address,
+                                   ulong               fees ) {
+  fd_accdb_svm_update_t update[1];
+  fd_acc_t acc = fd_accdb_svm_open_rw( bank, accdb, update, vote_address, 0 );
+  if( FD_UNLIKELY( !acc.lamports ) ) return 1; /* open_rw released the handle */
+
+  int burn = 0;
+
+  /* Must be a vote account.
+     https://github.com/anza-xyz/agave/blob/v4.4.0-alpha.5/runtime/src/bank/fee_distribution.rs#L312-L314 */
+  if( memcmp( acc.owner, fd_solana_vote_program_id.uc, sizeof(fd_pubkey_t) ) ) burn = 1;
+
+  /* Lamports must not overflow.  Checked before the field update: the
+     account is written back as is when the deposit burns.
+     https://github.com/anza-xyz/agave/blob/v4.4.0-alpha.5/runtime/src/bank/fee_distribution.rs#L324-L326 */
+  ulong pre_lamports = acc.lamports;
+  if( !burn && __builtin_uaddl_overflow( pre_lamports, fees, &acc.lamports ) ) burn = 1;
+
+  /* Must be a v4 state and pending_delegator_rewards must not overflow.
+     https://github.com/anza-xyz/agave/blob/v4.4.0-alpha.5/runtime/src/bank/fee_distribution.rs#L316-L322 */
+  if( !burn && fd_vote_account_add_pending_delegator_rewards( acc.data, acc.data_len, fees ) ) burn = 1;
+
+  if( burn ) acc.lamports = pre_lamports;
+  fd_accdb_svm_close_rw( bank, accdb, capture_ctx, &acc, update );
+  return burn;
+}
+
+/* Deposits the fee reward with the leader's collector and, under
+   SIMD-0123, the delegator share with the leader's vote account.
+   Returns the lamports to burn.
+   https://github.com/anza-xyz/agave/blob/v4.4.0-alpha.5/runtime/src/bank/fee_distribution.rs#L146 */
+
+static ulong
+fd_runtime_deposit_or_burn_fee( fd_bank_t *        bank,
+                                fd_accdb_t *       accdb,
+                                fd_capture_ctx_t * capture_ctx,
+                                ulong              deposit ) {
+  if( FD_UNLIKELY( !deposit ) ) return 0UL;
+
+  fd_epoch_leaders_t const * leaders = fd_bank_epoch_leaders_query( bank, bank->f.epoch );
+  fd_pubkey_t const *        leader  = fd_epoch_leaders_get( leaders, bank->f.slot );
+  if( FD_UNLIKELY( !leader ) ) FD_LOG_CRIT(( "fd_epoch_leaders_get(%lu) returned NULL", bank->f.slot ));
+
+  /* Per SIMD-0232, the fee reward goes to the leader's block revenue
+     collector from the vote account state the leader schedule was
+     derived from (captured entering the previous epoch, tag
+     epoch-1); default is the leader identity.
+     https://github.com/anza-xyz/agave/blob/v4.4.0-alpha.5/runtime/src/bank/fee_distribution.rs#L151-L181 */
+  int custom_commission_collector = FD_FEATURE_ACTIVE_BANK( bank, custom_commission_collector );
+
+  fd_pubkey_t const * collector_id   = leader;
+  fd_pubkey_t const * leader_vote    = NULL;
+  ushort              commission_bps = FD_VOTE_DEFAULT_BLOCK_REVENUE_COMMISSION_BPS;
+  fd_pubkey_t         override_collector;
+  if( custom_commission_collector ) {
+    leader_vote = fd_epoch_leaders_get_vote( leaders, bank->f.slot );
+    if( FD_UNLIKELY( !leader_vote ) ) FD_LOG_CRIT(( "fd_epoch_leaders_get_vote(%lu) returned NULL", bank->f.slot ));
+    int flags = fd_collector_overrides_query( fd_bank_collector_overrides( bank ),
+                                              bank->collector_overrides_fork_id,
+                                              fd_ulong_sat_sub( bank->f.epoch, 1UL ),
+                                              leader_vote,
+                                              NULL,
+                                              &override_collector );
+    if( FD_UNLIKELY( flags & FD_COLLECTOR_OVERRIDE_BLOCK ) ) collector_id = &override_collector;
+    if( FD_UNLIKELY( !fd_vote_stakes_query_block_revenue_t_2( fd_bank_vote_stakes( bank ), bank->vote_stakes_fork_id,
+                                                              leader_vote, &commission_bps, NULL ) ) ) {
+      FD_BASE58_ENCODE_32_BYTES( leader_vote->uc, leader_vote_b58 );
+      /* https://github.com/anza-xyz/agave/blob/v4.4.0-alpha.5/runtime/src/bank/fee_distribution.rs#L167 */
+      FD_LOG_CRIT(( "leader vote account %s is not in the epoch stakes at slot %lu", leader_vote_b58, bank->f.slot ));
+    }
+  }
+
+  /* https://github.com/anza-xyz/agave/blob/v4.4.0-alpha.5/runtime/src/bank/fee_distribution.rs#L183-L199 */
+  ulong validator_fee = deposit;
+  ulong delegator_fee = 0UL;
+  if( FD_FEATURE_ACTIVE_BANK( bank, block_revenue_sharing ) ) {
+    ulong clamped_commission_bps = fd_ulong_min( commission_bps, FD_VOTE_DEFAULT_BLOCK_REVENUE_COMMISSION_BPS );
+    validator_fee = (ulong)( (uint128)deposit * (uint128)clamped_commission_bps / (uint128)FD_VOTE_DEFAULT_BLOCK_REVENUE_COMMISSION_BPS );
+    delegator_fee = deposit - validator_fee;
+  }
+
+  /* https://github.com/anza-xyz/agave/blob/v4.4.0-alpha.5/runtime/src/bank/fee_distribution.rs#L201-L212 */
+  ulong validator_fee_to_burn = 0UL;
+  if( validator_fee && fd_runtime_deposit_fees( bank, accdb, capture_ctx, collector_id, leader_vote, validator_fee ) ) {
+    FD_LOG_INFO(( "slot %lu has an invalid fee collector, burning fee reward (%lu lamports)", bank->f.slot, validator_fee ));
+    validator_fee_to_burn = validator_fee;
+  }
+  ulong delegator_fee_to_burn = 0UL;
+  if( delegator_fee && fd_runtime_deposit_delegator_fees( bank, accdb, capture_ctx, leader_vote, delegator_fee ) ) {
+    FD_LOG_INFO(( "slot %lu has an invalid leader vote account, burning delegator fee reward (%lu lamports)", bank->f.slot, delegator_fee ));
+    delegator_fee_to_burn = delegator_fee;
+  }
+  return validator_fee_to_burn + delegator_fee_to_burn;
+}
+
 /* fd_runtime_settle_fees settles transaction fees accumulated during a
    slot.  A portion is burnt, another portion is credited to the fee
    collector (typically leader). */
@@ -229,65 +374,11 @@ fd_runtime_settle_fees( fd_bank_t *        bank,
   bank->f.execution_fees  = 0;
   bank->f.priority_fees   = 0;
 
-  if( FD_LIKELY( fee_reward ) ) {
-    fd_epoch_leaders_t const * leaders = fd_bank_epoch_leaders_query( bank, bank->f.epoch );
-    fd_pubkey_t const *        leader  = fd_epoch_leaders_get( leaders, bank->f.slot );
-    if( FD_UNLIKELY( !leader ) ) FD_LOG_CRIT(( "fd_epoch_leaders_get(%lu) returned NULL", bank->f.slot ));
+  ulong fee_reward_burn = fd_runtime_deposit_or_burn_fee( bank, accdb, capture_ctx, fee_reward );
 
-    /* Per SIMD-0232, the fee reward goes to the leader's block revenue
-       collector from the vote account state the leader schedule was
-       derived from (captured entering the previous epoch, tag
-       epoch-1); default is the leader identity.
-       https://github.com/anza-xyz/agave/blob/v4.2.0-beta.1/runtime/src/bank/fee_distribution.rs#L121-L148 */
-    int custom_commission_collector = FD_FEATURE_ACTIVE_BANK( bank, custom_commission_collector );
-
-    fd_pubkey_t const * collector_id = leader;
-    fd_pubkey_t const * leader_vote  = NULL;
-    fd_pubkey_t         override_collector;
-    if( custom_commission_collector ) {
-      leader_vote = fd_epoch_leaders_get_vote( leaders, bank->f.slot );
-      if( FD_UNLIKELY( !leader_vote ) ) FD_LOG_CRIT(( "fd_epoch_leaders_get_vote(%lu) returned NULL", bank->f.slot ));
-      int flags = fd_collector_overrides_query( fd_bank_collector_overrides( bank ),
-                                                bank->collector_overrides_fork_id,
-                                                fd_ulong_sat_sub( bank->f.epoch, 1UL ),
-                                                leader_vote,
-                                                NULL,
-                                                &override_collector );
-      if( FD_UNLIKELY( flags & FD_COLLECTOR_OVERRIDE_BLOCK ) ) collector_id = &override_collector;
-    }
-
-    /* Pay out reward portion of collected fees (increasing capitalization) */
-    fd_accdb_svm_update_t update[1];
-    fd_acc_t acc = fd_accdb_svm_open_rw( bank, accdb, update, collector_id, 1 );
-    int burn;
-    if( custom_commission_collector ) {
-      /* https://github.com/anza-xyz/agave/blob/v4.2.0-beta.1/runtime/src/bank/fee_distribution.rs#L184-L204 */
-      ulong post_balance;
-      burn = __builtin_uaddl_overflow( acc.lamports, fee_reward, &post_balance );
-      if( FD_LIKELY( !burn ) ) {
-        acc.lamports = post_balance;
-        /* The vote account itself is always a valid collector. */
-        if( !fd_pubkey_eq( collector_id, leader_vote ) ) {
-          burn = fd_runtime_validate_block_revenue_collector( bank, collector_id, update->lamports_before, &acc );
-        }
-      }
-      if( FD_UNLIKELY( burn ) ) acc.lamports = update->lamports_before;
-    } else {
-      burn = fd_runtime_validate_fee_collector( bank, &acc, fee_reward );
-      if( FD_LIKELY( !burn ) ) {
-        acc.lamports += fee_reward; /* guaranteed to not overflow, checked above */
-      }
-    }
-    if( FD_UNLIKELY( burn ) ) {
-      FD_LOG_INFO(( "slot %lu has an invalid fee collector, burning fee reward (%lu lamports)", bank->f.slot, fee_reward ));
-    }
-    if( FD_LIKELY( !burn ) ) fd_stakes_update_stake_delegation( collector_id, &acc, bank, NULL );
-    fd_accdb_svm_close_rw( bank, accdb, capture_ctx, &acc, update );
-  }
-
-  FD_LOG_INFO(( "slot=%lu priority_fees=%lu execution_fees=%lu fee_burn=%lu fee_rewards=%lu",
+  FD_LOG_INFO(( "slot=%lu priority_fees=%lu execution_fees=%lu fee_burn=%lu fee_rewards=%lu fee_reward_burn=%lu",
                 slot,
-                priority_fees, execution_fees, fee_burn, fee_reward ));
+                priority_fees, execution_fees, fee_burn, fee_reward, fee_reward_burn ));
 }
 
 static void
@@ -613,8 +704,7 @@ fd_compute_and_apply_new_feature_activations( fd_bank_t *          bank,
 /* process for the start of a new epoch
    https://github.com/anza-xyz/agave/blob/v4.3.0-beta.0/runtime/src/bank.rs#L1811-L1899 */
 static void
-fd_runtime_process_new_epoch( fd_banks_t *         banks,
-                              fd_bank_t *          bank,
+fd_runtime_process_new_epoch( fd_bank_t *          bank,
                               fd_accdb_t *         accdb,
                               fd_capture_ctx_t *   capture_ctx,
                               ulong                parent_epoch,
@@ -635,8 +725,6 @@ fd_runtime_process_new_epoch( fd_banks_t *         banks,
   /* Updates stake history sysvar accumulated values and recomputes
      stake delegations for vote accounts. */
 
-  ushort stake_delegations_fork_ids[ banks->max_total_banks ];
-  ulong  stake_delegations_fork_id_cnt = fd_banks_stake_delegations_fork_ids( banks, bank, stake_delegations_fork_ids );
   fd_stake_history_t   stake_delegations_history_[1];
   fd_stake_history_t * stake_delegations_history = fd_sysvar_cache_stake_history_view( &bank->f.sysvar_cache, stake_delegations_history_ );
 
@@ -644,13 +732,12 @@ fd_runtime_process_new_epoch( fd_banks_t *         banks,
   if( FD_UNLIKELY( !stake_delegations ) ) {
     FD_LOG_CRIT(( "stake_delegations is NULL" ));
   }
-  fd_stake_delegations_frontier_query_begin( stake_delegations,
-                                             bank->f.epoch,
-                                             stake_delegations_history,
-                                             &bank->f.warmup_cooldown_rate_epoch,
-                                             FD_FEATURE_ACTIVE_BANK( bank, upgrade_bpf_stake_program_to_v5_1 ),
-                                             stake_delegations_fork_ids,
-                                             stake_delegations_fork_id_cnt );
+  fd_stake_delegations_view_begin( stake_delegations,
+                                   bank->f.epoch,
+                                   stake_delegations_history,
+                                   &bank->f.warmup_cooldown_rate_epoch,
+                                   FD_FEATURE_ACTIVE_BANK( bank, upgrade_bpf_stake_program_to_v5_1 ),
+                                   bank->stake_delegations_fork_id );
 
   /* Wipe WARMED tags awarded under the old floating point math when the
      fixed point math activates.  This will force all the effective
@@ -667,8 +754,8 @@ fd_runtime_process_new_epoch( fd_banks_t *         banks,
      after it, unless some extremely sparse epochs happen after
      activation.  Tags are only used at boundaries for now, and this
      runs before any use. */
-  if( FD_UNLIKELY( FD_FEATURE_ACTIVE_BANK( bank, upgrade_bpf_stake_program_to_v5_1 ) && stake_delegations->fp_warmed_awarded ) ) {
-    fd_stake_delegations_invalidate_warmed( stake_delegations );
+  if( FD_UNLIKELY( FD_FEATURE_ACTIVE_BANK( bank, upgrade_bpf_stake_program_to_v5_1 ) ) ) {
+    fd_stake_delegations_invalidate_warmed( stake_delegations, 0 );
   }
 
   fd_stakes_activate_epoch( bank, runtime_stack, accdb, capture_ctx, stake_delegations,
@@ -691,12 +778,10 @@ fd_runtime_process_new_epoch( fd_banks_t *         banks,
      reward partitions have been calculated. */
   fd_stake_history_ensure_rent_exempt( bank, accdb, capture_ctx );
 
-  fd_stake_delegations_frontier_query_end( stake_delegations,
-                                           stake_delegations_history,
-                                           &bank->f.warmup_cooldown_rate_epoch,
-                                           FD_FEATURE_ACTIVE_BANK( bank, upgrade_bpf_stake_program_to_v5_1 ),
-                                           stake_delegations_fork_ids,
-                                           stake_delegations_fork_id_cnt );
+  fd_stake_delegations_view_end( stake_delegations,
+                                 stake_delegations_history,
+                                 &bank->f.warmup_cooldown_rate_epoch,
+                                 FD_FEATURE_ACTIVE_BANK( bank, upgrade_bpf_stake_program_to_v5_1 ) );
 
   /* The Agave client handles updating their stakes cache with a call to
      update_epoch_stakes() which keys stakes by the leader schedule
@@ -720,8 +805,7 @@ fd_runtime_process_new_epoch( fd_banks_t *         banks,
 }
 
 static void
-fd_runtime_block_pre_execute_process_new_epoch( fd_banks_t *         banks,
-                                                fd_bank_t *          bank,
+fd_runtime_block_pre_execute_process_new_epoch( fd_bank_t *          bank,
                                                 fd_accdb_t *         accdb,
                                                 fd_capture_ctx_t *   capture_ctx,
                                                 fd_runtime_stack_t * runtime_stack,
@@ -741,13 +825,13 @@ fd_runtime_block_pre_execute_process_new_epoch( fd_banks_t *         banks,
 
     if( FD_UNLIKELY( prev_epoch<new_epoch || !slot_idx ) ) {
       FD_LOG_DEBUG(( "Epoch boundary starting" ));
-      fd_runtime_process_new_epoch( banks, bank, accdb, capture_ctx, prev_epoch, runtime_stack );
+      fd_runtime_process_new_epoch( bank, accdb, capture_ctx, prev_epoch, runtime_stack );
       *is_epoch_boundary = 1;
     } else {
       *is_epoch_boundary = 0;
     }
 
-    fd_distribute_partitioned_epoch_rewards( banks, bank, accdb, runtime_stack, capture_ctx );
+    fd_distribute_partitioned_epoch_rewards( bank, accdb, runtime_stack, capture_ctx );
   } else {
     *is_epoch_boundary = 0;
   }
@@ -866,7 +950,7 @@ fd_runtime_block_execute_prepare( fd_banks_t *         banks,
     }
   }
 
-  fd_runtime_block_pre_execute_process_new_epoch( banks, bank, accdb, capture_ctx, runtime_stack, is_epoch_boundary );
+  fd_runtime_block_pre_execute_process_new_epoch( bank, accdb, capture_ctx, runtime_stack, is_epoch_boundary );
 
   if( FD_LIKELY( bank->f.slot ) ) {
     fd_cost_tracker_t * cost_tracker = fd_bank_cost_tracker_modify( bank );
@@ -1108,7 +1192,8 @@ fd_runtime_pre_execute_check( fd_runtime_t *      runtime,
    given an account that might have been updated. */
 
 static void
-fd_runtime_lthash_account( fd_bank_t *         bank,
+fd_runtime_lthash_account( fd_runtime_t *      runtime,
+                           fd_bank_t *         bank,
                            fd_pubkey_t const * pubkey,
                            fd_acc_t *          acc,
                            fd_capture_ctx_t *  capture_ctx ) {
@@ -1116,6 +1201,17 @@ fd_runtime_lthash_account( fd_bank_t *         bank,
     acc->data_len   = 0UL;
     acc->executable = 0;
     memset( acc->owner, 0, sizeof(acc->owner) );
+  }
+
+  if( FD_UNLIKELY( acc->prior_data &&
+                   acc->lamports==acc->prior_lamports &&
+                   acc->data_len==acc->prior_data_len &&
+                   (!!acc->executable)==(!!acc->prior_executable) &&
+                   !memcmp( acc->owner, acc->prior_owner, sizeof(acc->owner) ) &&
+                   !memcmp( acc->data,  acc->prior_data,  acc->data_len ) ) ) {
+    runtime->metrics.lthash_unchanged_cnt++;
+    if( FD_LIKELY( acc->lamports ) ) fd_hashes_capture_account( pubkey->uc, acc->owner, acc->lamports, acc->executable, acc->data, acc->data_len, bank, capture_ctx );
+    return;
   }
 
   fd_lthash_value_t lthash_prev[1];
@@ -1152,6 +1248,9 @@ fd_runtime_commit_txn( fd_runtime_t *      runtime,
          payer account. */
       if( FD_UNLIKELY( !txn_out->accounts.is_writable[ i ] ) ) continue;
 
+      /* https://github.com/anza-xyz/agave/blob/v4.2.0-beta.1/runtime/src/account_saver.rs#L120-L122 */
+      if( FD_UNLIKELY( !txn_out->accounts.touched[ i ] ) ) continue;
+
       fd_pubkey_t const * pubkey = &txn_out->accounts.keys[ i ];
 
       /* Only the txn that owns the accdb reference commits the account
@@ -1181,7 +1280,7 @@ fd_runtime_commit_txn( fd_runtime_t *      runtime,
         }
       }
 
-      fd_runtime_lthash_account( bank, pubkey, account, runtime->log.capture_ctx );
+      fd_runtime_lthash_account( runtime, bank, pubkey, account, runtime->log.capture_ctx );
     }
 
     /* Atomically add all accumulated tips to the bank once after
@@ -1246,7 +1345,7 @@ fd_runtime_commit_txn( fd_runtime_t *      runtime,
       }
       nonce_account->executable = nonce_account->prior_executable;
       nonce_account->commit = 1;
-      fd_runtime_lthash_account( bank, &txn_out->accounts.keys[ txn_out->accounts.nonce_idx_in_txn ], nonce_account, runtime->log.capture_ctx );
+      fd_runtime_lthash_account( runtime, bank, &txn_out->accounts.keys[ txn_out->accounts.nonce_idx_in_txn ], nonce_account, runtime->log.capture_ctx );
     }
 
     /* Now, we must only save the fee payer if the nonce account was not
@@ -1260,7 +1359,7 @@ fd_runtime_commit_txn( fd_runtime_t *      runtime,
       fee_payer_account->executable = fee_payer_account->prior_executable;
 
       fee_payer_account->commit = 1;
-      fd_runtime_lthash_account( bank, &txn_out->accounts.keys[ FD_FEE_PAYER_TXN_IDX ], fee_payer_account, runtime->log.capture_ctx );
+      fd_runtime_lthash_account( runtime, bank, &txn_out->accounts.keys[ FD_FEE_PAYER_TXN_IDX ], fee_payer_account, runtime->log.capture_ctx );
     }
   }
 
@@ -1338,14 +1437,15 @@ fd_runtime_new_txn_out( fd_txn_in_t const * txn_in,
 
   fd_hash_t * blockhash = (fd_hash_t *)((uchar *)txn_in->txn->payload + TXN( txn_in->txn )->recent_blockhash_off);
   memcpy( txn_out->details.blockhash.uc, blockhash->hash, sizeof(fd_hash_t) );
+  memset( txn_out->details.blake_txn_msg_hash.uc, 0, sizeof(fd_hash_t) );
 
   txn_out->accounts.is_setup           = 0;
   txn_out->accounts.is_bundle          = txn_in->bundle.is_bundle;
   if( FD_LIKELY( !txn_in->bundle.is_bundle ) ) txn_out->accounts.cnt= 0UL;
 
-  FD_STATIC_ASSERT( offsetof(fd_txn_out_t, accounts.rm_vote)-offsetof(fd_txn_out_t, accounts.stake_update)==3UL*MAX_TX_ACCOUNT_LOCKS, txn_out_flags_contiguous );
+  FD_STATIC_ASSERT( offsetof(fd_txn_out_t, accounts.touched)-offsetof(fd_txn_out_t, accounts.stake_update)==4UL*MAX_TX_ACCOUNT_LOCKS, txn_out_flags_contiguous );
   memset( txn_out->accounts.is_writable,  0, sizeof(txn_out->accounts.is_writable) );
-  memset( txn_out->accounts.stake_update, 0, 4UL*MAX_TX_ACCOUNT_LOCKS );
+  memset( txn_out->accounts.stake_update, 0, 5UL*MAX_TX_ACCOUNT_LOCKS );
   txn_out->accounts.nonce_idx_in_txn            = ULONG_MAX;
 
   /* For bundle transactions the resolved key list is bound once up
@@ -1577,8 +1677,7 @@ fd_runtime_init_bank_from_genesis( fd_banks_t *         banks,
           stake_state->stake.stake.delegation.deactivation_epoch,
           stake_state->stake.stake.credits_observed,
           account->lamports,
-          (uint)account->data_len,
-          FD_STAKE_DELEGATIONS_WARMUP_COOLDOWN_RATE_ENUM_025 /* genesis is epoch 0, always 0.25 */ );
+          (uint)account->data_len );
     }
   }
 
@@ -1635,7 +1734,12 @@ fd_runtime_init_bank_from_genesis( fd_banks_t *         banks,
 
       fd_vote_stakes_iter_ele( vote_stakes, fork_id, FD_VOTE_STAKES_ITER_T_1, iter, &pubkey, &node_account, &stake,
                                NULL, NULL, &commission, NULL, NULL, bls_key, NULL );
+      ushort block_revenue_commission_bps;
+      ulong  pending_delegator_rewards;
+      fd_vote_stakes_iter_block_revenue( vote_stakes, fork_id, FD_VOTE_STAKES_ITER_T_1, iter,
+                                         &block_revenue_commission_bps, &pending_delegator_rewards );
       fd_vote_stakes_snap_insert_t_2( vote_stakes, fork_id, &pubkey, &node_account, stake, commission, bls_key );
+      fd_vote_stakes_set_block_revenue_t_2( vote_stakes, fork_id, &pubkey, block_revenue_commission_bps, pending_delegator_rewards );
     }
     /* A chain may activate Alpenglow in genesis.  Epoch 0 does not
        cross an epoch boundary, so assign ranks to the copied t-2 set
@@ -2049,23 +2153,25 @@ fd_runtime_prepare_bundle_accounts( fd_runtime_t *      runtime,
       txn_out->accounts.account[ j ]          = NULL;
       txn_out->accounts.account_acquired[ j ] = 0U;
     }
-    if( FD_UNLIKELY( err!=FD_RUNTIME_EXECUTE_SUCCESS ) ) return err;
-
     /* Validate account locks before the union acquire below, bounding
        the deduped set within the accdb acquire limit. */
-    err = fd_executor_validate_account_locks( txn_out );
-    if( FD_UNLIKELY( err!=FD_RUNTIME_EXECUTE_SUCCESS ) ) return err;
+    if( FD_LIKELY( err==FD_RUNTIME_EXECUTE_SUCCESS ) ) err = fd_executor_validate_account_locks( txn_out );
+    if( FD_UNLIKELY( err!=FD_RUNTIME_EXECUTE_SUCCESS ) ) {
+      txn_out->err.txn_err = err;
+      return err;
+    }
 
+    uint bpf_upgradeable = fd_txn_account_has_bpf_loader_upgradeable( txn_out->accounts.keys, txn_out->accounts.cnt );
     for( ushort j=0; j<txn_out->accounts.cnt; j++ ) {
       fd_pubkey_t const * key = &txn_out->accounts.keys[ j ];
+      int writable = fd_runtime_account_is_writable_idx_flat( j, key, TXN( txn_in->txn ), bpf_upgradeable );
       int dup = 0;
-      for( ulong k=0UL; k<acquire_cnt; k++ ) if( FD_UNLIKELY( !memcmp( acquire_pubkeys[ k ], key->uc, 32UL ) ) ) { dup = 1; break; }
+      for( ulong k=0UL; k<acquire_cnt; k++ ) if( FD_UNLIKELY( !memcmp( acquire_pubkeys[ k ], key->uc, 32UL ) ) ) { acquire_writable[ k ] |= writable; dup = 1; break; }
       if( FD_UNLIKELY( dup ) ) continue;
       FD_TEST( acquire_cnt<FD_BUNDLE_ACCT_MAX );
       acquire_pubkeys [ acquire_cnt ] = key->uc;
-      /* Bundle accounts are always acquired writable so that a later
-        txn can cleanly upgrade a read permission to a write. */
-      acquire_writable[ acquire_cnt ] = 1;
+      /* Acquire writable if any bundle member can write this account. */
+      acquire_writable[ acquire_cnt ] = writable;
       acquire_cnt++;
     }
   }
@@ -2097,7 +2203,6 @@ fd_runtime_prepare_bundle_accounts( fd_runtime_t *      runtime,
 
   fd_pubkey_t   programdata_keys[ FD_BUNDLE_ACCT_MAX ];
   uchar const * pd_pubkeys      [ FD_BUNDLE_ACCT_MAX ];
-  int           pd_writable     [ FD_BUNDLE_ACCT_MAX ];
   ulong         pd_cnt = 0UL;
 
   FD_TEST( bank->parent_accdb_fork_id.val!=USHORT_MAX );
@@ -2125,7 +2230,6 @@ fd_runtime_prepare_bundle_accounts( fd_runtime_t *      runtime,
     FD_TEST( pd_cnt<FD_BUNDLE_ACCT_MAX );
     programdata_keys[ pd_cnt ] = *programdata_key;
     pd_pubkeys[ pd_cnt ]       = programdata_keys[ pd_cnt ].uc;
-    pd_writable[ pd_cnt ]      = 0;
     pd_cnt++;
   }
 
@@ -2134,7 +2238,7 @@ fd_runtime_prepare_bundle_accounts( fd_runtime_t *      runtime,
     programdata.  Skip it entirely for an empty bundle (nothing was
     reserved and nothing is executable). */
   if( FD_LIKELY( acquire_cnt || pd_cnt ) ) {
-    fd_accdb_acquire_b( runtime->accdb, bank->parent_accdb_fork_id, acquire_cnt, pd_cnt, pd_pubkeys, pd_writable, runtime->accounts.executable );
+    fd_accdb_acquire_b( runtime->accdb, bank->parent_accdb_fork_id, acquire_cnt, pd_cnt, pd_pubkeys, runtime->accounts.executable );
   }
   runtime->accounts.executable_cnt = pd_cnt;
 

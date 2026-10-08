@@ -223,6 +223,30 @@ fd_ed25519_point_frombytes_2x( fd_ed25519_point_t * r1,
   return 0;
 }
 
+int
+fd_ed25519_point_frombytes_1x( fd_ed25519_point_t * r,
+                               uchar const          buf[ 32 ] ) {
+  return fd_ed25519_point_frombytes( r, buf ) ? 0 : -1;
+}
+
+void
+fd_ed25519_point_decode_init( fd_ed25519_point_decode_t * st,
+                              uchar const                 buf[ 32 ] ) {
+  memcpy( st->buf, buf, 32UL );
+}
+
+void
+fd_ed25519_point_decode_step( fd_ed25519_point_decode_t * st,
+                              ulong                       n ) {
+  (void)st; (void)n;
+}
+
+int
+fd_ed25519_point_decode_fini( fd_ed25519_point_t *        r,
+                              fd_ed25519_point_decode_t * st ) {
+  return fd_ed25519_point_frombytes_1x( r, st->buf );
+}
+
 /*
   Affine (only for init(), can be slow)
 */

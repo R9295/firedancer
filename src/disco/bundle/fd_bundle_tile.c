@@ -21,6 +21,7 @@
 #include "../../waltz/resolv/fd_netdb.h"
 #include "../../discof/replay/fd_replay_tile.h"
 
+#include <linux/futex.h>
 #include "generated/fd_bundle_tile_seccomp.h"
 
 #define IN_KIND_REPLAY_OUT (1)
@@ -228,6 +229,12 @@ after_frag( fd_bundle_tile_t *  ctx,
   }
 }
 
+static long
+next_deadline( fd_bundle_tile_t * ctx ) {
+  if( FD_UNLIKELY( ctx->halt_signing || ctx->sleep_mode || ctx->next_step_deadline==LONG_MAX ) ) return LONG_MAX;
+  return fd_clock_tile_wallclock_to_tickcount( ctx->clock, ctx->next_step_deadline );
+}
+
 static void
 before_credit( fd_bundle_tile_t *  ctx,
                fd_stem_context_t * stem,
@@ -236,14 +243,19 @@ before_credit( fd_bundle_tile_t *  ctx,
     ctx->stem = stem;
   }
 
-  if( FD_UNLIKELY( ctx->halt_signing ) ) return;
-
-  if( FD_UNLIKELY( ctx->sleep_mode ) ) {
-    if( ctx->tcp_sock>=0 ) {
+  if( FD_UNLIKELY( ctx->halt_signing || ctx->sleep_mode ) ) {
+    if( ctx->sleep_mode && ctx->tcp_sock>=0 ) {
       fd_bundle_client_reset( ctx );
       /* Override backoff so we don't treat this as an error */
       ctx->backoff_until = 0;
       ctx->backoff_iter  = 0;
+    }
+    /* The socket is closed so any wake (even one that raced the close)
+       is stale: drain it or the stem never parks, and rearm so the next
+       connection can wake us. */
+    if( FD_UNLIKELY( fd_fseq_query( ctx->waker_fseq )==1UL ) ) {
+      fd_fseq_update( ctx->waker_fseq, 0UL );
+      fd_waker_client_rearm( ctx->waker_client_idx );
     }
     return;
   }
@@ -282,12 +294,12 @@ after_credit( fd_bundle_tile_t *  ctx,
 
       fd_txn_m_t * txnm = fd_chunk_to_laddr( ctx->verify_out.mem, ctx->verify_out.chunk );
       *txnm = (fd_txn_m_t) {
-        .reference_slot = 0UL,
-        .payload_sz     = txn->payload_sz,
-        .txn_t_sz       = 0U,
-        .source_ipv4    = txn->source_ipv4,
-        .source_tpu     = FD_TXN_M_TPU_SOURCE_BUNDLE,
-        .first_seen_nanos = txn->first_seen_nanos,
+        .reference_block_height = 0UL,
+        .payload_sz             = txn->payload_sz,
+        .txn_t_sz               = 0U,
+        .source_ipv4            = txn->source_ipv4,
+        .source_tpu             = FD_TXN_M_TPU_SOURCE_BUNDLE,
+        .first_seen_nanos       = txn->first_seen_nanos,
         .block_engine   = {
           .bundle_id      = txn->bundle_seq,
           .bundle_txn_cnt = txn->bundle_txn_cnt,
@@ -544,6 +556,12 @@ unprivileged_init( fd_topo_t const *      topo,
   if( FD_UNLIKELY( sign_out_idx==ULONG_MAX ) ) FD_LOG_ERR(( "Missing bundle_sign link" ));
   fd_topo_link_t const * sign_out = &topo->links[ tile->out_link_id[ sign_out_idx ] ];
 
+  fd_sleep_t * sleep = NULL;
+  if( FD_UNLIKELY( topo->sleep_obj_id!=ULONG_MAX ) ) {
+    sleep = fd_sleep_join( fd_topo_obj_laddr( topo, topo->sleep_obj_id ) );
+    FD_TEST( sleep );
+  }
+
   if( FD_UNLIKELY( !fd_keyguard_client_join( fd_keyguard_client_new(
       ctx->keyguard_client,
       sign_out->mcache,
@@ -551,7 +569,10 @@ unprivileged_init( fd_topo_t const *      topo,
       sign_in->mcache,
       sign_in->dcache,
       sign_out->mtu,
-      sign_in->mtu
+      sign_in->mtu,
+      sleep,
+      sign_out->id,
+      fd_topo_find_link_consumer( topo, sign_out )
   ) ) ) ) {
     FD_LOG_ERR(( "fd_keyguard_client_join failed" )); /* unreachable */
   }
@@ -594,7 +615,7 @@ unprivileged_init( fd_topo_t const *      topo,
     if( FD_UNLIKELY( !tile->in_link_poll[ i ] ) ) continue;
 
     fd_topo_link_t const * link = &topo->links[ tile->in_link_id[ i ] ];
-    if( !strcmp( link->name, "replay_out" ) ) {
+    if( !strcmp( link->name, "replay_slot" ) ) {
       ctx->in_kind[ polled_in_idx ] = IN_KIND_REPLAY_OUT;
       fd_topo_wksp_t const * link_wksp = &topo->workspaces[ topo->objs[ link->dcache_obj_id ].wksp_id ];
       ctx->replay_in.mem    = link_wksp->wksp;
@@ -675,6 +696,7 @@ populate_allowed_fds( fd_topo_t const *      topo,
 #define STEM_CALLBACK_CONTEXT_ALIGN alignof(fd_bundle_tile_t)
 
 #define STEM_CALLBACK_DURING_HOUSEKEEPING fd_bundle_tile_housekeeping
+#define STEM_CALLBACK_NEXT_DEADLINE       next_deadline
 #define STEM_CALLBACK_METRICS_WRITE       metrics_write
 #define STEM_CALLBACK_DURING_FRAG         during_frag
 #define STEM_CALLBACK_AFTER_FRAG          after_frag

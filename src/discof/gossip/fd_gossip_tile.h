@@ -6,8 +6,8 @@
 #include "../../disco/fd_clock_tile.h"
 #include "../../flamenco/gossip/fd_gossip.h"
 #include "../../flamenco/runtime/fd_runtime_const.h"
-#include "../../disco/keyguard/fd_keyguard_client.h"
 #include "../../disco/keyguard/fd_keyswitch.h"
+#include "../../disco/gui/fd_gui_gossip_bw.h"
 
 typedef struct {
   int         kind;
@@ -38,23 +38,32 @@ struct fd_gossip_tile_ctx {
 
   uchar gossvf_staged[ FD_GOSSIP_GOSSVF_MTU ] __attribute__((aligned(128)));
 
+  ulong gui_bw_seed;
   uint  rng_seed;
   ulong rng_idx;
+  uchar ping_seed[ 32 ];
 
   fd_clock_tile_t clock[1];
+
+  int has_gui;
+  fd_gui_gossip_bw_t * gui_bw;
 
   fd_gossip_in_ctx_t in[ 128UL ];
 
   fd_gossip_out_ctx_t net_out[ 1 ];
-  fd_gossip_out_ctx_t gossip_out[ 1 ];
+  fd_gossip_out_ctx_t update_out[ FD_GOSSIP_UPDATE_LINK_CNT ]; /* gossip_ciaddr, gossip_ciseen, gossip_vote, gossip_misc */
   fd_gossip_out_ctx_t gossvf_out[ 1 ];
   fd_gossip_out_ctx_t sign_out[ 1 ];
   fd_gossip_out_ctx_t gossip_wfs[ 1 ];
+  fd_gossip_out_ctx_t gui_out[ 1 ];
 
-  fd_keyguard_client_t keyguard_client[ 1 ];
+  ulong sign_out_mtu;
+  uchar sign_staged[ 64UL ];
+
   fd_keyswitch_t *     keyswitch;
   int                  is_halting_signing;
   int                  is_pending_set_identity;
+  ulong                txsend_in_seq;
 
   ushort            net_id;
   fd_ip4_udp_hdrs_t net_out_hdr[ 1 ];
@@ -85,7 +94,7 @@ struct fd_gossip_tile_ctx {
   /* Peer table saturation detection.  We track the high-water mark
      of the peer count (staked + unstaked).  When the count stops
      increasing for FD_GOSSIP_PEER_SAT_QUIET_NS and at least one
-     peer is present, we publish PEER_SATURATED on gossip_out. */
+     peer is present, we publish PEER_SATURATED on gossip_ciaddr. */
   ulong peer_sat_hwm;        /* high-water mark of peer count       */
   long  peer_sat_hwm_nanos;  /* wallclock when HWM last increased   */
   int   peer_sat_published;  /* one-shot latch (0 -> 1)             */

@@ -14,8 +14,9 @@
 #define IN_KIND_SHRED_NET    (2)
 #define IN_KIND_REPLAY_OUT   (3)
 
-#define OUT_IDX_GOSSIP_OUT   (0)
-#define OUT_IDX_NET_SHRED    (1)
+#define OUT_IDX_GOSSIP_CI    (0)
+#define OUT_IDX_GOSSIP_MISC  (1)
+#define OUT_IDX_NET_SHRED    (2)
 
 #define FD_FORKT_DRAIN_PAIRS_MAX (512UL)
 
@@ -290,7 +291,7 @@ unprivileged_init( fd_topo_t const *      topo,
     if     ( FD_LIKELY( !strcmp( link->name, "replay_epoch" ) ) ) ctx->in[ i ].kind = IN_KIND_REPLAY_EPOCH;
     else if( FD_LIKELY( !strcmp( link->name, "tower_out"    ) ) ) ctx->in[ i ].kind = IN_KIND_TOWER_OUT;
     else if( FD_LIKELY( !strcmp( link->name, "shred_net"    ) ) ) ctx->in[ i ].kind = IN_KIND_SHRED_NET;
-    else if( FD_LIKELY( !strcmp( link->name, "replay_out"   ) ) ) ctx->in[ i ].kind = IN_KIND_REPLAY_OUT;
+    else if( FD_LIKELY( !strcmp( link->name, "replay_slot"  ) ) ) ctx->in[ i ].kind = IN_KIND_REPLAY_OUT;
     else FD_LOG_ERR(( "forkt tile has unexpected input link %lu %s", i, link->name ));
 
     if( FD_LIKELY( link->mtu ) ) {
@@ -305,8 +306,9 @@ unprivileged_init( fd_topo_t const *      topo,
     fd_topo_link_t const * out_link = &topo->links[ tile->out_link_id[ i ] ];
     fd_topo_wksp_t const * out_wksp = &topo->workspaces[ topo->objs[ out_link->dcache_obj_id ].wksp_id ];
 
-    if     ( FD_LIKELY( !strcmp( out_link->name, "gossip_out" ) ) ) FD_TEST( i==OUT_IDX_GOSSIP_OUT );
-    else if( FD_LIKELY( !strcmp( out_link->name, "net_shred"  ) ) ) FD_TEST( i==OUT_IDX_NET_SHRED   );
+    if     ( FD_LIKELY( !strcmp( out_link->name, "gossip_ciaddr" ) ) ) FD_TEST( i==OUT_IDX_GOSSIP_CI   );
+    else if( FD_LIKELY( !strcmp( out_link->name, "gossip_misc"   ) ) ) FD_TEST( i==OUT_IDX_GOSSIP_MISC );
+    else if( FD_LIKELY( !strcmp( out_link->name, "net_shred"   ) ) ) FD_TEST( i==OUT_IDX_NET_SHRED   );
     else FD_LOG_ERR(( "forkt tile has unexpected output link %lu %s", i, out_link->name ));
 
     ctx->out[ i ].wksp   = out_wksp->wksp;

@@ -13,9 +13,12 @@ mock_query_voters( fd_tower_tile_t *            ctx,
 }
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 
 /* mock_vote_txn builds a vote transaction from a tower.  Constructs an
    fd_tower_t with the given (slot, conf) pairs, serializes it via
@@ -160,6 +163,320 @@ test_publish_slot_done_identity_mismatch( void ) {
   fd_wksp_delete( fd_wksp_leave( wksp ) );
 
   FD_LOG_NOTICE(( "pass: test_publish_slot_done_identity_mismatch" ));
+}
+
+static void
+test_identity_switch_waits_for_replay( void ) {
+  static fd_tower_tile_t ctx[1];
+  static fd_keyswitch_t  identity_keyswitch[1];
+  static fd_keyswitch_t  auth_vtr_keyswitch[1];
+  static uchar           tower_mem    [ 65536 ] __attribute__((aligned(128)));
+  static uchar           publishes_mem[ 65536 ] __attribute__((aligned(128)));
+
+  fd_pubkey_t old_identity = { .ul = { 0x11UL } };
+  fd_pubkey_t new_identity = { .ul = { 0x22UL } };
+
+  memset( ctx,                0, sizeof(*ctx) );
+  memset( identity_keyswitch, 0, sizeof(*identity_keyswitch) );
+  memset( auth_vtr_keyswitch, 0, sizeof(*auth_vtr_keyswitch) );
+  memset( publishes_mem,      0, sizeof(publishes_mem) );
+
+  ctx->identity_key       [0] = old_identity;
+  ctx->identity_keyswitch     = identity_keyswitch;
+  ctx->auth_vtr_keyswitch     = auth_vtr_keyswitch;
+  ctx->tower                   = fd_tower_join( fd_tower_new( tower_mem, 2UL, 2UL, 0UL ) );
+  ctx->publishes               = publishes_join( publishes_new( publishes_mem, 2UL ) );
+  identity_keyswitch->param    = 1UL;
+  identity_keyswitch->result   = ULONG_MAX;
+  memcpy( identity_keyswitch->bytes, &new_identity, sizeof(new_identity) );
+  fd_keyswitch_state( identity_keyswitch, FD_KEYSWITCH_STATE_SWITCH_PENDING );
+
+  during_housekeeping( ctx );
+
+  FD_TEST( fd_keyswitch_state_query( identity_keyswitch )==FD_KEYSWITCH_STATE_SWITCH_PENDING );
+  FD_TEST( !ctx->halt_signing );
+  FD_TEST( fd_pubkey_eq( ctx->identity_key, &old_identity ) );
+  FD_TEST( identity_keyswitch->result==ULONG_MAX );
+
+  ctx->in_kind[ 0 ] = IN_KIND_REPLAY;
+  FD_TEST( before_frag( ctx, 0UL, 0UL, REPLAY_SIG_RESET ) );
+  FD_TEST( ctx->replay_in_seq==1UL );
+
+  during_housekeeping( ctx );
+  FD_TEST( fd_keyswitch_state_query( identity_keyswitch )==FD_KEYSWITCH_STATE_COMPLETED );
+  FD_TEST( ctx->halt_signing );
+  FD_TEST( fd_pubkey_eq( ctx->identity_key, &new_identity ) );
+
+  FD_LOG_NOTICE(( "pass: test_identity_switch_waits_for_replay" ));
+}
+
+static void
+test_halt_signing_backpressures_replay( void ) {
+  static fd_tower_tile_t ctx[1];
+  memset( ctx, 0, sizeof(*ctx) );
+
+  ctx->halt_signing          = 1;
+  ctx->replay_in_seq         = 7UL;
+  ctx->in_kind[ 0 ]          = IN_KIND_REPLAY;
+  ctx->in[ 0 ].mcache_only   = 1;
+
+  /* Authorized-voter removal has no Replay barrier and relies on this
+     fragment remaining unconsumed until signing is unhalted. */
+  FD_TEST( returnable_frag( ctx, 0UL, 7UL, REPLAY_SIG_SLOT_COMPLETED,
+                            0UL, 0UL, 0UL, 0UL, 0UL, NULL )==1 );
+  FD_TEST( ctx->replay_in_seq==7UL );
+
+  FD_LOG_NOTICE(( "pass: test_halt_signing_backpressures_replay" ));
+}
+
+static void
+test_identity_switch_waits_for_publishes( void ) {
+  static fd_tower_tile_t ctx[1];
+  static fd_keyswitch_t  identity_keyswitch[1];
+  static fd_keyswitch_t  auth_vtr_keyswitch[1];
+  static uchar           tower_mem    [ 65536 ] __attribute__((aligned(128)));
+  static uchar           publishes_mem[ 65536 ] __attribute__((aligned(128)));
+
+  fd_pubkey_t old_identity = { .ul = { 0x11UL } };
+  fd_pubkey_t new_identity = { .ul = { 0x22UL } };
+
+  memset( ctx,                0, sizeof(*ctx) );
+  memset( identity_keyswitch, 0, sizeof(*identity_keyswitch) );
+  memset( auth_vtr_keyswitch, 0, sizeof(*auth_vtr_keyswitch) );
+  memset( publishes_mem,      0, sizeof(publishes_mem) );
+
+  ctx->identity_key       [0] = old_identity;
+  ctx->identity_keyswitch     = identity_keyswitch;
+  ctx->auth_vtr_keyswitch     = auth_vtr_keyswitch;
+  ctx->tower                   = fd_tower_join( fd_tower_new( tower_mem, 2UL, 2UL, 0UL ) );
+  ctx->publishes               = publishes_join( publishes_new( publishes_mem, 2UL ) );
+  ctx->out_seq                 = 42UL;
+  identity_keyswitch->result   = ULONG_MAX;
+  memcpy( identity_keyswitch->bytes, &new_identity, sizeof(new_identity) );
+  fd_keyswitch_state( identity_keyswitch, FD_KEYSWITCH_STATE_SWITCH_PENDING );
+
+  publishes_push_head( ctx->publishes, (publish_t){ .sig = FD_TOWER_SIG_SLOT_DONE } );
+  during_housekeeping( ctx );
+
+  FD_TEST( ctx->halt_signing );
+  FD_TEST( fd_keyswitch_state_query( identity_keyswitch )==FD_KEYSWITCH_STATE_SWITCH_PENDING );
+  FD_TEST( fd_pubkey_eq( ctx->identity_key, &old_identity ) );
+  FD_TEST( identity_keyswitch->result==ULONG_MAX );
+
+  publishes_pop_head_nocopy( ctx->publishes );
+  during_housekeeping( ctx );
+
+  FD_TEST( fd_keyswitch_state_query( identity_keyswitch )==FD_KEYSWITCH_STATE_COMPLETED );
+  FD_TEST( fd_pubkey_eq( ctx->identity_key, &new_identity ) );
+  FD_TEST( identity_keyswitch->result==42UL );
+
+  FD_LOG_NOTICE(( "pass: test_identity_switch_waits_for_publishes" ));
+}
+
+/* Banks with a single root bank at index 0, whose sysvar cache is
+   empty. */
+
+static fd_banks_t *
+test_banks( void ) {
+  static uchar        mem[ 1UL<<25 ] __attribute__((aligned(FD_BANKS_ALIGN)));
+  static fd_banks_t * banks;
+  if( FD_LIKELY( banks ) ) return banks;
+  FD_TEST( fd_banks_footprint( 1UL, 1UL, 8UL, 8UL )<=sizeof(mem) );
+  banks = fd_banks_join( fd_banks_new( mem, FD_STAKE_DELEGATIONS_FD, 1UL, 1UL, 8UL, 128UL, 8UL, 0UL, 42UL ) );
+  FD_TEST( banks );
+  FD_TEST( fd_banks_init_bank( banks )->idx==0UL );
+  return banks;
+}
+
+/* Blocks 100 <- 101 <- 102 <- 104 <- 105 (slot 103 skipped), root 100,
+   and our own unsent votes for 101 and 105. */
+
+static fd_tower_tile_t *
+adopt_setup( void ) {
+  static fd_tower_tile_t ctx[1];
+  static fd_keyswitch_t  identity_keyswitch[1];
+  static fd_keyswitch_t  auth_vtr_keyswitch[1];
+  static uchar           tower_mem    [ 1UL<<20                 ] __attribute__((aligned(128)));
+  static uchar           scratch_mem  [ FD_TOWER_VOTE_FOOTPRINT ] __attribute__((aligned(FD_TOWER_VOTE_ALIGN)));
+  static uchar           publishes_mem[ 65536                   ] __attribute__((aligned(128)));
+  static void *          ghost_mem;
+
+  if( FD_UNLIKELY( !ghost_mem ) ) {
+    fd_wksp_t * wksp = fd_wksp_new_anonymous( FD_SHMEM_NORMAL_PAGE_SZ, 64UL, 0UL, "adopt_test", 0UL );
+    FD_TEST( wksp );
+    ghost_mem = fd_wksp_alloc_laddr( wksp, fd_ghost_align(), fd_ghost_footprint( 8UL, 2UL ), 1UL );
+    FD_TEST( ghost_mem );
+  }
+
+  memset( ctx,                0, sizeof(*ctx) );
+  memset( identity_keyswitch, 0, sizeof(*identity_keyswitch) );
+  memset( auth_vtr_keyswitch, 0, sizeof(*auth_vtr_keyswitch) );
+  ctx->identity_keyswitch = identity_keyswitch;
+  ctx->auth_vtr_keyswitch = auth_vtr_keyswitch;
+  ctx->banks              = test_banks();
+  ctx->tower              = fd_tower_join( fd_tower_new( tower_mem, 32UL, 1UL, 0UL ) );
+  ctx->scratch_tower      = fd_tower_vote_join( fd_tower_vote_new( scratch_mem ) );
+  ctx->publishes          = publishes_join( publishes_new( publishes_mem, 2UL ) );
+  ctx->ghost              = fd_ghost_join( fd_ghost_new( ghost_mem, 8UL, 2UL, 0UL ) );
+  FD_TEST( ctx->ghost );
+
+  ulong slots  [ 5 ] = { 100UL,     101UL, 102UL, 104UL, 105UL };
+  ulong parents[ 5 ] = { ULONG_MAX, 100UL, 101UL, 102UL, 104UL };
+  for( ulong i=0UL; i<5UL; i++ ) {
+    fd_tower_blk_t * blk   = fd_tower_blocks_insert( ctx->tower, slots[ i ], parents[ i ] );
+    blk->replayed          = 1;
+    blk->replayed_block_id = (fd_hash_t){ .ul = { slots[ i ] } };
+    blk->bank_hash         = (fd_hash_t){ .ul = { slots[ i ]+1000UL } };
+    if( !i ) fd_ghost_init  ( ctx->ghost, slots[ i ], slots[ i ], &blk->replayed_block_id );
+    else     fd_ghost_insert( ctx->ghost, slots[ i ], slots[ i ], &blk->replayed_block_id, &(fd_hash_t){ .ul = { parents[ i ] } } );
+  }
+  ctx->tower->root = 100UL;
+  fd_tower_vote_push_tail( ctx->tower->votes, (fd_tower_vote_t){ .slot = 101UL, .conf = 2UL } );
+  fd_tower_vote_push_tail( ctx->tower->votes, (fd_tower_vote_t){ .slot = 105UL, .conf = 1UL } );
+  fd_tower_blocks_query( ctx->tower, 101UL )->voted = 1;
+  fd_tower_blocks_query( ctx->tower, 105UL )->voted = 1;
+  return ctx;
+}
+
+static int
+adopt_tower_is( fd_tower_tile_t const * ctx,
+                ulong                   root,
+                ulong                   slot0,
+                ulong                   slot1 ) {
+  return ctx->tower->root==root && fd_tower_vote_cnt( ctx->tower->votes )==2UL &&
+         fd_tower_vote_peek_index_const( ctx->tower->votes, 0UL )->slot==slot0 &&
+         fd_tower_vote_peek_index_const( ctx->tower->votes, 1UL )->slot==slot1;
+}
+
+static int
+adopt_tower_cleared( fd_tower_tile_t const * ctx ) {
+  return ctx->tower->root==100UL && fd_tower_vote_empty( ctx->tower->votes ) && !fd_tower_blocks_query( ctx->tower, 105UL )->voted;
+}
+
+static void
+adopt_switch( fd_tower_tile_t *       ctx,
+              ulong                   identity,
+              fd_tower_file_t const * file ) {
+  fd_pubkey_t key = { .ul = { identity } };
+  memcpy( ctx->identity_keyswitch->bytes, &key, sizeof(key) );
+  FD_STORE( ulong, ctx->identity_keyswitch->bytes+32UL, !!file );
+  if( file ) memcpy( ctx->identity_keyswitch->bytes+40UL, file, sizeof(fd_tower_file_t) );
+  fd_keyswitch_state( ctx->identity_keyswitch, FD_KEYSWITCH_STATE_SWITCH_PENDING );
+  during_housekeeping( ctx );
+  FD_TEST( fd_keyswitch_state_query( ctx->identity_keyswitch )==FD_KEYSWITCH_STATE_COMPLETED );
+}
+
+static void
+test_identity_switch_adopts_vote_history( void ) {
+  fd_tower_file_t history = { .votes = {{ 102UL, 2UL }, { 104UL, 1UL }}, .votes_cnt = 2UL, .root = 101UL, .bank_hash = { .ul = { 1104UL } } };
+
+  /* Switching to a new identity with a history clears our tower, and the
+     next replayed slot adopts the history in place of our newer unsent
+     votes. */
+
+  fd_tower_tile_t * ctx = adopt_setup();
+  adopt_switch( ctx, 0x22UL, &history );
+  FD_TEST( ctx->vote_history_pending && !memcmp( &ctx->vote_history, &history, sizeof(history) ) );
+  FD_TEST( adopt_tower_cleared( ctx ) );
+  check_vote_history( ctx, &(fd_replay_slot_completed_t){ .slot = 105UL } );
+  FD_TEST( !ctx->vote_history_pending && !ctx->tower->wait_to_vote_slot );
+  FD_TEST( adopt_tower_is( ctx, 101UL, 102UL, 104UL ) && fd_tower_blocks_query( ctx->tower, 100UL ) ); /* until ghost publishes 101 */
+  FD_TEST( fd_tower_vote_peek_index_const( ctx->tower->votes, 0UL )->conf==2UL );
+  FD_TEST( fd_tower_blocks_query( ctx->tower, 104UL )->voted && !fd_tower_blocks_query( ctx->tower, 105UL )->voted );
+
+  /* Votes at or below our root are dropped and our root is kept. */
+
+  fd_tower_file_t older = { .votes = {{ 100UL, 3UL }, { 102UL, 2UL }, { 104UL, 1UL }}, .votes_cnt = 3UL, .root = 90UL, .bank_hash = history.bank_hash };
+  ctx = adopt_setup(); clear_votes( ctx->tower ); ctx->vote_history = older; adopt_vote_history( ctx );
+  FD_TEST( adopt_tower_is( ctx, 100UL, 102UL, 104UL ) );
+
+  /* A last vote for a different version of the slot is still adopted,
+     recorded against the version we replayed. */
+
+  fd_tower_file_t other = history; other.bank_hash.ul[ 0 ] = 1UL;
+  ctx = adopt_setup(); clear_votes( ctx->tower ); ctx->vote_history = other; adopt_vote_history( ctx );
+  FD_TEST( adopt_tower_is( ctx, 101UL, 102UL, 104UL ) );
+  FD_TEST( fd_hash_eq( &fd_tower_blocks_query( ctx->tower, 104UL )->voted_block_id, &fd_tower_blocks_query( ctx->tower, 104UL )->replayed_block_id ) );
+
+  /* Switching to the identity we already have keeps the live tower. */
+
+  ctx = adopt_setup();
+  adopt_switch( ctx, 0UL, &history );
+  FD_TEST( !ctx->vote_history_pending && adopt_tower_is( ctx, 100UL, 101UL, 105UL ) );
+
+  /* A new identity without a history clears our tower. */
+
+  ctx = adopt_setup();
+  adopt_switch( ctx, 0x22UL, NULL );
+  FD_TEST( !ctx->vote_history_pending && adopt_tower_cleared( ctx ) );
+
+  /* A history behind our root is dropped. */
+
+  fd_tower_file_t bad = { .votes = {{ 95UL, 2UL }, { 100UL, 1UL }}, .votes_cnt = 2UL, .root = 90UL };
+  ctx = adopt_setup(); adopt_switch( ctx, 0x22UL, &bad ); check_vote_history( ctx, &(fd_replay_slot_completed_t){ .slot = 105UL } );
+  FD_TEST( adopt_tower_cleared( ctx ) && !ctx->vote_history_pending && !ctx->tower->wait_to_vote_slot );
+
+  /* A history ahead of the blocks we replayed stays pending.  Our tower
+     takes its replayed vote, and we don't vote until its missing vote's
+     lockout expires. */
+
+  bad = history; bad.votes[ 1 ].slot = 106UL;
+  ctx = adopt_setup(); adopt_switch( ctx, 0x22UL, &bad ); check_vote_history( ctx, &(fd_replay_slot_completed_t){ .slot = 105UL } );
+  FD_TEST( ctx->tower->root==101UL && fd_tower_vote_cnt( ctx->tower->votes )==1UL && fd_tower_vote_peek_tail_const( ctx->tower->votes )->slot==102UL );
+  FD_TEST( ctx->vote_history_pending && ctx->tower->wait_to_vote_slot==109UL );
+
+  /* If that block still hasn't been replayed when the lockout expires,
+     its vote is dropped, but the wait stays so the slot we actually
+     vote for is still checked against it. */
+
+  check_vote_history( ctx, &(fd_replay_slot_completed_t){ .slot = 109UL } );
+  FD_TEST( fd_tower_vote_cnt( ctx->tower->votes )==1UL && fd_tower_vote_peek_tail_const( ctx->tower->votes )->slot==102UL );
+  FD_TEST( !ctx->vote_history_pending && ctx->tower->wait_to_vote_slot==109UL );
+
+  /* Like Agave, our tower is compared against the history's last vote,
+     even if its block is not replayed yet, so a history whose replayed
+     votes are older than ours still replaces our tower. */
+
+  fd_tower_file_t ahead = { .votes = {{ 104UL, 3UL }, { 110UL, 1UL }}, .votes_cnt = 2UL, .root = 102UL, .bank_hash = { .ul = { 1110UL } } };
+  ctx = adopt_setup(); ctx->vote_history = ahead; adopt_vote_history( ctx );
+  FD_TEST( ctx->tower->root==102UL && fd_tower_vote_cnt( ctx->tower->votes )==1UL && fd_tower_vote_peek_tail_const( ctx->tower->votes )->slot==104UL );
+
+  /* Switching to another identity drops a pending history. */
+
+  ctx = adopt_setup(); adopt_switch( ctx, 0x22UL, &bad ); check_vote_history( ctx, &(fd_replay_slot_completed_t){ .slot = 105UL } );
+  adopt_switch( ctx, 0x33UL, NULL );
+  FD_TEST( !ctx->vote_history_pending && !ctx->tower->wait_to_vote_slot );
+
+  FD_LOG_NOTICE(( "pass: test_identity_switch_adopts_vote_history" ));
+}
+
+static void
+test_vote_history_floor( void ) {
+  fd_tower_tile_t * ctx = adopt_setup(); /* root 100 */
+
+  /* Slots 90 and 100 are on the rooted chain, 95 is not. */
+
+  static ulong bits[ 4 ];
+  memset( bits, 0, sizeof(bits) );
+  bits[ (90UL /64UL)%4UL ] |= 1UL<<(90UL %64UL);
+  bits[ (100UL/64UL)%4UL ] |= 1UL<<(100UL%64UL);
+  fd_slot_history_view_t slot_history = { .bits = (uchar const *)bits, .blocks_len = 4UL, .bits_len = 256UL, .next_slot = 200UL };
+
+  /* 95 was on an abandoned fork, so we wait out its lockout.  90 is
+     rooted and 105 is above our root, so neither counts. */
+
+  fd_tower_file_t file = { .votes = {{ 90UL, 5UL }, { 95UL, 4UL }, { 105UL, 1UL }}, .votes_cnt = 3UL, .root = 80UL };
+  FD_TEST( vote_history_floor( ctx->tower->root, &file, &slot_history )==95UL+16UL+1UL );
+
+  /* Votes above the root we judge against don't count, even if the
+     history lacks them. */
+
+  FD_TEST( vote_history_floor( 94UL, &file, &slot_history )==0UL );
+
+  file.votes[ 1 ].slot = 100UL;
+  FD_TEST( vote_history_floor( ctx->tower->root, &file, &slot_history )==0UL );
+
+  FD_LOG_NOTICE(( "pass: test_vote_history_floor" ));
 }
 
 static void
@@ -521,8 +838,7 @@ test_fixture_replay( fd_wksp_t * wksp ) {
 
   /* Set fields normally handled by privileged_init. */
 
-  ctx->checkpt_fd = -1;
-  ctx->restore_fd = -1;
+  ctx->tower_dir_fd = -1;
   memset( ctx->identity_key, 0x11, sizeof(fd_pubkey_t) );
   memset( ctx->vote_account, 0x22, sizeof(fd_pubkey_t) );
 
@@ -637,8 +953,7 @@ eqvoc_setup( fd_wksp_t * wksp ) {
   fd_tower_tile_t * ctx = init_choreo( scratch, topo, tile );
   FD_TEST( ctx );
 
-  ctx->checkpt_fd = -1;
-  ctx->restore_fd = -1;
+  ctx->tower_dir_fd = -1;
   memset( ctx->identity_key, 0x11, sizeof(fd_pubkey_t) );
   memset( ctx->vote_account, 0x22, sizeof(fd_pubkey_t) );
 
@@ -883,15 +1198,197 @@ test_eqvoc_cre_diff( fd_wksp_t * wksp ) {
   FD_LOG_NOTICE(( "pass: test_eqvoc_cre_diff" ));
 }
 
+static void
+replay_fixture_slot( fd_tower_tile_t * ctx,
+                     ulong             slot ) {
+  fd_replay_slot_completed_t sc;
+  memset( &sc, 0, sizeof(sc) );
+  sc.slot            = slot;
+  sc.parent_slot     = slot - 1;
+  sc.block_id        = (fd_hash_t){ .ul = { slot } };
+  sc.parent_block_id = (fd_hash_t){ .ul = { slot - 1 } };
+  sc.bank_hash       = (fd_hash_t){ .ul = { slot } };
+  sc.block_hash      = (fd_hash_t){ .ul = { slot } };
+  sc.bank_idx        = 0UL; /* test_banks root bank */
+  replay_slot_completed( ctx, &sc, 0UL, NULL );
+}
+
+static void
+test_vote_history_pending_replay( fd_wksp_t * wksp ) {
+  fd_tower_tile_t * ctx  = eqvoc_setup( wksp );
+  ulong             next = EQVOC_START_SLOT + EQVOC_BOOT_CNT;
+  ctx->banks = test_banks();
+
+  /* As after a switch: our tower is cleared and the history is pending.
+     The other machine's last two votes are on slots we haven't replayed
+     yet. */
+
+  ctx->vote_history = (fd_tower_file_t){ .votes = {{ next-1UL, 3UL }, { next, 2UL }, { next+1UL, 1UL }}, .votes_cnt = 3UL, .root = ctx->tower->root, .bank_hash = { .ul = { next+1UL } } };
+  clear_votes( ctx->tower );
+  ctx->vote_history_pending = 1;
+
+  /* Still ahead after replaying one of them: it stays pending, our
+     tower takes the replayed votes, and we don't vote until the missing
+     vote's lockout expires. */
+
+  replay_fixture_slot( ctx, next );
+  FD_TEST( ctx->vote_history_pending && ctx->tower->wait_to_vote_slot==next+4UL );
+  FD_TEST( fd_tower_vote_cnt( ctx->tower->votes )==2UL && fd_tower_vote_peek_tail_const( ctx->tower->votes )->slot==next );
+
+  /* Replaying the last one adopts it and lifts the wait. */
+
+  replay_fixture_slot( ctx, next+1UL );
+  FD_TEST( !ctx->vote_history_pending && !ctx->tower->wait_to_vote_slot );
+  FD_TEST( fd_tower_vote_cnt( ctx->tower->votes )==3UL && fd_tower_vote_peek_tail_const( ctx->tower->votes )->slot==next+1UL );
+
+  FD_LOG_NOTICE(( "pass: test_vote_history_pending_replay" ));
+}
+
+static void
+tower_file_make( int          dir_fd,
+                 char const * name,
+                 char const * text ) {
+  int fd = openat( dir_fd, name, O_WRONLY|O_CREAT|O_TRUNC, 0644 );
+  FD_TEST( -1!=fd );
+  FD_TEST( (long)strlen( text )==write( fd, text, strlen( text ) ) );
+  FD_TEST( !close( fd ) );
+}
+
+/* tower_file_is returns whether name holds text, or if text is NULL, a
+   tower file for identity. */
+
+static int
+tower_file_is( int                 dir_fd,
+               char const *        name,
+               char const *        text,
+               fd_pubkey_t const * identity ) {
+  uchar buf[ FD_TOWER_FILE_DATA_OFF+32UL ] = {0};
+  int   fd = openat( dir_fd, name, O_RDONLY );
+  if( -1==fd ) return 0;
+  long n = read( fd, buf, sizeof(buf) );
+  FD_TEST( !close( fd ) );
+  if( text ) return n==(long)strlen( text ) && !memcmp( buf, text, strlen( text ) );
+  return n==(long)sizeof(buf) && FD_LOAD( uint, buf )==1U && fd_memeq( buf+FD_TOWER_FILE_DATA_OFF, identity->uc, 32UL );
+}
+
+static void
+test_tower_file_write( fd_wksp_t * wksp ) {
+
+  /* A fake sign tile, a response is published before each request */
+
+  ulong            depth       = 4UL;
+  ulong            req_data_sz = fd_dcache_req_data_sz( FD_KEYGUARD_SIGN_REQ_MTU, depth, 1UL, 1 );
+  ulong            rsp_data_sz = fd_dcache_req_data_sz( 64UL,                     depth, 1UL, 1 );
+  fd_frag_meta_t * req_mcache  = fd_mcache_join( fd_mcache_new( fd_wksp_alloc_laddr( wksp, fd_mcache_align(), fd_mcache_footprint( depth, 0UL ), 1UL ), depth, 0UL, 0UL ) );
+  fd_frag_meta_t * rsp_mcache  = fd_mcache_join( fd_mcache_new( fd_wksp_alloc_laddr( wksp, fd_mcache_align(), fd_mcache_footprint( depth, 0UL ), 1UL ), depth, 0UL, 0UL ) );
+  uchar *          req_dcache  = fd_dcache_join( fd_dcache_new( fd_wksp_alloc_laddr( wksp, fd_dcache_align(), fd_dcache_footprint( req_data_sz, 0UL ), 1UL ), req_data_sz, 0UL ) );
+  uchar *          rsp_dcache  = fd_dcache_join( fd_dcache_new( fd_wksp_alloc_laddr( wksp, fd_dcache_align(), fd_dcache_footprint( rsp_data_sz, 0UL ), 1UL ), rsp_data_sz, 0UL ) );
+  static fd_tower_tile_t ctx[1];
+  FD_TEST( fd_keyguard_client_join( fd_keyguard_client_new( ctx->keyguard_client, req_mcache, req_dcache, rsp_mcache, rsp_dcache, FD_KEYGUARD_SIGN_REQ_MTU, 64UL, NULL, 0UL, ULONG_MAX ) ) );
+  ulong rsp_chunk0 = fd_dcache_compact_chunk0( wksp, rsp_dcache );
+  ulong rsp_seq    = 0UL;
+
+  char dir[] = "/tmp/test_tower_file_write_XXXXXX";
+  FD_TEST( mkdtemp( dir ) );
+  int dir_fd = open( dir, O_RDONLY|O_DIRECTORY );
+  FD_TEST( -1!=dir_fd );
+  ctx->tower_dir_fd = dir_fd;
+
+  /* identities U, A and B */
+
+  fd_pubkey_t id[ 3 ];
+  char        name[ 3 ][ 2 ][ PATH_MAX ];
+  char        old [ 3 ][ 2 ][ PATH_MAX ];
+  for( ulong i=0UL; i<3UL; i++ ) {
+    memset( id[ i ].uc, (int)(0x11UL*(i+1UL)), 32UL );
+    FD_BASE58_ENCODE_32_BYTES( id[ i ].uc, b58 );
+    FD_TEST( fd_cstr_printf_check( name[ i ][ 1 ], PATH_MAX, NULL, "tower-1_9-%s.bin", b58 ) );
+    FD_TEST( fd_cstr_printf_check( name[ i ][ 0 ], PATH_MAX, NULL, "%s.new", name[ i ][ 1 ] ) );
+    FD_TEST( fd_cstr_printf_check( old[ i ][ 0 ], PATH_MAX, NULL, "%s.old",   name[ i ][ 1 ] ) );
+    FD_TEST( fd_cstr_printf_check( old[ i ][ 1 ], PATH_MAX, NULL, "%s.old.1", name[ i ][ 1 ] ) );
+  }
+
+  ctx->identity_key[ 0 ] = id[ 0 ];
+  memcpy( ctx->tower_name, name[ 0 ], sizeof(name[ 0 ]) );
+  for( ulong i=0UL; i<2UL; i++ ) {
+    ctx->tower_fd[ i ] = openat( dir_fd, ctx->tower_name[ i ], O_WRONLY|O_CREAT, 0644 );
+    FD_TEST( -1!=ctx->tower_fd[ i ] );
+  }
+  memset( &ctx->compact_tower_sync_serde, 0, sizeof(ctx->compact_tower_sync_serde) );
+  ctx->compact_tower_sync_serde.root          = 100UL;
+  ctx->compact_tower_sync_serde.lockouts_cnt  = 1;
+  ctx->compact_tower_sync_serde.lockouts[ 0 ] = ( __typeof__(ctx->compact_tower_sync_serde.lockouts[0]) ){ .offset=1UL, .confirmation_count=1 };
+
+# define WRITE() do {                                                                         \
+    fd_mcache_publish( rsp_mcache, depth, rsp_seq++, 0UL, rsp_chunk0, 64UL, 0UL, 0UL, 0UL ); \
+    ctx->tower_file_pending = 101UL;                                                          \
+    tower_file_write( ctx );                                                                  \
+  } while(0)
+
+  /* the first write as U */
+
+  WRITE();
+  FD_TEST( tower_file_is( dir_fd, name[ 0 ][ 1 ], NULL, &id[ 0 ] ) );
+
+  /* switching to A, whose name has the tower file passed to
+     set-identity, keeps that file under an .old name */
+
+  tower_file_make( dir_fd, name[ 1 ][ 1 ], "copy" );
+  ctx->identity_key[ 0 ] = id[ 1 ];
+  WRITE();
+  FD_TEST( tower_file_is( dir_fd, name[ 1 ][ 1 ], NULL,   &id[ 1 ] ) );
+  FD_TEST( tower_file_is( dir_fd, name[ 1 ][ 0 ], NULL,   &id[ 0 ] ) );
+  FD_TEST( tower_file_is( dir_fd, old [ 1 ][ 0 ], "copy", NULL     ) );
+  FD_TEST( -1==faccessat( dir_fd, name[ 0 ][ 0 ], F_OK, 0 ) );
+  FD_TEST( -1==faccessat( dir_fd, name[ 0 ][ 1 ], F_OK, 0 ) );
+
+  /* another write as A only exchanges the staging and live files */
+
+  WRITE();
+  FD_TEST( tower_file_is( dir_fd, name[ 1 ][ 1 ], NULL, &id[ 1 ] ) );
+  FD_TEST( tower_file_is( dir_fd, name[ 1 ][ 0 ], NULL, &id[ 1 ] ) );
+
+  /* switching to B, whose .old name is taken too, uses the next one */
+
+  tower_file_make( dir_fd, name[ 2 ][ 1 ], "copy"  );
+  tower_file_make( dir_fd, old [ 2 ][ 0 ], "older" );
+  ctx->identity_key[ 0 ] = id[ 2 ];
+  WRITE();
+  FD_TEST( tower_file_is( dir_fd, name[ 2 ][ 1 ], NULL,    &id[ 2 ] ) );
+  FD_TEST( tower_file_is( dir_fd, old [ 2 ][ 0 ], "older", NULL     ) );
+  FD_TEST( tower_file_is( dir_fd, old [ 2 ][ 1 ], "copy",  NULL     ) );
+
+  struct stat st;
+  FD_TEST( !fstatat( dir_fd, name[ 2 ][ 1 ], &st, 0 ) );
+  FD_TEST( ctx->metrics.tower_file_write==4UL              );
+  FD_TEST( ctx->metrics.tower_file_slot ==101UL            );
+  FD_TEST( !ctx->tower_file_pending                        );
+  FD_TEST( ctx->metrics.tower_file_sz   ==(ulong)st.st_size );
+
+# undef WRITE
+
+  char const * files[] = { name[ 2 ][ 0 ], name[ 2 ][ 1 ], old[ 2 ][ 0 ], old[ 2 ][ 1 ], old[ 1 ][ 0 ] };
+  for( ulong i=0UL; i<5UL; i++ ) FD_TEST( !unlinkat( dir_fd, files[ i ], 0 ) );
+  for( ulong i=0UL; i<2UL; i++ ) FD_TEST( !close( ctx->tower_fd[ i ] ) );
+  FD_TEST( !close( dir_fd ) );
+  FD_TEST( !rmdir( dir ) );
+
+  FD_LOG_NOTICE(( "pass: test_tower_file_write" ));
+}
+
 int
 main( int     argc,
       char ** argv ) {
   fd_boot( &argc, &argv );
 
   test_publish_slot_done_identity_mismatch();
+  test_identity_switch_waits_for_replay();
+  test_halt_signing_backpressures_replay();
+  test_identity_switch_waits_for_publishes();
+  test_identity_switch_adopts_vote_history();
+  test_vote_history_floor();
   test_count_vote_txn();
   test_parent_vote_txn_recent_blockhash();
-
   char const * _page_sz = fd_env_strip_cmdline_cstr ( &argc, &argv, "--page-sz",  NULL, "gigantic"              );
   ulong        page_cnt = fd_env_strip_cmdline_ulong( &argc, &argv, "--page-cnt", NULL, 4UL                     );
   ulong        numa_idx = fd_env_strip_cmdline_ulong( &argc, &argv, "--numa-idx", NULL, fd_shmem_numa_idx( 0UL ) );
@@ -906,6 +1403,8 @@ main( int     argc,
   fd_wksp_reset( wksp, 1UL ); test_eqvoc_rce_diff( wksp );
   fd_wksp_reset( wksp, 1UL ); test_eqvoc_erc_diff( wksp );
   fd_wksp_reset( wksp, 1UL ); test_eqvoc_cre_diff( wksp );
+  fd_wksp_reset( wksp, 1UL ); test_vote_history_pending_replay( wksp );
+  fd_wksp_reset( wksp, 1UL ); test_tower_file_write( wksp );
 
   fd_halt();
 }

@@ -41,7 +41,7 @@ ag_vote_de( ag_vote_t *   self,
   uint kind = (uint)vote.tag - AG_VOTE_SERDE_TAG_NOTAR;
 
   int has_block_id = kind==AG_VOTE_KIND_NOTAR || kind==AG_VOTE_KIND_NOTAR_FALLBACK;
-  FAIL( buf_sz!=AG_VOTE_SER_SZ( has_block_id ), SZ ); /* too few, or trailing bytes */
+  FAIL( buf_sz<AG_VOTE_SER_SZ( has_block_id ), SZ ); /* too few, trailing bytes are ignored */
 
   vote.slot          = FD_LOAD( ulong, buf+off );  off += sizeof(ulong);
   vote.block_id      = NULL;
@@ -52,9 +52,7 @@ ag_vote_de( ag_vote_t *   self,
 
   fd_bls_sig_t   sig[1];
   blst_p2_affine sig_aff[1];
-  FAIL( vote.signature[0]&0xA0U,                                      INVAL );
   FAIL( blst_p2_deserialize( sig_aff, vote.signature )!=BLST_SUCCESS, INVAL );
-  FAIL( !blst_p2_affine_in_g2( sig_aff ),                             INVAL );
   blst_p2_from_affine( sig, sig_aff );
   vote.shred_version = FD_LOAD( ushort, buf+off ); off += sizeof(ushort);
 

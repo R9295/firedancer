@@ -3,6 +3,7 @@
 #include "fd_fec_set.h"
 #include "../../ballet/bmtree/fd_bmtree.h"
 #include "../../ballet/ed25519/fd_ed25519.h"
+#include "../../util/hist/fd_histf.h"
 
 /* This header defines several methods for building and validating FEC
    sets from received shreds.  It's designed just for use by the shred
@@ -118,12 +119,14 @@ FD_FN_CONST ulong fd_fec_resolver_align    ( void );
    shmem must have the required alignment and footprint.  depth,
    partial_depth, complete_depth, and done_depth are as defined above
    and must be positive.  The sum of depth, partial_depth, and
-   complete_depth must be less than UINT_MAX.  sets is a pointer to the
-   first of depth+partial_depth+complete_depth FEC sets that this
-   resolver will take ownership of.  The FEC resolver retains a write
-   interest in these FEC sets and the shreds they point to until the
-   resolver is deleted.  These FEC sets and the memory for the shreds
-   they point to are the only values that will be returned in the
+   complete_depth must be less than UINT_MAX.  slot_max is the maximum
+   number of slots above the root slot that the resolver tracks; if
+   slot_max is 0, the resolver does not limit the slot range.  sets is a
+   pointer to the first of depth+partial_depth+complete_depth FEC sets
+   that this resolver will take ownership of.  The FEC resolver retains
+   a write interest in these FEC sets and the shreds they point to until
+   the resolver is deleted.  These FEC sets and the memory for the
+   shreds they point to are the only values that will be returned in the
    out_shred and out_fec_set output parameters of add_shred. seed is an
    arbitrary ulong used to seed various data structures.  It should be
    set to a validator independent value.
@@ -142,6 +145,7 @@ fd_fec_resolver_new( void                    * shmem,
                      ulong                     partial_depth,
                      ulong                     complete_depth,
                      ulong                     done_depth,
+                     ulong                     slot_max,
                      fd_fec_set_t            * sets,
                      ulong                     seed );
 
@@ -259,9 +263,11 @@ typedef struct fd_fec_resolver_spilled fd_fec_resolver_spilled_t;
    SHRED_IGNORED, even if that particular shred hadn't been received.
 
    However, if the shred is part of an in progress FEC set but has
-   already been received, FEC resolver returns SHRED_DUPLICATE and
-   populates out_merkle_root if it is non-NULL. out_shred will be
-   populated similarly to when returning SHRED_OKAY.
+   already been received: if source is REPAIR, FEC resolver returns
+   SHRED_DUPLICATE and populates out_merkle_root if it is non-NULL, and
+   out_shred is populated similarly to when returning SHRED_OKAY.  For
+   any other source it returns SHRED_IGNORED without validating the
+   shred or writing to out_{fec_set,shred,merkle_root}.
 
    If the shred fails validation for any other reason, returns
    SHRED_REJECTED and does not write to out_{fec_set,shred}. If
@@ -298,6 +304,13 @@ fd_fec_resolver_add_shred( fd_fec_resolver_t         * resolver,
                            fd_shred_t const        * * out_shred,
                            fd_bmtree_node_t          * out_merkle_root,
                            fd_fec_resolver_spilled_t * out_spilled_fec_set );
+
+/* fd_fec_resolver_completion_lag_hist returns a pointer to the
+   resolver's histogram estimating how much earlier repair made a FEC
+   set complete. */
+
+fd_histf_t const *
+fd_fec_resolver_completion_lag_hist( fd_fec_resolver_t const * resolver );
 
 
 void * fd_fec_resolver_leave( fd_fec_resolver_t * resolver );

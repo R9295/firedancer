@@ -14,6 +14,7 @@
 
 #include <sys/socket.h> /* SOCK_CLOEXEC, SOCK_NONBLOCK needed for seccomp filter */
 
+#include <linux/futex.h>
 #include "generated/fd_gui_tile_seccomp.h"
 
 #include "../../disco/tiles.h"
@@ -26,6 +27,7 @@
 #include "../../disco/metrics/fd_metrics.h"
 #include "../../disco/net/fd_net_tile.h"
 #include "../../disco/waker/fd_waker.h"
+#include "../../disco/sleep/fd_sleep.h"
 #include "../../disco/fd_clock_tile.h"
 #include "../../discof/genesis/fd_genesi_tile.h" // TODO: Layering violation
 #include "../../ballet/sha256/fd_sha256.h"
@@ -44,8 +46,8 @@ FD_STATIC_ASSERT( FD_METRICS_ENUM_GUI_DB_CNT==FD_GUI_HIST_CNT, gui_db_enum );
 #define IN_KIND_PACK_POH      ( 3UL)
 #define IN_KIND_EXECLE_POH    ( 4UL)
 #define IN_KIND_SHRED_OUT     ( 5UL) /* firedancer only */
-#define IN_KIND_NET_GOSSVF    ( 6UL) /* firedancer only */
-#define IN_KIND_GOSSIP_NET    ( 7UL) /* firedancer only */
+#define IN_KIND_GOSSVF_GUI    ( 6UL) /* firedancer only */
+#define IN_KIND_GOSSIP_GUI    ( 7UL) /* firedancer only */
 #define IN_KIND_GOSSIP_OUT    ( 8UL) /* firedancer only */
 #define IN_KIND_SNAPCT        ( 9UL) /* firedancer only */
 #define IN_KIND_REPAIR_NET    (10UL) /* firedancer only */
@@ -67,8 +69,18 @@ FD_IMPORT_BINARY( firedancer_svg, "book/public/fire.svg" );
 #define FD_HTTP_SERVER_GUI_MAX_WS_RECV_FRAME_LEN 65536
 #define FD_HTTP_SERVER_GUI_MAX_WS_SEND_FRAME_CNT 8192
 
+#define FD_GUI_TIMELINE_RAW_RESPONSE_MAX (32UL<<20)
+/* Agg revenue has three ulong-string arrays: at most 3*23=69 bytes per
+   bucket including commas, within the shared 512-byte budget. */
+FD_STATIC_ASSERT( FD_GUI_TIMELINE_QUERY_MAX_BUCKETS*512UL+4096UL<=FD_GUI_TIMELINE_RAW_RESPONSE_MAX, agg_response_bound );
+FD_STATIC_ASSERT( 2UL*FD_GUI_TIMELINE_RAW_RESPONSE_MAX+(FD_GUI_TIMELINE_RAW_RESPONSE_MAX>>8)<FD_GUI_HTTP_MIN_SEND_BUFFER_SZ,
+                  compressed_response_bound );
+
 static fd_http_server_params_t
 derive_http_params( fd_topo_tile_t const * tile ) {
+  if( FD_UNLIKELY( tile->gui.send_buffer_size_mb<(FD_GUI_HTTP_MIN_SEND_BUFFER_SZ>>20) || tile->gui.send_buffer_size_mb>(ULONG_MAX>>20) ) ) {
+    FD_LOG_ERR(( "[tiles.gui.send_buffer_size_mb] must be at least %lu MiB and fit in ulong bytes", FD_GUI_HTTP_MIN_SEND_BUFFER_SZ>>20 ));
+  }
   return (fd_http_server_params_t) {
     .max_connection_cnt    = tile->gui.max_http_connections,
     .max_ws_connection_cnt = tile->gui.max_websocket_connections,
@@ -114,6 +126,8 @@ typedef struct {
   ulong in_cnt;
   ulong idle_cnt;
 
+  long deadline_ticks;
+
   fd_clock_tile_t clock[1];
 
   ulong chunk;
@@ -123,8 +137,7 @@ typedef struct {
       ulong shred_idx;
     } repair_net;
 
-    uchar net_gossvf[ FD_NET_MTU ];
-    uchar gossip_net[ FD_NET_MTU ];
+    fd_gui_gossip_bw_rec_t gossip_bw[ FD_GUI_GOSSIP_BW_REC_MAX ];
 
     struct {
       fd_snapsv_msg_t snapsv_out;
@@ -154,11 +167,8 @@ typedef struct {
 
   ulong           in_kind[ FD_TOPO_MAX_TILE_IN_LINKS ];
   int             in_reliable[ FD_TOPO_MAX_TILE_IN_LINKS ];
-  ulong *         in_fseq    [ FD_TOPO_MAX_TILE_IN_LINKS ];
   ulong           in_bank_idx[ FD_TOPO_MAX_TILE_IN_LINKS ];
   fd_gui_in_ctx_t in[ FD_TOPO_MAX_TILE_IN_LINKS ];
-
-  fd_net_rx_bounds_t net_in_bounds[ FD_TOPO_MAX_TILE_IN_LINKS ];
 } fd_gui_ctx_t;
 
 FD_FN_CONST static inline ulong
@@ -254,14 +264,25 @@ metrics_write( fd_gui_ctx_t * ctx ) {
   FD_MCNT_ENUM_COPY( GUI, DB_FORCED_EVICTION,    hist_reserves );
 }
 
+static inline void
+deadline_update( fd_gui_ctx_t * ctx,
+                 long           now ) {
+  long due = fd_long_min( fd_gui_next_deadline( ctx->gui ), fd_gui_peers_next_deadline( ctx->peers ) );
+  ctx->deadline_ticks = due-now>=FD_SLEEP_PARK_CAP_NS ? LONG_MAX : fd_clock_tile_wallclock_to_tickcount( ctx->clock, due );
+}
+
+static long
+next_deadline( fd_gui_ctx_t const * ctx ) {
+  return ctx->deadline_ticks;
+}
+
 static void
 before_credit( fd_gui_ctx_t *      ctx,
                fd_stem_context_t * stem,
                int *               charge_busy ) {
-  (void)stem;
-
   ctx->idle_cnt++;
-  if( FD_LIKELY( ctx->idle_cnt<2UL*ctx->in_cnt ) ) return;
+  int due = stem->now>=ctx->deadline_ticks;
+  if( FD_LIKELY( ctx->idle_cnt<2UL*ctx->in_cnt && !due ) ) return;
   ctx->idle_cnt = 0UL;
 
   int charge_busy_server = 0;
@@ -283,6 +304,8 @@ before_credit( fd_gui_ctx_t *      ctx,
   int charge_poll = 0;
   charge_poll |= fd_gui_poll( ctx->gui, now );
   charge_poll |= fd_gui_peers_poll( ctx->peers, now );
+
+  deadline_update( ctx, now );
 
   *charge_busy = charge_busy_server | charge_poll;
 }
@@ -332,7 +355,8 @@ during_frag( fd_gui_ctx_t * ctx,
     if( FD_LIKELY( sig!=REPLAY_SIG_SLOT_COMPLETED &&
                    sig!=REPLAY_SIG_BECAME_LEADER  &&
                    sig!=REPLAY_SIG_ROOT_ADVANCED  &&
-                   sig!=REPLAY_SIG_OC_ADVANCED ) ) return;
+                   sig!=REPLAY_SIG_OC_ADVANCED &&
+                   sig!=REPLAY_SIG_TXN_EXECUTED ) ) return;
   }
 
   if( FD_UNLIKELY( (sz>0UL && (chunk<ctx->in[ in_idx ].chunk0 || chunk>ctx->in[ in_idx ].wmark)) || sz>ctx->in[ in_idx ].mtu ) )
@@ -353,15 +377,10 @@ during_frag( fd_gui_ctx_t * ctx,
       }
       break;
     }
-    case IN_KIND_NET_GOSSVF: {
-      FD_TEST( sz<=sizeof(ctx->parsed.net_gossvf) );
-      uchar const * net_src = fd_net_rx_translate_frag( &ctx->net_in_bounds[ in_idx ], chunk, ctl, sz );
-      fd_memcpy( ctx->parsed.net_gossvf, net_src, sz );
-      break;
-    }
-    case IN_KIND_GOSSIP_NET: {
-      FD_TEST( sz<=sizeof(ctx->parsed.gossip_net) );
-      fd_memcpy( ctx->parsed.gossip_net, src, sz );
+    case IN_KIND_GOSSVF_GUI:
+    case IN_KIND_GOSSIP_GUI: {
+      FD_TEST( sz<=sizeof(ctx->parsed.gossip_bw) && !(sz%sizeof(fd_gui_gossip_bw_rec_t)) );
+      fd_memcpy( ctx->parsed.gossip_bw, src, sz );
       break;
     }
     case IN_KIND_SNAPSV_OUT: {
@@ -463,6 +482,9 @@ after_frag( fd_gui_ctx_t *      ctx,
       } else if( FD_UNLIKELY( sig==REPLAY_SIG_OC_ADVANCED ) ) {
         fd_replay_oc_advanced_t const * oc = (fd_replay_oc_advanced_t const *)src;
         fd_gui_handle_oc_advanced( ctx->gui, oc->slot, oc->bank_seq, fd_clock_tile_now( ctx->clock ) );
+      } else if( FD_LIKELY( sig==REPLAY_SIG_TXN_EXECUTED ) ) {
+        if( FD_UNLIKELY( sz!=sizeof(fd_replay_txn_executed_t) ) ) FD_LOG_ERR(( "invalid replay transaction message size %lu", sz ));
+        fd_gui_handle_replay_txn( ctx->gui, (fd_replay_txn_executed_t const *)src, fd_clock_tile_now( ctx->clock ) );
       } else {
         return;
       }
@@ -524,33 +546,9 @@ after_frag( fd_gui_ctx_t *      ctx,
       fd_gui_handle_repair_request( ctx->gui, ctx->parsed.repair_net.slot, ctx->parsed.repair_net.shred_idx, tsorig_ns, fd_clock_tile_now( ctx->clock ) );
       break;
     }
-    case IN_KIND_NET_GOSSVF: {
-      uchar * payload;
-      ulong payload_sz;
-      fd_ip4_hdr_t * ip4_hdr;
-      fd_udp_hdr_t * udp_hdr;
-      if( FD_LIKELY( fd_ip4_udp_hdr_strip( ctx->parsed.net_gossvf, sz, &payload, &payload_sz, NULL, &ip4_hdr, &udp_hdr ) ) ) {
-        fd_gossip_socket_t socket = {
-          .is_ipv6 = 0,
-          .ip4 = ip4_hdr->saddr,
-          .port = udp_hdr->net_sport,
-        };
-        fd_gui_peers_handle_gossip_message( ctx->peers, payload, payload_sz, &socket, 1 );
-      }
-      break;
-    }
-    case IN_KIND_GOSSIP_NET: {
-      uchar * payload;
-      ulong payload_sz;
-      fd_ip4_hdr_t * ip4_hdr;
-      fd_udp_hdr_t * udp_hdr;
-      FD_TEST( fd_ip4_udp_hdr_strip( ctx->parsed.gossip_net, sz, &payload, &payload_sz, NULL, &ip4_hdr, &udp_hdr ) );
-      fd_gossip_socket_t socket = {
-        .is_ipv6 = 0,
-        .ip4 = ip4_hdr->daddr,
-        .port = udp_hdr->net_dport,
-      };
-      fd_gui_peers_handle_gossip_message( ctx->peers, payload, payload_sz, &socket, 0 );
+    case IN_KIND_GOSSVF_GUI:
+    case IN_KIND_GOSSIP_GUI: {
+      fd_gui_peers_handle_gossip_bw( ctx->peers, ctx->parsed.gossip_bw, sz/sizeof(fd_gui_gossip_bw_rec_t), ctx->in_kind[ in_idx ]==IN_KIND_GOSSVF_GUI );
       break;
     }
     case IN_KIND_GOSSIP_OUT: {
@@ -583,7 +581,7 @@ after_frag( fd_gui_ctx_t *      ctx,
         FD_LOG_ERR(( "unexpected poh packet type %lu", fd_disco_poh_sig_pkt_type( sig ) ));
       }
       /* The link is shallow; return the credit now, like the execle. */
-      fd_fseq_update( ctx->in_fseq[ in_idx ], seq+1UL );
+      fd_stem_credit_return( stem, in_idx, seq+1UL );
       break;
     }
     case IN_KIND_EXECLE_POH: {
@@ -602,6 +600,7 @@ after_frag( fd_gui_ctx_t *      ctx,
                                       (fd_txn_p_t *)src,
                                       trailer->pack_txn_idx,
                                       trailer->txn_ns_dt,
+                                      trailer->exec_end_ticks,
                                       trailer->tips,
                                       trailer->bank_seq,
                                       fd_clock_tile_now( ctx->clock ) );
@@ -976,7 +975,8 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->waker_fseq = fd_fseq_join( fd_topo_obj_laddr( topo, tile->waker_fseq_obj_id ) );
   FD_TEST( ctx->waker_fseq );
 
-  ctx->idle_cnt = 0UL;
+  ctx->idle_cnt       = 0UL;
+  deadline_update( ctx, fd_clock_tile_now( ctx->clock ) );
   FD_TEST( tile->in_cnt<=sizeof(ctx->in)/sizeof(ctx->in[0]) );
   ctx->in_cnt = tile->in_cnt;
 
@@ -984,24 +984,17 @@ unprivileged_init( fd_topo_t const *      topo,
     fd_topo_link_t const * link = &topo->links[ tile->in_link_id[ i ] ];
     fd_topo_wksp_t const * link_wksp = &topo->workspaces[ topo->objs[ link->dcache_obj_id ].wksp_id ];
 
-    if( FD_LIKELY( !strcmp( link->name, "pack_execle"  ) ) ) {
-      ctx->in_kind[ i ] = IN_KIND_PACK_EXECLE;
-      ctx->in_fseq[ i ] = fd_fseq_join( fd_topo_obj_laddr( topo, tile->in_link_fseq_obj_id[ i ] ) );
-      FD_TEST( ctx->in_fseq[ i ] );
-    }
+    if( FD_LIKELY( !strcmp( link->name, "pack_execle"  ) ) ) ctx->in_kind[ i ] = IN_KIND_PACK_EXECLE;
     else if( FD_LIKELY( !strcmp( link->name, "pack_poh"     ) ) ) ctx->in_kind[ i ] = IN_KIND_PACK_POH;
     else if( FD_LIKELY( !strcmp( link->name, "execle_poh"   ) ) ) ctx->in_kind[ i ] = IN_KIND_EXECLE_POH;
     else if( FD_LIKELY( !strcmp( link->name, "shred_out"    ) ) ) ctx->in_kind[ i ] = IN_KIND_SHRED_OUT;
-    else if( FD_LIKELY( !strcmp( link->name, "net_gossvf"   ) ) ) {
-      ctx->in_kind[ i ] = IN_KIND_NET_GOSSVF;
-      fd_net_rx_bounds_init( &ctx->net_in_bounds[ i ], link->dcache );
-    }
-    else if( FD_LIKELY( !strcmp( link->name, "gossip_net"    ) ) ) ctx->in_kind[ i ] = IN_KIND_GOSSIP_NET;
-    else if( FD_LIKELY( !strcmp( link->name, "gossip_out"    ) ) ) ctx->in_kind[ i ] = IN_KIND_GOSSIP_OUT;
+    else if( FD_LIKELY( !strcmp( link->name, "gossvf_gui"   ) ) ) ctx->in_kind[ i ] = IN_KIND_GOSSVF_GUI;
+    else if( FD_LIKELY( !strcmp( link->name, "gossip_gui"    ) ) ) ctx->in_kind[ i ] = IN_KIND_GOSSIP_GUI;
+    else if( FD_LIKELY( !strcmp( link->name, "gossip_ciseen" ) ) ) ctx->in_kind[ i ] = IN_KIND_GOSSIP_OUT;
     else if( FD_LIKELY( !strcmp( link->name, "snapct_gui"    ) ) ) ctx->in_kind[ i ] = IN_KIND_SNAPCT;
     else if( FD_LIKELY( !strcmp( link->name, "repair_net"    ) ) ) ctx->in_kind[ i ] = IN_KIND_REPAIR_NET;
     else if( FD_LIKELY( !strcmp( link->name, "tower_out"     ) ) ) ctx->in_kind[ i ] = IN_KIND_TOWER_OUT;
-    else if( FD_LIKELY( !strcmp( link->name, "replay_out"    ) ) ) ctx->in_kind[ i ] = IN_KIND_REPLAY_OUT;
+    else if( FD_LIKELY( !strcmp( link->name, "replay_slot"   ) ) ) ctx->in_kind[ i ] = IN_KIND_REPLAY_OUT;
     else if( FD_LIKELY( !strcmp( link->name, "replay_epoch"  ) ) ) ctx->in_kind[ i ] = IN_KIND_EPOCH;
     else if( FD_LIKELY( !strcmp( link->name, "genesi_out"    ) ) ) ctx->in_kind[ i ] = IN_KIND_GENESI_OUT;
     else if( FD_LIKELY( !strcmp( link->name, "snapin_gui"    ) ) ) ctx->in_kind[ i ] = IN_KIND_SNAPIN;
@@ -1087,6 +1080,7 @@ rlimit_file_cnt( fd_topo_t const *      topo FD_PARAM_UNUSED,
 #define STEM_CALLBACK_DURING_HOUSEKEEPING during_housekeeping
 #define STEM_CALLBACK_METRICS_WRITE       metrics_write
 #define STEM_CALLBACK_BEFORE_CREDIT       before_credit
+#define STEM_CALLBACK_NEXT_DEADLINE       next_deadline
 #define STEM_CALLBACK_BEFORE_FRAG         before_frag
 #define STEM_CALLBACK_DURING_FRAG         during_frag
 #define STEM_CALLBACK_RETURNABLE_FRAG     returnable_frag

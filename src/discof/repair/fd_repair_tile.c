@@ -120,6 +120,7 @@
 #include "../genesis/fd_genesi_tile.h"
 #include "../../disco/topo/fd_topo.h"
 #include "../../disco/fd_clock_tile.h"
+#include <linux/futex.h>
 #include "generated/fd_repair_tile_seccomp.h"
 #include "../../disco/keyguard/fd_keyload.h"
 #include "../../disco/keyguard/fd_keyguard.h"
@@ -544,7 +545,7 @@ after_shred( ctx_t      * ctx,
     if( FD_UNLIKELY( !blk_insert_check( ctx, blk, shred->slot, evicted ) ) ) return;
 
     if( FD_LIKELY( fd_forest_data_shred_insert( ctx->forest, shred->slot, shred->slot - shred->data.parent_off, shred->idx, shred->fec_set_idx, slot_complete, ref_tick, src, mr, cmr, rx_tick ) ) ) {
-      if( FD_UNLIKELY( src == SHRED_SRC_REPAIR && ( rtt = fd_inflights_shred_match( ctx->inflights, nonce, shred->slot, shred->idx, NULL, &peer, NULL, fd_clock_tile_now( ctx->clock ) ) ) > 0 ) ) {
+      if( FD_UNLIKELY( src == SHRED_SRC_REPAIR && ( rtt = fd_inflights_shred_match( ctx->inflights, FD_REPAIR_KIND_SHRED, nonce, shred->slot, shred->idx, NULL, &peer, NULL, fd_clock_tile_now( ctx->clock ) ) ) > 0 ) ) {
         fd_policy_peer_response_update( ctx->policy, &peer, rtt );
         fd_histf_sample( ctx->metrics->response_latency, (ulong)rtt );
         blk->response_cnt++;
@@ -866,7 +867,7 @@ after_frag( ctx_t *             ctx,
         complete_msg->fec = *in_msg;
 
         fd_fec_complete_metrics_t * m = &complete_msg->metrics;
-        m->fec_completed_ts_nanos = (ulong)fd_clock_epoch_y( ctx->clock->epoch, rx_tick );
+        m->fec_completed_ts_nanos = fd_clock_epoch_y( ctx->clock->epoch, rx_tick );
 
         m->stats_valid = 0U;
         fd_forest_blk_t const * blk = fd_forest_query( ctx->forest, in_msg->last_shred_hdr.slot );
@@ -918,14 +919,14 @@ defer_inflight_request( ctx_t * ctx, ulong slot, ulong shred_idx, long now ) {
   fd_inflight_key_t inflight_req[1];
   fd_inflight_key_init( inflight_req, FD_REPAIR_KIND_SHRED, slot, shred_idx, 0UL, NULL );
   if( FD_LIKELY( !fd_inflight_map_ele_query( ctx->inflights->map, inflight_req, NULL, ctx->inflights->pool ) ) ) {
-    fd_inflights_shred_insert( ctx->inflights, 0, &hash, slot, shred_idx, NULL, NULL, now );
+    fd_inflights_shred_insert( ctx->inflights, FD_REPAIR_KIND_SHRED, 0, &hash, slot, shred_idx, NULL, NULL, now );
   }
 }
 
 /* Should be called for any regular FD_REPAIR_KIND_SHRED request made. */
 static void
 record_inflight_request( ctx_t * ctx, ulong nonce, fd_pubkey_t const * peer, ulong slot, ulong shred_idx, long now ) {
-  fd_inflights_shred_insert( ctx->inflights, nonce, peer, slot, shred_idx, NULL, NULL, now );
+  fd_inflights_shred_insert( ctx->inflights, FD_REPAIR_KIND_SHRED, nonce, peer, slot, shred_idx, NULL, NULL, now );
   fd_policy_peer_request_update( ctx->policy, peer );
 }
 
@@ -1046,7 +1047,14 @@ after_credit( ctx_t *             ctx,
 
   /* finally, send the request made by policy */
   fd_repair_send_sign_request( ctx, sign_out, cout, NULL );
-  if( FD_LIKELY( cout->kind == FD_REPAIR_KIND_SHRED ) ) record_inflight_request( ctx, cout->shred.nonce, &cout->shred.to, cout->shred.slot, cout->shred.shred_idx, now );
+  if( FD_LIKELY( cout->kind == FD_REPAIR_KIND_SHRED ) ) {
+    record_inflight_request( ctx, cout->shred.nonce, &cout->shred.to, cout->shred.slot, cout->shred.shred_idx, now );
+    fd_forest_blk_t * blk = fd_forest_query( ctx->forest, cout->shred.slot );
+    if( FD_LIKELY( blk ) ) {
+      blk->req_window_cnt++;
+      if( FD_UNLIKELY( !blk->first_req_ts ) ) blk->first_req_ts = fd_tickcount();
+    }
+  }
 }
 
 static void
@@ -1092,6 +1100,20 @@ during_housekeeping( ctx_t * ctx ) {
     FD_CHECK_CRIT( ctx->halt_signing, "state machine corruption" );
     ctx->halt_signing = 0;
     fd_keyswitch_state( ctx->keyswitch, FD_KEYSWITCH_STATE_COMPLETED );
+
+    /* Peers key their ping-pong cache by our pubkey, so every peer is
+       cold for the new identity.  Re-warm them all. */
+    fd_policy_peers_t * peers = &ctx->policy->peers;
+    fd_policy_peer_dlist_t * lists[ 2 ] = { peers->fast, peers->slow };
+    for( ulong l=0UL; l<2UL; l++ ) {
+      for( fd_policy_peer_dlist_iter_t iter = fd_policy_peer_dlist_iter_fwd_init( lists[ l ], peers->pool );
+           !fd_policy_peer_dlist_iter_done( iter, lists[ l ], peers->pool ) && !fd_signs_queue_full( ctx->pong_queue );
+           iter = fd_policy_peer_dlist_iter_fwd_next( iter, lists[ l ], peers->pool ) ) {
+        fd_policy_peer_t const * peer = fd_policy_peer_dlist_iter_ele_const( iter, lists[ l ], peers->pool );
+        fd_repair_msg_t * init = fd_repair_shred( ctx->protocol, &peer->key, (ulong)fd_clock_tile_now( ctx->clock )/1000000UL, 0, 0, 0 );
+        fd_signs_queue_push( ctx->pong_queue, (sign_pending_t){ .msg = *init } );
+      }
+    }
   }
 
   if( FD_UNLIKELY( fd_keyswitch_state_query( ctx->keyswitch )==FD_KEYSWITCH_STATE_SWITCH_PENDING ) ) {
@@ -1191,12 +1213,12 @@ unprivileged_init( fd_topo_t const *      topo,
       sign_repair_in_idx[ sign_repair_idx++ ] = in_idx;
       sign_link_depth                         = link->depth;
     }
-    else if( 0==strcmp( link->name, "gossip_out"   ) ) ctx->in_kind[ in_idx ] = IN_KIND_GOSSIP;
+    else if( 0==strcmp( link->name, "gossip_ciaddr" ) ) ctx->in_kind[ in_idx ] = IN_KIND_GOSSIP;
     else if( 0==strcmp( link->name, "tower_out"    ) ) ctx->in_kind[ in_idx ] = IN_KIND_TOWER;
     else if( 0==strcmp( link->name, "shred_out"    ) ) ctx->in_kind[ in_idx ] = IN_KIND_SHRED;
     else if( 0==strcmp( link->name, "snapin_manif" ) ) ctx->in_kind[ in_idx ] = IN_KIND_SNAP;
     else if( 0==strcmp( link->name, "genesi_out"   ) ) ctx->in_kind[ in_idx ] = IN_KIND_GENESIS;
-    else if( 0==strcmp( link->name, "replay_out"   ) ) ctx->in_kind[ in_idx ] = IN_KIND_REPLAY;
+    else if( 0==strcmp( link->name, "replay_slot"  ) ) ctx->in_kind[ in_idx ] = IN_KIND_REPLAY;
     else FD_LOG_ERR(( "repair tile has unexpected input link %s", link->name ));
 
     ctx->in_links[ in_idx ].mem    = topo->workspaces[ topo->objs[ link->dcache_obj_id ].wksp_id ].wksp;

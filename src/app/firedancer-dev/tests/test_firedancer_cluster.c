@@ -219,7 +219,7 @@ parse_configs( char * spec ) {
     config->has_user_config              = 1;
     config->development.no_clone         = 1;
     config->development.no_agave         = 1;
-    config->firedancer.development.alpenglow = 1;
+    config->firedancer.consensus.alpenglow = 1;
     config->log.log_fd                   = -1;
     fd_topo_initialize( config );
 

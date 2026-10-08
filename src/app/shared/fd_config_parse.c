@@ -12,6 +12,9 @@ fd_config_check_configf( fd_config_t *  config,
   if( FD_UNLIKELY( config->paths.snapshots[ 0 ]!='\0' && config->paths.snapshots[ 0 ]!='/' ) ) {
     FD_LOG_ERR(( "[config->paths.snapshots] must be an absolute path and hence start with a '/'"));
   }
+  if( FD_UNLIKELY( config->paths.vote_history[ 0 ]!='\0' && config->paths.vote_history[ 0 ]!='/' ) ) {
+    FD_LOG_ERR(( "[config->paths.vote_history] must be an absolute path and hence start with a '/'"));
+  }
 }
 
 fd_configh_t *
@@ -97,6 +100,8 @@ fd_config_extract_podf( uchar *        pod,
   CFG_POP      ( uint,   layout.snapsv_tile_count                            );
   CFG_POP      ( uint,   layout.snapsv_io_worker_count                       );
 
+  CFG_POP      ( cstr,   layout.mode                                         );
+
   CFG_POP      ( ulong,  accounts.max_accounts                               );
   CFG_POP      ( ulong,  accounts.cache_size_gib                             );
 
@@ -106,6 +111,7 @@ fd_config_extract_podf( uchar *        pod,
   CFG_POP      ( ulong,  runtime.program_cache_size_mib                      );
 
   CFG_POP      ( cstr,   consensus.wait_for_supermajority_with_bank_hash     );
+  CFG_POP      ( bool,   consensus.alpenglow                                 );
 
   CFG_POP      ( uint,   snapshots.sources.max_local_full_effective_age      );
   CFG_POP      ( uint,   snapshots.sources.max_local_incremental_age         );
@@ -134,7 +140,6 @@ fd_config_extract_podf( uchar *        pod,
 
   CFG_POP      ( bool,   development.hard_fork_fatal                         );
   CFG_POP      ( bool,   development.fixed_fec_sets                          );
-  CFG_POP      ( bool,   development.alpenglow                               );
 
   CFG_POP      ( ulong,  development.runtime.max_stake_accounts              );
   CFG_POP      ( ulong,  development.runtime.max_stake_accounts_fallback     );
@@ -182,6 +187,7 @@ fd_config_extract_pod( uchar *       pod,
     CFG_POP    ( cstr,   paths.stake_delegations                          );
     CFG_POP    ( cstr,   paths.shredb                                 );
     CFG_POP    ( cstr,   paths.guidb                                  );
+    CFG_POP    ( cstr,   paths.vote_history                               );
   } else {
     CFG_POP1   ( cstr,   scratch_directory,           paths.base          );
     CFG_POP1   ( cstr,   ledger.path,                 frankendancer.paths.ledger );
@@ -297,11 +303,13 @@ fd_config_extract_pod( uchar *       pod,
   CFG_POP      ( ushort, tiles.repair.repair_client_listen_port           );
   CFG_POP      ( ulong,  tiles.repair.slot_max                            );
 
-  CFG_POP      ( ulong,  tiles.rotor.slot_max                             );
-
   CFG_POP      ( bool,   tiles.rserve.enabled                             );
   CFG_POP      ( ushort, tiles.rserve.repair_serve_listen_port            );
   CFG_POP      ( ulong,  tiles.rserve.shred_storage_limit_gib             );
+
+  CFG_POP      ( bool,   tiles.tower.write_vote_history_file              );
+
+  CFG_POP      ( bool,   tiles.votor.write_vote_history_file              );
 
   CFG_POP      ( ulong,  capture.capture_start_slot                       );
   CFG_POP      ( cstr,   capture.solcap_capture                           );

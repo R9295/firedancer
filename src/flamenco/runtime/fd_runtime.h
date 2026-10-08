@@ -209,6 +209,10 @@ struct fd_runtime {
     ulong cu_cum;
     ulong instr_cum;
     ulong cpi_cum;
+
+    /* Committed writable accounts left byte-identical by the txn,
+       whose lthash update was skipped */
+    ulong lthash_unchanged_cnt;
   } metrics;
 
   struct {
@@ -321,6 +325,10 @@ struct fd_txn_out {
     uchar new_vote    [ MAX_TX_ACCOUNT_LOCKS ];
     uchar rm_vote     [ MAX_TX_ACCOUNT_LOCKS ];
 
+    /* Set when the transaction modifies the account (agave's touch).
+       Only touched writable accounts are committed. */
+    uchar touched     [ MAX_TX_ACCOUNT_LOCKS ];
+
     ulong nonce_idx_in_txn; /* !=ULONG_MAX if exists */
     ulong nonce_rollback_data_len;
     uchar nonce_rollback_data[ FD_RUNTIME_ACC_SZ_MAX ];
@@ -419,7 +427,9 @@ fd_runtime_cancel_txn( fd_runtime_t *      runtime,
    bundle.  It is responsible for acquiring the union of all accounts
    referenced by all transactions in the bundle.  This is required
    to make sure account acquisition does not get torn across tiles and
-   cause a resource acquisition deadlock. */
+   cause a resource acquisition deadlock.  On preparation failure, stores
+   the returned error in the failing member's err.txn_err; other members'
+   err.txn_err fields are unchanged. */
 
 int
 fd_runtime_prepare_bundle_accounts( fd_runtime_t *      runtime,

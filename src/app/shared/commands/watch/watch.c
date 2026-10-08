@@ -526,8 +526,10 @@ write_bench( config_t const * config,
     if( FD_LIKELY( strcmp( config->topo.tiles[ i ].name, "benchg" ) ) ) continue;
 
     ulong total_ticks = total_regime( &cur_tile[ i*FD_METRICS_TOTAL_SZ ] )-total_regime( &prev_tile[ i*FD_METRICS_TOTAL_SZ ] );
-    double backp_pct = 100.0*(double)( diff_tile( config, "benchg", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG ) ) )/(double)total_ticks;
-    double idle_pct = 100.0*(double)( diff_tile( config, "benchg", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG ) ) )/(double)total_ticks;
+    double backp_pct = 100.0*(double)( diff_tile( config, "benchg", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG ) )
+                                      +diff_tile( config, "benchg", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_SLEEPING ) ) )/(double)total_ticks;
+    double idle_pct = 100.0*(double)( diff_tile( config, "benchg", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG ) )
+                                     +diff_tile( config, "benchg", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_SLEEPING ) ) )/(double)total_ticks;
     double busy_pct = 100.0 - idle_pct - backp_pct;
 
     PRINT( " %s%.1f" U( "%%" ) RESET, sev_color( busy_pct ), busy_pct );
@@ -538,8 +540,10 @@ write_bench( config_t const * config,
     if( FD_LIKELY( strcmp( config->topo.tiles[ i ].name, "benchs" ) ) ) continue;
 
     ulong total_ticks = total_regime( &cur_tile[ i*FD_METRICS_TOTAL_SZ ] )-total_regime( &prev_tile[ i*FD_METRICS_TOTAL_SZ ] );
-    double backp_pct = 100.0*(double)( diff_tile( config, "benchs", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG ) ) )/(double)total_ticks;
-    double idle_pct = 100.0*(double)( diff_tile( config, "benchs", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG ) ) )/(double)total_ticks;
+    double backp_pct = 100.0*(double)( diff_tile( config, "benchs", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG ) )
+                                      +diff_tile( config, "benchs", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_SLEEPING ) ) )/(double)total_ticks;
+    double idle_pct = 100.0*(double)( diff_tile( config, "benchs", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG ) )
+                                     +diff_tile( config, "benchs", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_SLEEPING ) ) )/(double)total_ticks;
     double busy_pct = 100.0 - idle_pct - backp_pct;
 
     PRINT( " %s%.1f" U( "%%" ) RESET, sev_color( busy_pct ), busy_pct );
@@ -685,15 +689,23 @@ write_snapshots( config_t const * config,
   snapdc_total_ticks = fd_ulong_max( snapdc_total_ticks, 1UL );
   snapin_total_ticks = fd_ulong_max( snapin_total_ticks, 1UL );
 
-  double snapct_backp_pct = 100.0*(double)diff_tile( config, "snapct", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG ) )/(double)snapct_total_ticks;
-  double snapld_backp_pct = 100.0*(double)diff_tile( config, "snapld", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG ) )/(double)snapld_total_ticks;
-  double snapdc_backp_pct = 100.0*(double)diff_tile( config, "snapdc", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG ) )/(double)snapdc_total_ticks;
-  double snapin_backp_pct = 100.0*(double)diff_tile( config, "snapin", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG ) )/(double)snapin_total_ticks;
+  double snapct_backp_pct = 100.0*(double)( diff_tile( config, "snapct", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG ) )
+                                            +diff_tile( config, "snapct", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_SLEEPING ) ) )/(double)snapct_total_ticks;
+  double snapld_backp_pct = 100.0*(double)( diff_tile( config, "snapld", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG ) )
+                                            +diff_tile( config, "snapld", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_SLEEPING ) ) )/(double)snapld_total_ticks;
+  double snapdc_backp_pct = 100.0*(double)( diff_tile( config, "snapdc", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG ) )
+                                            +diff_tile( config, "snapdc", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_SLEEPING ) ) )/(double)snapdc_total_ticks;
+  double snapin_backp_pct = 100.0*(double)( diff_tile( config, "snapin", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG ) )
+                                            +diff_tile( config, "snapin", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_SLEEPING ) ) )/(double)snapin_total_ticks;
 
-  double snapct_idle_pct = 100.0*(double)diff_tile( config, "snapct", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG ) )/(double)snapct_total_ticks;
-  double snapld_idle_pct = 100.0*(double)diff_tile( config, "snapld", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG ) )/(double)snapld_total_ticks;
-  double snapdc_idle_pct = 100.0*(double)diff_tile( config, "snapdc", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG ) )/(double)snapdc_total_ticks;
-  double snapin_idle_pct = 100.0*(double)diff_tile( config, "snapin", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG ) )/(double)snapin_total_ticks;
+  double snapct_idle_pct = 100.0*(double)( diff_tile( config, "snapct", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG ) )
+                                           +diff_tile( config, "snapct", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_SLEEPING ) ) )/(double)snapct_total_ticks;
+  double snapld_idle_pct = 100.0*(double)( diff_tile( config, "snapld", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG ) )
+                                           +diff_tile( config, "snapld", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_SLEEPING ) ) )/(double)snapld_total_ticks;
+  double snapdc_idle_pct = 100.0*(double)( diff_tile( config, "snapdc", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG ) )
+                                           +diff_tile( config, "snapdc", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_SLEEPING ) ) )/(double)snapdc_total_ticks;
+  double snapin_idle_pct = 100.0*(double)( diff_tile( config, "snapin", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG ) )
+                                           +diff_tile( config, "snapin", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_SLEEPING ) ) )/(double)snapin_total_ticks;
 
   double busy [ 4 ] = { 100.0-snapct_idle_pct-snapct_backp_pct,
                         100.0-snapld_idle_pct-snapld_backp_pct,
@@ -874,8 +886,10 @@ write_accdb( config_t const * config,
 
   ulong accdb_total_ticks = total_regime( &cur_tile[ accdb_tile_idx*FD_METRICS_TOTAL_SZ ] )-total_regime( &prev_tile[ accdb_tile_idx*FD_METRICS_TOTAL_SZ ] );
   accdb_total_ticks = fd_ulong_max( accdb_total_ticks, 1UL );
-  double accdb_backp_pct = 100.0*(double)diff_tile( config, "accdb", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG ) )/(double)accdb_total_ticks;
-  double accdb_idle_pct  = 100.0*(double)diff_tile( config, "accdb", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG  ) )/(double)accdb_total_ticks;
+  double accdb_backp_pct = 100.0*(double)( diff_tile( config, "accdb", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG ) )
+                                          +diff_tile( config, "accdb", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_SLEEPING ) ) )/(double)accdb_total_ticks;
+  double accdb_idle_pct  = 100.0*(double)( diff_tile( config, "accdb", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG ) )
+                                          +diff_tile( config, "accdb", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_SLEEPING ) ) )/(double)accdb_total_ticks;
   double accdb_busy_pct  = 100.0 - accdb_backp_pct - accdb_idle_pct;
 
   ulong acct_cnt        = t[ MIDX( GAUGE,   ACCDB, ACCOUNT_COUNT         ) ];
@@ -1100,8 +1114,10 @@ write_gossip( config_t const * config,
 
   ulong gossip_total_ticks = total_regime( &cur_tile[ gossip_tile_idx*FD_METRICS_TOTAL_SZ ] )-total_regime( &prev_tile[ gossip_tile_idx*FD_METRICS_TOTAL_SZ ] );
   gossip_total_ticks = fd_ulong_max( gossip_total_ticks, 1UL );
-  double gossip_backp_pct = 100.0*(double)diff_tile( config, "gossip", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG ) )/(double)gossip_total_ticks;
-  double gossip_idle_pct = 100.0*(double)diff_tile( config, "gossip", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG ) )/(double)gossip_total_ticks;
+  double gossip_backp_pct = 100.0*(double)( diff_tile( config, "gossip", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG ) )
+                                           +diff_tile( config, "gossip", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_SLEEPING ) ) )/(double)gossip_total_ticks;
+  double gossip_idle_pct = 100.0*(double)( diff_tile( config, "gossip", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG ) )
+                                          +diff_tile( config, "gossip", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_SLEEPING ) ) )/(double)gossip_total_ticks;
   double gossip_busy_pct = 100.0 - gossip_backp_pct - gossip_idle_pct;
 
   PRINT( ROWH( "●", BLUE, "gossip      " )
@@ -1129,13 +1145,17 @@ write_repair( config_t const * config,
               ulong const *    prev_link ) {
   ulong repair_tile_idx = fd_topo_find_tile( &config->topo, "repair", 0UL );
   char const * repair_label = "repair      ";
+  int          is_rotor     = 0;
   if( repair_tile_idx==ULONG_MAX ) {
     repair_tile_idx = fd_topo_find_tile( &config->topo, "rotor", 0UL );
     repair_label    = "rotor       ";
+    is_rotor        = 1;
   }
   if( repair_tile_idx==ULONG_MAX ) return 0U;
-  ulong repair_slot = cur_tile[ repair_tile_idx*FD_METRICS_TOTAL_SZ+MIDX( GAUGE, REPAIR, SLOT_HIGHEST_REPAIRED ) ];
-  ulong turbine_slot = cur_tile[ repair_tile_idx*FD_METRICS_TOTAL_SZ+MIDX( GAUGE, REPAIR, SLOT_CURRENT ) ];
+  ulong highest_off  = is_rotor ? MIDX( GAUGE, ROTOR, SLOT_HIGHEST_DELIVERED ) : MIDX( GAUGE, REPAIR, SLOT_HIGHEST_REPAIRED );
+  ulong current_off  = is_rotor ? MIDX( GAUGE, ROTOR, SLOT_HIGHEST_RECEIVED  ) : MIDX( GAUGE, REPAIR, SLOT_CURRENT          );
+  ulong repair_slot  = cur_tile[ repair_tile_idx*FD_METRICS_TOTAL_SZ+highest_off ];
+  ulong turbine_slot = cur_tile[ repair_tile_idx*FD_METRICS_TOTAL_SZ+current_off ];
   long repair_lag = (long)repair_slot-(long)turbine_slot;
   PRINT( ROWH( "▲", RED, "%s" )
          K( "rx" ) "%s"
@@ -1235,9 +1255,11 @@ write_rserve( config_t const * config,
 static uint
 write_replay( config_t const * config,
               ulong const *    cur_tile ) {
+  int   repair_is_rotor = 0;
   ulong repair_tile_idx = fd_topo_find_tile( &config->topo, "repair", 0UL );
   if( repair_tile_idx==ULONG_MAX ) { // alpenglow
-    repair_tile_idx = fd_topo_find_tile( &config->topo, "rotor", 0UL );
+    repair_tile_idx  = fd_topo_find_tile( &config->topo, "rotor", 0UL );
+    repair_is_rotor  = 1;
   }
   ulong replay_tile_idx = fd_topo_find_tile( &config->topo, "replay", 0UL );
   if( replay_tile_idx==ULONG_MAX ) return 0U;
@@ -1249,7 +1271,7 @@ write_replay( config_t const * config,
 
   ulong turbine_slot;
   if( repair_tile_idx!=ULONG_MAX ) {
-    turbine_slot = cur_tile[ repair_tile_idx*FD_METRICS_TOTAL_SZ+MIDX( GAUGE, REPAIR, SLOT_CURRENT ) ];
+    turbine_slot = cur_tile[ repair_tile_idx*FD_METRICS_TOTAL_SZ+( repair_is_rotor ? MIDX( GAUGE, ROTOR, SLOT_HIGHEST_RECEIVED ) : MIDX( GAUGE, REPAIR, SLOT_CURRENT ) ) ];
   } else {
     turbine_slot = reset_slot;
   }
@@ -1298,6 +1320,55 @@ write_replay( config_t const * config,
   return 1U;
 }
 
+#define VOTOR_RATE( metric ) (__extension__({                                           \
+    ulong cnt = diff_tile( config, "votor", prev_tile, cur_tile, MIDX( COUNTER, VOTOR, metric ) ); \
+    COUNTF( (double)cnt*1e9/(double)SNAP_DT_NS() );                                     \
+  }))
+
+static uint
+write_votor( config_t const * config,
+             ulong const *    cur_tile,
+             ulong const *    prev_tile ) {
+  ulong votor_tile_idx = fd_topo_find_tile( &config->topo, "votor", 0UL );
+  if( votor_tile_idx==ULONG_MAX ) return 0U;
+  ulong const * t = &cur_tile[ votor_tile_idx*FD_METRICS_TOTAL_SZ ];
+
+  ulong replay_tile_idx = fd_topo_find_tile( &config->topo, "replay", 0UL );
+  ulong reset_slot      = replay_tile_idx!=ULONG_MAX ? cur_tile[ replay_tile_idx*FD_METRICS_TOTAL_SZ+MIDX( GAUGE, REPLAY, RESET_SLOT ) ] : 0UL;
+
+  ulong  finalized_slot = t[ MIDX( GAUGE, VOTOR, HIGHEST_FINAL_CERT_SLOT ) ];
+  ulong  slots_used     = t[ MIDX( GAUGE, VOTOR, SLOT_STATE_POOL_USED    ) ];
+  ulong  slots_max      = slots_used+t[ MIDX( GAUGE, VOTOR, SLOT_STATE_POOL_FREE ) ];
+  ulong  peers          = t[ MIDX( GAUGE, VOTOR, PEERS_CONNECTED      ) ];
+  long   rank           = (long)t[ MIDX( GAUGE, VOTOR, RANK           ) ];
+  double slots_pct      = slots_max ? 100.0*(double)slots_used/(double)slots_max : 0.0;
+  long   final_lag      = (long)finalized_slot-(long)reset_slot;
+
+  PRINT( ROWH( "◇", CYAN, "votor       " )
+         K( "final" ) BOLD "%lu" RESET " %s%+03ld" RESET
+         K( "slots" ) "%s%lu" RESET U( "/%lu" ),
+    finalized_slot,
+    final_lag<-32L ? RED : DIM,
+    final_lag,
+    sev_color( slots_pct ), slots_used, slots_max );
+  if( FD_UNLIKELY( rank<0L ) ) {
+    PRINT( "  " YELLOW "unstaked" RESET );
+  } else {
+    PRINT( K( "votes" ) "%s" U( "/s" )
+           K( "certs" ) "%s" U( "/s" )
+           K( "peers" ) "%lu"
+           K( "rank" )  "%ld",
+      VOTOR_RATE( VOTE_RX_SUCCESS ),
+      VOTOR_RATE( CERT_RX_SUCCESS ),
+      peers,
+      rank );
+  }
+  PRINT( CLEARLN "\n" );
+  return 1U;
+}
+
+#undef VOTOR_RATE
+
 static uint
 write_gui( config_t const * config,
            ulong const *    cur_tile,
@@ -1332,8 +1403,10 @@ write_gui( config_t const * config,
   ulong connection_count = cur_tile[ gui_tile_idx*FD_METRICS_TOTAL_SZ+off_conn_active ]+cur_tile[ gui_tile_idx*FD_METRICS_TOTAL_SZ+off_websocket_conn_active ];
   ulong gui_total_ticks = total_regime( &cur_tile[ gui_tile_idx*FD_METRICS_TOTAL_SZ ] )-total_regime( &prev_tile[ gui_tile_idx*FD_METRICS_TOTAL_SZ ] );
   gui_total_ticks = fd_ulong_max( gui_total_ticks, 1UL );
-  double gui_backp_pct = 100.0*(double)diff_tile( config, gui_name, prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG ) )/(double)gui_total_ticks;
-  double gui_idle_pct  = 100.0*(double)diff_tile( config, gui_name, prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG ) )/(double)gui_total_ticks;
+  double gui_backp_pct = 100.0*(double)( diff_tile( config, gui_name, prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG ) )
+                                        +diff_tile( config, gui_name, prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_SLEEPING ) ) )/(double)gui_total_ticks;
+  double gui_idle_pct  = 100.0*(double)( diff_tile( config, gui_name, prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG ) )
+                                        +diff_tile( config, gui_name, prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_SLEEPING ) ) )/(double)gui_total_ticks;
   double gui_busy_pct  = 100.0 - gui_backp_pct - gui_idle_pct;
 
   ulong sent_frame_count = diff_tile( config, gui_name, prev_tile, cur_tile, off_websocket_frame_tx );
@@ -1708,6 +1781,7 @@ write_summary( config_t const *           config,
   lines_printed += write_repair( config, cur_tile, cur_link, prev_link );
   lines_printed += write_rserve( config, cur_tile, cur_link, prev_link );
   lines_printed += write_replay( config, cur_tile );
+  lines_printed += write_votor( config, cur_tile, prev_tile );
   lines_printed += write_gui( config, cur_tile, prev_tile );
   lines_printed += write_event( config, cur_tile );
   lines_printed += write_backup( config, cur_tile );

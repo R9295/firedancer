@@ -18,6 +18,7 @@
 #include "../../flamenco/events/fd_event_runtime.h"
 
 #include <time.h>
+#include <linux/futex.h>
 #include "generated/fd_execrp_tile_seccomp.h"
 
 /* The exec tile is responsible for executing single transactions.  The
@@ -47,6 +48,7 @@ struct fd_execrp_tile {
 
   fd_sha512_t           sha_mem[ FD_TXN_SIG_MAX ];
   fd_sha512_t *         sha_lj[  FD_TXN_SIG_MAX ];
+  fd_ed25519_cache_t *  ed25519_cache;
 
   /* Capture context for debugging runtime execution. */
   fd_capture_ctx_t *    capture_ctx;
@@ -94,9 +96,14 @@ struct fd_execrp_tile {
     ulong txn_version[ FD_METRICS_ENUM_TXN_VERSION_CNT ];
   } metrics;
 
+  ulong ed25519_cache_seed;
 };
 
 typedef struct fd_execrp_tile fd_execrp_tile_t;
+
+/* Signer precomputation cache entries (vote authorities and frequent
+   fee payers) */
+#define ED25519_CACHE_ENT_CNT (2048UL)
 
 FD_FN_CONST static inline ulong
 scratch_align( void ) {
@@ -108,8 +115,9 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
   ulong l = FD_LAYOUT_INIT;
   l = FD_LAYOUT_APPEND(   l, alignof(fd_execrp_tile_t),    sizeof(fd_execrp_tile_t)                             );
   l = FD_LAYOUT_APPEND(   l, fd_txncache_align(),          fd_txncache_footprint( tile->execrp.max_live_slots ) );
-  l = FD_LAYOUT_APPEND(   l, fd_accdb_align(),             fd_accdb_footprint( tile->execrp.max_live_slots )    );
+  l = FD_LAYOUT_APPEND(   l, fd_accdb_align(),             fd_accdb_footprint( tile->execrp.max_live_slots, 0 )    );
   l = FD_LAYOUT_APPEND(   l, FD_PROGCACHE_SCRATCH_ALIGN,   FD_PROGCACHE_SCRATCH_FOOTPRINT                       );
+  l = FD_LAYOUT_APPEND(   l, fd_ed25519_cache_align(),     fd_ed25519_cache_footprint( ED25519_CACHE_ENT_CNT )  );
 
   if( FD_UNLIKELY( strlen( tile->execrp.solcap_capture ) ) ) {
     l = FD_LAYOUT_APPEND( l, fd_capture_ctx_align(),       fd_capture_ctx_footprint()                           );
@@ -154,6 +162,7 @@ metrics_write( fd_execrp_tile_t * ctx ) {
   FD_MCNT_SET( EXECRP, CU_EXECUTED, runtime->metrics.cu_cum );
   FD_MCNT_SET( EXECRP, INSTRUCTION_EXECUTED, runtime->metrics.instr_cum );
   FD_MCNT_SET( EXECRP, CPI_EXECUTED,         runtime->metrics.cpi_cum   );
+  FD_MCNT_SET( EXECRP, LTHASH_UNCHANGED,     runtime->metrics.lthash_unchanged_cnt );
 
   FD_ACCDB_METRICS_WRITE( EXECRP, fd_accdb_metrics( ctx->accdb ) );
 }
@@ -257,7 +266,7 @@ returnable_frag( fd_execrp_tile_t *  ctx,
                  fd_stem_context_t * stem ) {
   fd_startup_gate_busy( ctx->startup_gate );
 
-  if( (sig&0xFFFFFFFFUL)!=ctx->tile_idx ) return 0;
+  FD_TEST( (sig&0xFFFFFFFFUL)==ctx->tile_idx );
 
   FD_MGAUGE_SET( EXECRP, PROCESSING, 1UL );
 
@@ -315,7 +324,7 @@ returnable_frag( fd_execrp_tile_t *  ctx,
       }
       case FD_EXECRP_TT_TXN_SIGVERIFY: {
         fd_execrp_txn_sigverify_msg_t * msg = fd_chunk_to_laddr( ctx->replay_in->mem, chunk );
-        int res = fd_executor_txn_verify( msg->txn, ctx->sha_lj );
+        int res = fd_executor_txn_verify( msg->txn, ctx->sha_lj, ctx->ed25519_cache );
         fd_execrp_task_done_msg_t * out_msg = fd_chunk_to_laddr( ctx->execrp_replay_out->mem, ctx->execrp_replay_out->chunk );
         out_msg->bank_idx               = msg->bank_idx;
         out_msg->txn_sigverify->txn_idx = msg->txn_idx;
@@ -349,6 +358,15 @@ returnable_frag( fd_execrp_tile_t *  ctx,
 extern FD_TL int fd_wksp_oom_silent;
 
 static void
+privileged_init( fd_topo_t const *      topo,
+                 fd_topo_tile_t const * tile ) {
+  void * scratch = fd_topo_obj_laddr( topo, tile->tile_obj_id );
+  FD_SCRATCH_ALLOC_INIT( l, scratch );
+  fd_execrp_tile_t * ctx = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_execrp_tile_t), sizeof(fd_execrp_tile_t) );
+  FD_TEST( fd_rng_secure( &ctx->ed25519_cache_seed, sizeof(ulong) ) );
+}
+
+static void
 unprivileged_init( fd_topo_t const *      topo,
                    fd_topo_tile_t const * tile ) {
   void * scratch = fd_topo_obj_laddr( topo, tile->tile_obj_id );
@@ -356,8 +374,9 @@ unprivileged_init( fd_topo_t const *      topo,
   FD_SCRATCH_ALLOC_INIT( l, scratch );
   fd_execrp_tile_t * ctx    = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_execrp_tile_t),    sizeof(fd_execrp_tile_t)                             );
   void * _txncache          = FD_SCRATCH_ALLOC_APPEND( l, fd_txncache_align(),          fd_txncache_footprint( tile->execrp.max_live_slots ) );
-  void * _accdb             = FD_SCRATCH_ALLOC_APPEND( l, fd_accdb_align(),             fd_accdb_footprint( tile->execrp.max_live_slots )    );
+  void * _accdb             = FD_SCRATCH_ALLOC_APPEND( l, fd_accdb_align(),             fd_accdb_footprint( tile->execrp.max_live_slots, 0 )    );
   uchar * pc_scratch        = FD_SCRATCH_ALLOC_APPEND( l, FD_PROGCACHE_SCRATCH_ALIGN,   FD_PROGCACHE_SCRATCH_FOOTPRINT                       );
+  void * _ed25519_cache     = FD_SCRATCH_ALLOC_APPEND( l, fd_ed25519_cache_align(),     fd_ed25519_cache_footprint( ED25519_CACHE_ENT_CNT )  );
 
   void * _capture_ctx = NULL;
   if( FD_UNLIKELY( strlen( tile->execrp.solcap_capture ) ) ) {
@@ -381,6 +400,9 @@ unprivileged_init( fd_topo_t const *      topo,
     ctx->sha_lj[ i ] = sha;
   }
 
+  ctx->ed25519_cache = fd_ed25519_cache_join( fd_ed25519_cache_new( _ed25519_cache, ED25519_CACHE_ENT_CNT, ctx->ed25519_cache_seed ) );
+  FD_TEST( ctx->ed25519_cache );
+
   ctx->txn_in.bundle.is_bundle = 0;
   ctx->tile_idx = tile->kind_id;
 
@@ -401,11 +423,12 @@ unprivileged_init( fd_topo_t const *      topo,
   void * _accdb_shmem = fd_topo_obj_laddr( topo, tile->execrp.accdb_obj_id );
   fd_accdb_shmem_t * accdb_shmem = fd_accdb_shmem_join( _accdb_shmem );
   FD_TEST( accdb_shmem );
-  ctx->accdb = fd_accdb_join( fd_accdb_new( _accdb, accdb_shmem, FD_ACCDB_FD_RW, 0UL, NULL ) );
+  fd_sleep_t * accdb_sleep = topo->sleep_obj_id!=ULONG_MAX ? fd_sleep_join( fd_topo_obj_laddr( topo, topo->sleep_obj_id ) ) : NULL;
+  ctx->accdb = fd_accdb_join( fd_accdb_new( _accdb, accdb_shmem, FD_ACCDB_FD_RW, 0UL, NULL, accdb_sleep, fd_topo_find_tile( topo, "accdb", 0UL ), 0 ) );
   FD_TEST( ctx->accdb );
 
   /* First find and setup the in-link from replay to exec. */
-  ctx->replay_in->idx = fd_topo_find_tile_in_link( topo, tile, "replay_execrp", 0UL );
+  ctx->replay_in->idx = fd_topo_find_tile_in_link( topo, tile, "replay_execrp", ctx->tile_idx );
   FD_TEST( ctx->replay_in->idx!=ULONG_MAX );
   fd_topo_link_t const * replay_in_link = &topo->links[ tile->in_link_id[ ctx->replay_in->idx ] ];
   ctx->replay_in->mem    = topo->workspaces[ topo->objs[ replay_in_link->dcache_obj_id ].wksp_id ].wksp;
@@ -580,6 +603,7 @@ fd_topo_run_tile_t fd_tile_execrp = {
   .populate_allowed_fds     = populate_allowed_fds,
   .scratch_align            = scratch_align,
   .scratch_footprint        = scratch_footprint,
+  .privileged_init          = privileged_init,
   .unprivileged_init        = unprivileged_init,
   .run                      = stem_run,
 };

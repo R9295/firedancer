@@ -1,7 +1,5 @@
 #include "ag_cert_serde.h"
 
-#include "../../ballet/bls/fd_bls12_381.h" /* fd_bls12_381_g2_add_syscall */
-
 #define FAIL( cond, err ) do { if( FD_UNLIKELY( cond ) ) return AG_CERT_DE_ERR_##err; } while( 0 )
 
 ulong
@@ -72,6 +70,7 @@ ag_cert_ser( ag_cert_t const * self,
 
 int
 ag_cert_de( ag_cert_t *   self,
+            ulong *       bit_cnt,
             uchar const * buf,
             ulong         buf_sz ) {
   FAIL( buf_sz<2 /* version + tag */, SZ );
@@ -97,16 +96,14 @@ ag_cert_de( ag_cert_t *   self,
 
   fd_bls_sig_t   sig[1];
   blst_p2_affine sig_aff[1];
-  FAIL( cert.signature[0]&0xA0U,                                      INVAL );
   FAIL( blst_p2_deserialize( sig_aff, cert.signature )!=BLST_SUCCESS, INVAL );
-  FAIL( !blst_p2_affine_in_g2( sig_aff ),                             INVAL );
   blst_p2_from_affine( sig, sig_aff );
   cert.bitmap_sz     = FD_LOAD( ulong, buf+off ); off += sizeof(ulong);
   cert.bitmap        = buf+off;
   FD_TEST( off==hdr_sz );
 
   ulong rem = buf_sz - hdr_sz;
-  FAIL( cert.bitmap_sz>rem || rem-cert.bitmap_sz!=sizeof(ushort), SZ ); /* too few, or trailing bytes */
+  FAIL( cert.bitmap_sz>rem || rem-cert.bitmap_sz<sizeof(ushort), SZ ); /* too few, trailing bytes are ignored */
 
   cert.shred_version = FD_LOAD( ushort, cert.bitmap+cert.bitmap_sz );
 
@@ -115,21 +112,21 @@ ag_cert_de( ag_cert_t *   self,
   case AG_CERT_KIND_FINAL:
     self->final.slot = cert.slot;
     self->final.shred_version = cert.shred_version;
-    if( FD_UNLIKELY( err = ag_bls_agg_de( &self->final.agg, cert.bitmap, cert.bitmap_sz ) ) ) return err;
+    if( FD_UNLIKELY( err = ag_bls_agg_de( &self->final.agg, bit_cnt, cert.bitmap, cert.bitmap_sz ) ) ) return err;
     self->final.agg.sig = *sig;
     break;
   case AG_CERT_KIND_FAST_FINAL:
     self->fast_final.slot = cert.slot;
     self->fast_final.shred_version = cert.shred_version;
     memcpy( self->fast_final.block_hash, cert.block_id, sizeof(ag_block_hash_t) );
-    if( FD_UNLIKELY( err = ag_bls_agg_de( &self->fast_final.agg, cert.bitmap, cert.bitmap_sz ) ) ) return err;
+    if( FD_UNLIKELY( err = ag_bls_agg_de( &self->fast_final.agg, bit_cnt, cert.bitmap, cert.bitmap_sz ) ) ) return err;
     self->fast_final.agg.sig = *sig;
     break;
   case AG_CERT_KIND_NOTAR:
     self->notar.slot = cert.slot;
     self->notar.shred_version = cert.shred_version;
     memcpy( self->notar.block_hash, cert.block_id, sizeof(ag_block_hash_t) );
-    if( FD_UNLIKELY( err = ag_bls_agg_de( &self->notar.agg, cert.bitmap, cert.bitmap_sz ) ) ) return err;
+    if( FD_UNLIKELY( err = ag_bls_agg_de( &self->notar.agg, bit_cnt, cert.bitmap, cert.bitmap_sz ) ) ) return err;
     self->notar.agg.sig = *sig;
     break;
   case AG_CERT_KIND_NOTAR_FALLBACK: {
@@ -138,7 +135,7 @@ ag_cert_de( ag_cert_t *   self,
     self->notar_fallback.slot = cert.slot;
     self->notar_fallback.shred_version = cert.shred_version;
     memcpy( self->notar_fallback.block_hash, cert.block_id, sizeof(ag_block_hash_t) );
-    if( FD_UNLIKELY( err = ag_bls_agg_pair_de( agg, agg2, cert.bitmap, cert.bitmap_sz ) ) ) return err;
+    if( FD_UNLIKELY( err = ag_bls_agg_pair_de( agg, agg2, bit_cnt, cert.bitmap, cert.bitmap_sz ) ) ) return err;
     agg->sig = *sig;
     break;
   }
@@ -147,7 +144,7 @@ ag_cert_de( ag_cert_t *   self,
     fd_bls_agg_t * agg2 = &self->skip.agg_skip_fallback;
     self->skip.slot = cert.slot;
     self->skip.shred_version = cert.shred_version;
-    if( FD_UNLIKELY( err = ag_bls_agg_pair_de( agg, agg2, cert.bitmap, cert.bitmap_sz ) ) ) return err;
+    if( FD_UNLIKELY( err = ag_bls_agg_pair_de( agg, agg2, bit_cnt, cert.bitmap, cert.bitmap_sz ) ) ) return err;
     agg->sig = *sig;
     break;
   }

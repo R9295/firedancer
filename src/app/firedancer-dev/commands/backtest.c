@@ -5,7 +5,7 @@
    backtest-------------->replay------------->execrp
      ^                    |^ | ^                |
      |____________________|| | |________________|
-          replay_out       | |   execrp_replay
+          replay_slot      | |   execrp_replay
                            | |------------------------------>no consumer
     genesi------------------  replay_epoch
                 genesi_out
@@ -99,6 +99,8 @@ backtest_topo( config_t * config ) {
   fd_topob_wksp( topo, "metric_in" );
   fd_topob_tile( topo, "metric", "metric", "metric_in", FLOAT_CPU, 0, 0, 0, 1 );
 
+  if( FD_UNLIKELY( !strcmp( config->firedancer.layout.mode, "efficient" ) ) ) fd_topob_sleep( topo, "metric_in", NEXT_CPU );
+
   fd_topob_wksp( topo, "backt" );
   fd_topo_tile_t * backt_tile = fd_topob_tile( topo, "backt", "backt", "metric_in", NEXT_CPU, 0, 0, 0, 0 );
 
@@ -160,8 +162,8 @@ backtest_topo( config_t * config ) {
     fd_topob_wksp( topo, "snapdc" );
     fd_topob_wksp( topo, "snapin" );
 
-    fd_topo_tile_t * snapct_tile = fd_topob_tile( topo, "snapct",  "snapct",  "metric_in",  NEXT_CPU, 0, 0, 0, 0 );
-    fd_topo_tile_t * snapld_tile = fd_topob_tile( topo, "snapld",  "snapld",  "metric_in",  NEXT_CPU, 0, 0, 0, 0 );
+    fd_topo_tile_t * snapct_tile = fd_topob_tile( topo, "snapct",  "snapct",  "metric_in",  NEXT_CPU, 0, 0, 0, 1 );
+    fd_topo_tile_t * snapld_tile = fd_topob_tile( topo, "snapld",  "snapld",  "metric_in",  NEXT_CPU, 0, 0, 0, 1 );
     FOR(snapdc_tile_cnt)           fd_topob_tile( topo, "snapdc",  "snapdc",  "metric_in",  NEXT_CPU, 0, 0, 0, 0 )->allow_shutdown = 1;
     FOR(snapin_tile_cnt)           fd_topob_tile( topo, "snapin",  "snapin",  "metric_in",  NEXT_CPU, 0, 0, 0, 0 )->allow_shutdown = 1;
 
@@ -170,7 +172,7 @@ backtest_topo( config_t * config ) {
   }
 
   fd_topob_wksp( topo, "genesi" );
-  fd_topo_tile_t * genesi_tile = fd_topob_tile( topo, "genesi",  "genesi",  "metric_in",  NEXT_CPU, 0, 0, 0, 0 );
+  fd_topo_tile_t * genesi_tile = fd_topob_tile( topo, "genesi",  "genesi",  "metric_in",  NEXT_CPU, 0, 0, 0, 1 );
   genesi_tile->allow_shutdown = 1;
 
   fd_topob_wksp( topo, "genesi_out" );
@@ -285,7 +287,7 @@ backtest_topo( config_t * config ) {
      roots it.  Replay keys blocks by the synthetic ids the backtest tile
      feeds it, so the finalization certs in the ledger's footers can not
      root anything here. */
-  if( FD_UNLIKELY( config->firedancer.development.alpenglow ) ) {
+  if( FD_UNLIKELY( config->firedancer.consensus.alpenglow ) ) {
     fd_topob_wksp( topo, "votor_out" );
     fd_topob_link( topo, "votor_out", "votor_out", 1024UL, sizeof(fd_votor_msg_t), 1UL );
     fd_topob_tile_in( topo, "replay", 0UL, "metric_in", "votor_out", 0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
@@ -305,9 +307,12 @@ backtest_topo( config_t * config ) {
   /**********************************************************************/
 
   fd_topob_wksp( topo, "replay_out" );
-  fd_topob_link( topo, "replay_out", "replay_out", 8192UL, sizeof( fd_replay_message_t ), 1UL );
+  fd_topob_link( topo, "replay_out", "replay_out", 8192UL, sizeof( fd_replay_message_t ), 1UL )->permit_no_consumers = 1;
   fd_topob_tile_out( topo, "replay", 0UL, "replay_out", 0UL );
-  fd_topob_tile_in ( topo, "backt", 0UL, "metric_in", "replay_out", 0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
+  fd_topob_wksp( topo, "replay_slot" );
+  fd_topob_link( topo, "replay_slot", "replay_slot", 4096UL, sizeof( fd_replay_message_t ), 1UL );
+  fd_topob_tile_out( topo, "replay", 0UL, "replay_slot", 0UL );
+  fd_topob_tile_in ( topo, "backt", 0UL, "metric_in", "replay_slot", 0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
   fd_topob_tile_in ( topo, "backt", 0UL, "metric_in", "genesi_out", 0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
   if( FD_LIKELY( !disable_snap_loader ) ) {
     fd_topob_tile_in ( topo, "backt", 0UL, "metric_in", "snapin_manif", 0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
@@ -317,10 +322,10 @@ backtest_topo( config_t * config ) {
   /* Setup replay->exec link in topo                                    */
   /**********************************************************************/
   fd_topob_wksp( topo, "replay_execrp" );
-  fd_topob_link( topo, "replay_execrp", "replay_execrp", 16384UL, sizeof(fd_execrp_task_msg_t), 1UL );
-  fd_topob_tile_out( topo, "replay", 0UL, "replay_execrp", 0UL );
   for( ulong i=0UL; i<execrp_tile_cnt; i++ ) {
-    fd_topob_tile_in( topo, "execrp", i, "metric_in", "replay_execrp", 0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
+    fd_topob_link( topo, "replay_execrp", "replay_execrp", 256UL, sizeof(fd_execrp_task_msg_t), 1UL );
+    fd_topob_tile_out( topo, "replay", 0UL, "replay_execrp", i );
+    fd_topob_tile_in( topo, "execrp", i, "metric_in", "replay_execrp", i, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
   }
 
   /**********************************************************************/
@@ -362,7 +367,7 @@ backtest_topo( config_t * config ) {
     FOR(snapin_tile_cnt) fd_topob_tile_out( topo, "snapin", i, "snapin_gui", i );
 
     /**/                 fd_topob_tile_in( topo, "gui", 0UL, "metric_in", "tower_out",     0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
-    /**/                 fd_topob_tile_in( topo, "gui", 0UL, "metric_in", "replay_out",    0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
+    /**/                 fd_topob_tile_in( topo, "gui", 0UL, "metric_in", "replay_slot",   0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
     /**/                 fd_topob_tile_in( topo, "gui", 0UL, "metric_in", "replay_epoch",  0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
     /**/                 fd_topob_tile_in( topo, "gui", 0UL, "metric_in", "genesi_out",    0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
     FOR(execrp_tile_cnt) fd_topob_tile_in( topo, "gui", 0UL, "metric_in", "execrp_replay", i,   FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
@@ -395,7 +400,7 @@ backtest_topo( config_t * config ) {
                                          config->limits.max_shreds_per_block/FD_FEC_SHRED_CNT, config->limits.max_shreds_per_block );
   ulong store_fec_max = config->firedancer.runtime.max_live_slots * fec_sets_per_slot + repair_out_link->depth + 1UL;
   ulong store_fec_data_max = fd_ulong_if( config->firedancer.development.fixed_fec_sets, 31840UL, 63985UL );
-  fd_topo_obj_t * store_obj = setup_topo_store( topo, "store", store_fec_max, store_fec_data_max, 0UL, config->tiles.shred.shred_cache_size_mib, 0UL, config->limits.max_shreds_per_block, config->paths.shredb );
+  fd_topo_obj_t * store_obj = setup_topo_store( topo, "store", store_fec_max, store_fec_data_max, 0UL, config->tiles.shred.shred_cache_size_mib, 0UL, config->limits.max_shreds_per_block, config->paths.shredb, config->firedancer.consensus.alpenglow, 1UL );
   fd_topob_tile_uses( topo, backt_tile, store_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
   fd_topob_tile_uses( topo, replay_tile, store_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
   FD_TEST( fd_pod_insertf_ulong( topo->props, store_obj->id, "store" ) );
@@ -434,6 +439,9 @@ backtest_topo( config_t * config ) {
     fd_topo_obj_t * shmem_obj = fd_topob_obj( topo, "snapin_shmem", "snapin_shmem" );
     FD_TEST( fd_pod_insertf_ulong( topo->props, shmem_obj->id, "snapin_shmem" ) );
     FOR(snapin_tile_cnt) fd_topob_tile_uses( topo, &topo->tiles[ fd_topo_find_tile( topo, "snapin", i ) ], shmem_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
+
+    fd_topo_obj_t * dc_ticket_obj = fd_topob_obj_named( topo, "fseq", "snapdc", "frame_ticket" );
+    FOR(snapdc_tile_cnt) fd_topob_tile_uses( topo, &topo->tiles[ fd_topo_find_tile( topo, "snapdc", i ) ], dc_ticket_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
   }
 
   for( ulong i=0UL; i<topo->tile_cnt; i++ ) {
@@ -464,6 +472,7 @@ backtest_topo( config_t * config ) {
   }
 
   fd_topob_waker( topo );
+  fd_topob_sleep_finish( topo );
 
   fd_topob_finish( topo, CALLBACKS );
 }

@@ -473,6 +473,7 @@ typedef struct fd_tower_vtr fd_tower_vtr_t;
 struct fd_tower {
   fd_tower_vote_t * votes; /* our local tower's vote deque */
   ulong             root;  /* our local tower's root slot (ULONG_MAX if none) */
+  ulong             wait_to_vote_slot; /* never vote for slots below this */
 
   ulong              blk_max;   /* max number of blocks */
   ulong              vtr_max;   /* max number of voters */
@@ -638,6 +639,19 @@ ulong
 fd_tower_blocks_lowest_common_ancestor( fd_tower_t * tower,
                                         ulong        slot1,
                                         ulong        slot2 );
+
+/* fd_tower_blk_canonical_block_id returns the block id we treat as
+   canonical for blk: the confirmed one, else the one we voted for,
+   else the replayed one.  blk must be a valid block map entry; the
+   returned pointer is into blk and stays valid while blk does.
+   fd_tower_blocks_canonical_block_id is the same on a slot lookup. */
+
+static inline fd_hash_t const *
+fd_tower_blk_canonical_block_id( fd_tower_blk_t const * blk ) {
+  if     ( FD_LIKELY( blk->confirmed ) ) return &blk->confirmed_block_id;
+  else if( FD_LIKELY( blk->voted     ) ) return &blk->voted_block_id;
+  else                                   return &blk->replayed_block_id;
+}
 
 fd_hash_t const *
 fd_tower_blocks_canonical_block_id( fd_tower_t * tower,

@@ -1,6 +1,7 @@
 #include "fd_verify_tile.h"
 #include "../fd_txn_m.h"
 #include "../metrics/fd_metrics.h"
+#include <linux/futex.h>
 #include "generated/fd_verify_tile_seccomp.h"
 #include "../../flamenco/gossip/fd_gossip_message.h"
 
@@ -22,6 +23,7 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
   for( ulong i=0; i<FD_TXN_SIG_MAX; i++ ) {
     l = FD_LAYOUT_APPEND( l, fd_sha512_align(), fd_sha512_footprint() );
   }
+  l = FD_LAYOUT_APPEND( l, fd_ed25519_cache_align(), fd_ed25519_cache_footprint( FD_VERIFY_ED25519_CACHE_ENT_CNT ) );
   return FD_LAYOUT_FINI( l, scratch_align() );
 }
 
@@ -175,7 +177,7 @@ unprivileged_init( fd_topo_t const *      topo,
 
   FD_SCRATCH_ALLOC_INIT( l, scratch );
   fd_verify_ctx_t * ctx = FD_SCRATCH_ALLOC_APPEND( l, alignof( fd_verify_ctx_t ), sizeof( fd_verify_ctx_t ) );
-  fd_tcache_t * tcache = fd_tcache_join( fd_tcache_new( FD_SCRATCH_ALLOC_APPEND( l, FD_TCACHE_ALIGN, FD_TCACHE_FOOTPRINT( tile->verify.tcache_depth, 0UL ) ), tile->verify.tcache_depth, 0UL ) );
+  fd_tcache_t * tcache = fd_tcache_join( fd_tcache_new( FD_SCRATCH_ALLOC_APPEND( l, fd_tcache_align(), fd_tcache_footprint( tile->verify.tcache_depth, 0UL ) ), tile->verify.tcache_depth, 0UL ) );
   if( FD_UNLIKELY( !tcache ) ) FD_LOG_ERR(( "fd_tcache_join failed" ));
 
   ctx->round_robin_cnt = fd_topo_tile_name_cnt( topo, tile->name );
@@ -186,6 +188,10 @@ unprivileged_init( fd_topo_t const *      topo,
     if( FD_UNLIKELY( !sha ) ) FD_LOG_ERR(( "fd_sha512_join failed" ));
     ctx->sha[i] = sha;
   }
+
+  void * _ed25519_cache = FD_SCRATCH_ALLOC_APPEND( l, fd_ed25519_cache_align(), fd_ed25519_cache_footprint( FD_VERIFY_ED25519_CACHE_ENT_CNT ) );
+  ctx->ed25519_cache = fd_ed25519_cache_join( fd_ed25519_cache_new( _ed25519_cache, FD_VERIFY_ED25519_CACHE_ENT_CNT, ctx->hashmap_seed ) );
+  FD_TEST( ctx->ed25519_cache );
 
   ctx->bundle_failed = 0;
   ctx->bundle_id     = 0UL;
@@ -211,7 +217,7 @@ unprivileged_init( fd_topo_t const *      topo,
     if(      !strcmp( link->name, "quic_verify"  ) ) ctx->in_kind[ i ] = IN_KIND_QUIC;
     else if( !strcmp( link->name, "bundle_verif" ) ) ctx->in_kind[ i ] = IN_KIND_BUNDLE;
     else if( !strcmp( link->name, "txsend_out"   ) ) ctx->in_kind[ i ] = IN_KIND_TXSEND;
-    else if( !strcmp( link->name, "gossip_out"   ) ) ctx->in_kind[ i ] = IN_KIND_GOSSIP;
+    else if( !strcmp( link->name, "gossip_vote"  ) ) ctx->in_kind[ i ] = IN_KIND_GOSSIP;
     else FD_LOG_ERR(( "unexpected link name %s", link->name ));
   }
 

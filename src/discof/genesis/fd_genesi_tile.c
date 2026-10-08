@@ -3,6 +3,8 @@
 #include "fd_genesis_client.h"
 #include "../../disco/topo/fd_topo.h"
 #include "../../disco/topo/fd_dns_resolve.h"
+#include "../../disco/waker/fd_waker.h"
+#include "../../disco/fd_clock_tile.h"
 #include "../../flamenco/accdb/fd_accdb.h"
 #include "../../flamenco/accdb/fd_accdb_shmem.h"
 #include "../../flamenco/genesis/fd_genesis_parse.h"
@@ -22,6 +24,7 @@
 #include <linux/fs.h>
 
 #include <sys/socket.h>
+#include <linux/futex.h>
 #include "generated/fd_genesi_tile_seccomp.h"
 
 static void *
@@ -55,6 +58,11 @@ struct fd_genesi_tile {
 
   fd_genesis_client_t * client;
 
+  ulong   waker_client_idx;
+  ulong * waker_fseq;
+
+  fd_clock_tile_t clock[1];
+
   fd_ip4_port_t entrypoints[ FD_TOPO_GOSSIP_ENTRYPOINTS_MAX ];
   ulong         entrypoints_cnt;
 
@@ -82,10 +90,10 @@ struct fd_genesi_tile {
 
   fd_alloc_t * bz2_alloc;
 
-  fd_genesis_t genesis[1];
-  uchar *      genesis_blob;
-  ulong        genesis_blob_sz;
-  ulong        max_message_size;
+  fd_genesis_t * genesis;
+  uchar *        genesis_blob;
+  ulong          genesis_blob_sz;
+  ulong          max_message_size;
 };
 
 typedef struct fd_genesi_tile fd_genesi_tile_t;
@@ -95,6 +103,7 @@ scratch_align( void ) {
   ulong a = alignof( fd_genesi_tile_t );
   a = fd_ulong_max( a, fd_genesis_client_align() );
   a = fd_ulong_max( a, fd_alloc_align() );
+  a = fd_ulong_max( a, fd_genesis_align() );
   return a;
 }
 
@@ -105,8 +114,9 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
   l = FD_LAYOUT_APPEND( l, fd_genesis_client_align(),   fd_genesis_client_footprint() );
   l = FD_LAYOUT_APPEND( l, fd_alloc_align(),            fd_alloc_footprint()          );
   if( FD_UNLIKELY( !tile->genesi.entrypoints_cnt ) ) {
-    l = FD_LAYOUT_APPEND( l, fd_accdb_align(),          fd_accdb_footprint( tile->genesi.max_live_slots ) );
+    l = FD_LAYOUT_APPEND( l, fd_accdb_align(),          fd_accdb_footprint( tile->genesi.max_live_slots, 0 ) );
   }
+  l = FD_LAYOUT_APPEND( l, fd_genesis_align(),          fd_genesis_footprint( fd_genesis_account_max( tile->genesi.max_message_size ) ) );
   l = FD_LAYOUT_APPEND( l, alignof(uchar),              tile->genesi.max_message_size + 4UL*FD_TAR_BLOCK_SZ );
   return FD_LAYOUT_FINI( l, scratch_align() );
 }
@@ -121,6 +131,20 @@ loose_footprint( fd_topo_tile_t const * tile ) {
 static inline int
 should_shutdown( fd_genesi_tile_t * ctx ) {
   return ctx->shutdown;
+}
+
+static void
+during_housekeeping( fd_genesi_tile_t * ctx ) {
+  if( FD_UNLIKELY( fd_clock_tile_recal_due( ctx->clock ) ) ) fd_clock_tile_recal( ctx->clock );
+}
+
+static long
+next_deadline( fd_genesi_tile_t * ctx ) {
+  if( FD_LIKELY( ctx->shutdown || ctx->local_genesis ) ) return LONG_MAX;
+
+  long deadline = fd_genesis_client_deadline_nanos( ctx->client );
+  if( FD_UNLIKELY( deadline==LONG_MAX ) ) return 0L; /* first poll starts the clock */
+  return fd_clock_tile_wallclock_to_tickcount( ctx->clock, deadline );
 }
 
 static void
@@ -232,16 +256,19 @@ after_credit( fd_genesi_tile_t *  ctx,
     dst->blob_sz = ctx->genesis_blob_sz;
     fd_memcpy( dst_blob, ctx->genesis_blob, ctx->genesis_blob_sz );
 
-    fd_stem_publish( stem, 0UL, msg_sz, ctx->out.chunk0, msg_sz, 0UL, 0UL, 0UL );
+    fd_stem_publish( stem, 0UL, msg_sz, ctx->out.chunk0, 0UL, 0UL, 0UL, 0UL );
     *charge_busy = 1;
     FD_LOG_NOTICE(( "loaded local genesis.bin from file %s%s%s", fd_log_style_dim(), ctx->genesis_path, fd_log_style_normal() ));
 
     ctx->shutdown = 1;
   } else {
+    int fired = fd_fseq_query( ctx->waker_fseq )==1UL;
+    if( FD_LIKELY( fired ) ) fd_fseq_update( ctx->waker_fseq, 0UL );
     uchar * buffer;
     ulong buffer_sz;
     fd_ip4_port_t peer;
-    int result = fd_genesis_client_poll( ctx->client, &peer, &buffer, &buffer_sz, charge_busy );
+    int result = fd_genesis_client_poll( ctx->client, fd_clock_tile_now( ctx->clock ), &peer, &buffer, &buffer_sz, charge_busy );
+    if( FD_LIKELY( fired ) ) fd_waker_client_rearm( ctx->waker_client_idx );
     if( FD_UNLIKELY( -1==result ) ) FD_LOG_ERR(( "failed to retrieve genesis.bin from any configured gossip entrypoints" ));
     if( FD_LIKELY( 1==result ) ) return;
 
@@ -348,7 +375,7 @@ after_credit( fd_genesi_tile_t *  ctx,
     char basename_partial[ PATH_MAX ];
     FD_TEST( fd_cstr_printf_check( basename_partial, PATH_MAX, NULL, "%s.partial", basename ) );
 
-    int err = renameat2( ctx->out_dir_fd, basename_partial, ctx->out_dir_fd, basename, RENAME_NOREPLACE );
+    int err = (int)syscall( SYS_renameat2, ctx->out_dir_fd, basename_partial, ctx->out_dir_fd, basename, RENAME_NOREPLACE );
     if( FD_UNLIKELY( -1==err ) ) FD_LOG_ERR(( "renameat2() failed (%i-%s)", errno, fd_io_strerror( errno ) ));
 
     FD_LOG_NOTICE(( "retrieved genesis %s%s%s from peer at %shttp://" FD_IP4_ADDR_FMT ":%hu/genesis.tar.bz2%s",
@@ -482,7 +509,7 @@ privileged_init( fd_topo_t const *      topo,
           fd_dns_resolve_peers( tile->genesi.entrypoints[ 0 ], sizeof(tile->genesi.entrypoints[ 0 ]), tile->genesi.entrypoints_cnt, "gossip.entrypoints", ctx->entrypoints );
           ctx->entrypoints_cnt = tile->genesi.entrypoints_cnt;
 
-          fd_genesis_client_init( ctx->client, ctx->entrypoints, ctx->entrypoints_cnt );
+          fd_genesis_client_init( ctx->client, ctx->entrypoints, ctx->entrypoints_cnt, FD_WAKER_INNER_FD( tile->waker_client_idx ) );
         }
       }
     } else {
@@ -501,12 +528,21 @@ unprivileged_init( fd_topo_t const *      topo,
                            FD_SCRATCH_ALLOC_APPEND( l, fd_genesis_client_align(),   fd_genesis_client_footprint()                     );
   void * _alloc          = FD_SCRATCH_ALLOC_APPEND( l, fd_alloc_align(),            fd_alloc_footprint()                              );
   void * _accdb          = !tile->genesi.entrypoints_cnt ?
-                           FD_SCRATCH_ALLOC_APPEND( l, fd_accdb_align(),            fd_accdb_footprint( tile->genesi.max_live_slots ) ) :
+                           FD_SCRATCH_ALLOC_APPEND( l, fd_accdb_align(),            fd_accdb_footprint( tile->genesi.max_live_slots, 0 ) ) :
                            NULL;
+  void * _genesis        = FD_SCRATCH_ALLOC_APPEND( l, fd_genesis_align(),          fd_genesis_footprint( fd_genesis_account_max( tile->genesi.max_message_size ) ) );
   void * _genesis_blob   = FD_SCRATCH_ALLOC_APPEND( l, alignof(uchar),              tile->genesi.max_message_size + 4UL*FD_TAR_BLOCK_SZ );
 
   fd_lthash_zero( ctx->lthash );
 
+  ctx->waker_client_idx = tile->waker_client_idx;
+  FD_TEST( ctx->waker_client_idx!=ULONG_MAX );
+  ctx->waker_fseq = fd_fseq_join( fd_topo_obj_laddr( topo, tile->waker_fseq_obj_id ) );
+  FD_TEST( ctx->waker_fseq );
+  fd_clock_tile_init( ctx->clock );
+
+  ctx->genesis = fd_genesis_new( _genesis, fd_genesis_account_max( tile->genesi.max_message_size ) );
+  FD_TEST( ctx->genesis );
   ctx->genesis_blob = _genesis_blob;
   ctx->max_message_size = tile->genesi.max_message_size;
   ctx->shutdown = 0;
@@ -521,7 +557,8 @@ unprivileged_init( fd_topo_t const *      topo,
     void * _accdb_shmem = fd_topo_obj_laddr( topo, tile->genesi.accdb_obj_id );
     fd_accdb_shmem_t * accdb_shmem = fd_accdb_shmem_join( _accdb_shmem );
     FD_TEST( accdb_shmem );
-    ctx->accdb = fd_accdb_join( fd_accdb_new( _accdb, accdb_shmem, FD_ACCDB_FD_RW, 0UL, NULL ) );
+    fd_sleep_t * accdb_sleep = topo->sleep_obj_id!=ULONG_MAX ? fd_sleep_join( fd_topo_obj_laddr( topo, topo->sleep_obj_id ) ) : NULL;
+    ctx->accdb = fd_accdb_join( fd_accdb_new( _accdb, accdb_shmem, FD_ACCDB_FD_RW, 0UL, NULL, accdb_sleep, fd_topo_find_tile( topo, "accdb", 0UL ), 0 ) );
     FD_TEST( ctx->accdb );
   }
 
@@ -583,7 +620,9 @@ populate_allowed_seccomp( fd_topo_t const *      topo,
   }
 
   uint accounts_fd = !tile->genesi.entrypoints_cnt ? (uint)FD_ACCDB_FD_RW : (uint)-1;
-  populate_sock_filter_policy_fd_genesi_tile( out_cnt, out, (uint)fd_log_private_logfile_fd(), in_fd, out_fd, out_dir_fd, accounts_fd );
+  uint epoll_inner_fd = (uint)FD_WAKER_INNER_FD( tile->waker_client_idx );
+  uint epoll_outer_fd = (uint)FD_WAKER_OUTER_FD;
+  populate_sock_filter_policy_fd_genesi_tile( out_cnt, out, (uint)fd_log_private_logfile_fd(), in_fd, out_fd, out_dir_fd, accounts_fd, epoll_inner_fd, epoll_outer_fd );
   return sock_filter_policy_fd_genesi_tile_instr_cnt;
 }
 
@@ -597,12 +636,14 @@ populate_allowed_fds( fd_topo_t const *      topo,
   FD_SCRATCH_ALLOC_INIT( l, scratch );
   fd_genesi_tile_t * ctx = FD_SCRATCH_ALLOC_APPEND( l, alignof( fd_genesi_tile_t ), sizeof( fd_genesi_tile_t ) );
 
-  if( FD_UNLIKELY( out_fds_cnt<tile->genesi.entrypoints_cnt+6UL ) ) FD_LOG_ERR(( "out_fds_cnt %lu", out_fds_cnt ));
+  if( FD_UNLIKELY( out_fds_cnt<tile->genesi.entrypoints_cnt+8UL ) ) FD_LOG_ERR(( "out_fds_cnt %lu", out_fds_cnt ));
 
   ulong out_cnt = 0UL;
   out_fds[ out_cnt++ ] = 2; /* stderr */
   if( FD_LIKELY( -1!=fd_log_private_logfile_fd() ) )
     out_fds[ out_cnt++ ] = fd_log_private_logfile_fd(); /* logfile */
+  out_fds[ out_cnt++ ] = FD_WAKER_OUTER_FD;                           /* waker outer epoll fd (rearm) */
+  out_fds[ out_cnt++ ] = FD_WAKER_INNER_FD( tile->waker_client_idx ); /* waker inner epoll fd */
   if( FD_UNLIKELY( !tile->genesi.entrypoints_cnt ) )
     out_fds[ out_cnt++ ] = FD_ACCDB_FD_RW; /* accounts db */
 
@@ -624,14 +665,16 @@ populate_allowed_fds( fd_topo_t const *      topo,
   return out_cnt;
 }
 
+#define STEM_LAZY ((long)1e5) /* 0.1ms */
 #define STEM_BURST (1UL)
 
 #define STEM_CALLBACK_CONTEXT_TYPE  fd_genesi_tile_t
 #define STEM_CALLBACK_CONTEXT_ALIGN alignof(fd_genesi_tile_t)
 
-#define STEM_CALLBACK_AFTER_CREDIT    after_credit
-#define STEM_CALLBACK_SHOULD_SHUTDOWN should_shutdown
-#define STEM_LAZY                     ((long)1e5) /* 0.1ms */
+#define STEM_CALLBACK_DURING_HOUSEKEEPING during_housekeeping
+#define STEM_CALLBACK_NEXT_DEADLINE       next_deadline
+#define STEM_CALLBACK_AFTER_CREDIT        after_credit
+#define STEM_CALLBACK_SHOULD_SHUTDOWN     should_shutdown
 
 #include "../../disco/stem/fd_stem.c"
 

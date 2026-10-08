@@ -10,21 +10,8 @@
 #define AG_NOTAR_FALLBACK_VOTE_MAX (3UL)    /* Definition 12 */
 #define AG_NOTAR_FALLBACK_CERT_MAX (4UL)    /* Lemma 48 */
 
-#define AG_DELTA_NS             (250000000L)       /* 250 ms 0.5-RTT, partial-synchrony */
-#define AG_DELTA_BLOCK_NS       (200000000L)       /* 200 ms slots */
-#define AG_DELTA_FIRST_SLICE_NS (10000000L)        /* TODO */
-#define AG_DELTA_TIMEOUT_NS     (3L * AG_DELTA_NS) /* skip timeout  */
-#define AG_DELTA_STANDSTILL_NS  (10000000000L)     /* 10s since last finalize */
-#define AG_TIMEOUT_MAX_NS       (3600000000000L)   /* 1h cap on a standstill-extended skip timeout */
-
-/* During a standstill, certs and our own votes above the finalized slot
-   are refreshed in batches of at most AG_REFRESH_MSG_MAX messages every
-   AG_REFRESH_INTERVAL_NS, so as to stay within the per-peer rate limit
-   Agave applies to Votor traffic (Agave STANDSTILL_REFRESH_BATCH_SIZE
-   and STANDSTILL_REFRESH_INTERVAL). */
-
-#define AG_REFRESH_INTERVAL_NS  (1000000000L)      /* 1s between refresh batches */
-#define AG_REFRESH_MSG_MAX      (20UL)             /* messages per refresh batch */
+#define AG_DELTA_TIMEOUT_NS    (400000000L)   /* skip timeout */
+#define AG_DELTA_STANDSTILL_NS (10000000000L) /* 10s since last finalize */
 
 #define AG_WEAKEST_QUORUM_THRESHOLD_NUMER (1UL) /* 20%, safe-to-notar + 40% skip */
 #define AG_WEAK_QUORUM_THRESHOLD_NUMER    (2UL) /* 40%, safe-to-notar / safe-to-skip */
@@ -32,15 +19,18 @@
 #define AG_STRONG_QUORUM_THRESHOLD_NUMER  (4UL) /* 80%, fast-finalize */
 #define AG_QUORUM_THRESHOLD_DENOM         (5UL) /* 100% */
 
-typedef uchar ag_block_hash_t[ 32 ]; /* double merkle root of the block */
 typedef uchar ag_vote_key_t  [ 32 ]; /* vote account address */
 typedef uchar ag_id_key_t    [ 32 ]; /* identity public key */
+typedef uchar ag_bls_key_t   [ 48 ]; /* compressed BLS public key */
 
-union ag_block_hash_key { /* ag_block_hash_t as an assignable fd_map key */
-  uchar uc[ 32 ];
-  ulong ul[  4 ];
+typedef uchar ag_block_hash_t[ 32 ]; /* double merkle root of the block */
+static const ag_block_hash_t ag_block_hash_null = { 0 };
+
+struct ag_block_hash_key { /* ag_block_hash_t as an assignable fd_map key */
+  ag_block_hash_t block_hash;
 };
-typedef union ag_block_hash_key ag_block_hash_key_t;
+typedef struct ag_block_hash_key ag_block_hash_key_t;
+static const ag_block_hash_key_t ag_block_hash_key_null = { 0 };
 
 struct ag_block_id {
   ulong           slot;
@@ -58,14 +48,14 @@ typedef struct ag_block_info ag_block_info_t;
 typedef struct ag_vote ag_vote_t; /* forward decl */
 typedef struct ag_cert ag_cert_t; /* forward decl */
 
-struct ag_refresh {
-  ulong       slot; /* highest finalized slot as of the refresh */
+struct ag_standstill {
+  ulong       slot;
   ag_cert_t * certs;
   ulong       cert_cnt;
   ag_vote_t * votes;
   ulong       vote_cnt;
 };
-typedef struct ag_refresh ag_refresh_t;
+typedef struct ag_standstill ag_standstill_t;
 
 FD_PROTOTYPES_BEGIN
 

@@ -490,6 +490,8 @@ fd_quic_init( fd_quic_t * quic ) {
 
     .alpn                  = config->alpn,
     .alpn_sz               = config->alpn_sz,
+
+    .req_client_cert       = config->req_client_cert,
   };
 
   /* State: Initialize handshake pool */
@@ -2833,6 +2835,7 @@ fd_quic_tls_cb_handshake_complete( fd_quic_tls_hs_t * hs,
   switch( conn->state ) {
     case FD_QUIC_CONN_STATE_ABORT:
     case FD_QUIC_CONN_STATE_CLOSE_PENDING:
+    case FD_QUIC_CONN_STATE_PEER_CLOSE:
     case FD_QUIC_CONN_STATE_DEAD:
       /* ignore */
       return;
@@ -3037,12 +3040,55 @@ fd_quic_conn_tx_buf_remaining( fd_quic_conn_t * conn ) {
   return (ulong)( sizeof( conn->tx_buf_conn ) - (ulong)( conn->tx_ptr - conn->tx_buf_conn ) );
 }
 
+static inline int
+fd_quic_conn_can_acquire_pkt_meta( fd_quic_conn_t             * conn,
+                                   fd_quic_pkt_meta_tracker_t * tracker ) {
+  fd_quic_state_t * state = fd_quic_get_state( conn->quic );
+  fd_quic_metrics_t * metrics = &conn->quic->metrics;
+
+  ulong pool_free = fd_quic_pkt_meta_pool_free( tracker->pool );
+  if( !pool_free || conn->used_pkt_meta >= state->max_inflight_frame_cnt_conn ) {
+    if( !pool_free ) {
+      metrics->frame_tx_alloc_cnt[FD_METRICS_ENUM_FRAME_TX_ALLOC_RESULT_V_FAIL_EMPTY_POOL_IDX]++;
+    } else {
+      metrics->frame_tx_alloc_cnt[FD_METRICS_ENUM_FRAME_TX_ALLOC_RESULT_V_FAIL_CONNECTION_MAX_IDX]++;
+    }
+    return 0;
+  }
+  metrics->frame_tx_alloc_cnt[FD_METRICS_ENUM_FRAME_TX_ALLOC_RESULT_V_SUCCESS_IDX]++;
+
+  return 1;
+}
+
+/* fd_quic_gen_frame_store_pkt_meta stores a pkt_meta into tracker.
+   Value and type take the passed args; all other fields are copied
+   from pkt_meta_tmpl. Returns 1 if successful, 0 if not.
+   Failure reasons include empty pkt_meta pool, or this conn reached
+   its pkt_meta limit. Theoretically only need latter, but let's be safe! */
+static inline int
+fd_quic_gen_frame_store_pkt_meta( const fd_quic_pkt_meta_t   * pkt_meta_tmpl,
+                                  uchar                        type,
+                                  fd_quic_pkt_meta_value_t     value,
+                                  fd_quic_pkt_meta_tracker_t * tracker,
+                                  fd_quic_conn_t             * conn ) {
+  if( !fd_quic_conn_can_acquire_pkt_meta( conn, tracker ) ) return 0;
+
+  conn->used_pkt_meta++;
+  fd_quic_pkt_meta_t * pkt_meta = fd_quic_pkt_meta_pool_ele_acquire( tracker->pool );
+  *pkt_meta = *pkt_meta_tmpl;
+  FD_QUIC_PKT_META_SET_TYPE( pkt_meta, type );
+  pkt_meta->val = value;
+  fd_quic_pkt_meta_insert( &tracker->sent_pkt_metas[pkt_meta->enc_level], pkt_meta, tracker->pool );
+  return 1;
+}
+
 ulong
 fd_quic_conn_tx_dgram( fd_quic_conn_t * conn,
                        uchar *          pkt,
                        ulong            pkt_sz,
                        uchar const *    dgram,
-                       ulong            dgram_sz ) {
+                       ulong            dgram_sz,
+                       ulong *          opt_pkt_num ) {
   if( FD_UNLIKELY( !conn || !pkt || (!dgram && dgram_sz) ) ) return 0UL;
   if( FD_UNLIKELY( conn->state!=FD_QUIC_CONN_STATE_ACTIVE ) ) return 0UL;
   if( FD_UNLIKELY( !fd_uint_extract_bit( conn->keys_avail, fd_quic_enc_level_appdata_id ) ) ) return 0UL;
@@ -3124,6 +3170,17 @@ fd_quic_conn_tx_dgram( fd_quic_conn_t * conn,
 #endif
 
   conn->pkt_number[ pn_space ] = pkt_num + 1UL;
+
+  /* RFC 9221 Section 5.2: DATAGRAM frames are ack-eliciting, so track
+     the packet for RTT samples and loss detection like any other */
+  long               expiry           = state->now + fd_quic_calc_expiry_duration( conn, 0, conn->server );
+  fd_quic_pkt_meta_t pkt_meta_tmpl[1] = {{ .expiry = expiry, .tx_time = state->now, .enc_level = fd_quic_enc_level_appdata_id, .pn_space = (uchar)pn_space }};
+  FD_QUIC_PKT_META_SET_PKT_NUM( pkt_meta_tmpl, pkt_num );
+  if( FD_LIKELY( fd_quic_gen_frame_store_pkt_meta( pkt_meta_tmpl, FD_QUIC_PKT_META_TYPE_DATAGRAM, (fd_quic_pkt_meta_value_t){0}, &conn->pkt_meta_tracker, conn ) ) ) {
+    fd_quic_svc_prep_schedule( conn, expiry );
+    fd_quic_svc_schedule1( conn );
+  }
+  if( opt_pkt_num ) *opt_pkt_num = pkt_num;
   return out_sz;
 }
 
@@ -3250,48 +3307,6 @@ fd_quic_tx_buffered( fd_quic_t *      quic,
       endpoint->udp_port,
       conn->host.ip_addr,
       conn->host.udp_port);
-}
-
-static inline int
-fd_quic_conn_can_acquire_pkt_meta( fd_quic_conn_t             * conn,
-                                   fd_quic_pkt_meta_tracker_t * tracker ) {
-  fd_quic_state_t * state = fd_quic_get_state( conn->quic );
-  fd_quic_metrics_t * metrics = &conn->quic->metrics;
-
-  ulong pool_free = fd_quic_pkt_meta_pool_free( tracker->pool );
-  if( !pool_free || conn->used_pkt_meta >= state->max_inflight_frame_cnt_conn ) {
-    if( !pool_free ) {
-      metrics->frame_tx_alloc_cnt[FD_METRICS_ENUM_FRAME_TX_ALLOC_RESULT_V_FAIL_EMPTY_POOL_IDX]++;
-    } else {
-      metrics->frame_tx_alloc_cnt[FD_METRICS_ENUM_FRAME_TX_ALLOC_RESULT_V_FAIL_CONNECTION_MAX_IDX]++;
-    }
-    return 0;
-  }
-  metrics->frame_tx_alloc_cnt[FD_METRICS_ENUM_FRAME_TX_ALLOC_RESULT_V_SUCCESS_IDX]++;
-
-  return 1;
-}
-
-/* fd_quic_gen_frame_store_pkt_meta stores a pkt_meta into tracker.
-   Value and type take the passed args; all other fields are copied
-   from pkt_meta_tmpl. Returns 1 if successful, 0 if not.
-   Failure reasons include empty pkt_meta pool, or this conn reached
-   its pkt_meta limit. Theoretically only need latter, but let's be safe! */
-static inline int
-fd_quic_gen_frame_store_pkt_meta( const fd_quic_pkt_meta_t   * pkt_meta_tmpl,
-                                  uchar                        type,
-                                  fd_quic_pkt_meta_value_t     value,
-                                  fd_quic_pkt_meta_tracker_t * tracker,
-                                  fd_quic_conn_t             * conn ) {
-  if( !fd_quic_conn_can_acquire_pkt_meta( conn, tracker ) ) return 0;
-
-  conn->used_pkt_meta++;
-  fd_quic_pkt_meta_t * pkt_meta = fd_quic_pkt_meta_pool_ele_acquire( tracker->pool );
-  *pkt_meta = *pkt_meta_tmpl;
-  FD_QUIC_PKT_META_SET_TYPE( pkt_meta, type );
-  pkt_meta->val = value;
-  fd_quic_pkt_meta_insert( &tracker->sent_pkt_metas[pkt_meta->enc_level], pkt_meta, tracker->pool );
-  return 1;
 }
 
 static ulong
@@ -4599,10 +4614,12 @@ fd_quic_pkt_meta_retry( fd_quic_t      *  quic,
       return;
     };
 
-    quic->metrics.pkt_retransmissions_cnt[enc_level] += !(pkt_meta->key.pkt_num == prev_retx_pkt_num[enc_level]);
+    uint type = pkt_meta->key.type;
+    int  retx = type!=FD_QUIC_PKT_META_TYPE_DATAGRAM; /* a lost DATAGRAM is only reclaimed */
+
+    quic->metrics.pkt_retransmissions_cnt[enc_level] += (ulong)( retx & !(pkt_meta->key.pkt_num == prev_retx_pkt_num[enc_level]) );
     prev_retx_pkt_num[enc_level] = pkt_num;
 
-    uint type = pkt_meta->key.type;
     FD_DTRACE_PROBE_4( quic_pkt_meta_retry, conn->our_conn_id, pkt_num, expiry, type);
     /* set the data to retry */
     switch( type ) {
@@ -4700,7 +4717,7 @@ fd_quic_pkt_meta_retry( fd_quic_t      *  quic,
     }
 
     /* reschedule to ensure the data gets processed */
-    fd_quic_svc_prep_schedule_now( conn );
+    if( retx ) fd_quic_svc_prep_schedule_now( conn );
 
     fd_quic_pkt_meta_remove( &tracker->sent_pkt_metas[enc_level], pool, pkt_meta );
     conn->used_pkt_meta--;
@@ -4929,6 +4946,8 @@ fd_quic_process_ack_range( fd_quic_conn_t      * conn,
   }
 
   conn->used_pkt_meta -= fd_quic_pkt_meta_remove_range( sent, pool, lo, hi );
+
+  if( enc_level==fd_quic_enc_level_appdata_id ) fd_quic_cb_ack_range( conn->quic, conn, lo, hi );
 }
 
 static ulong
@@ -5131,9 +5150,14 @@ fd_quic_handle_new_token_frame(
     fd_quic_new_token_frame_t * data,
     uchar const *               p    FD_PARAM_UNUSED,
     ulong                       p_sz FD_PARAM_UNUSED ) {
-  /* FIXME A server MUST treat receipt of a NEW_TOKEN frame as a connection error of type PROTOCOL_VIOLATION. */
   (void)data;
   FD_DTRACE_PROBE_1( quic_handle_new_token_frame, context->conn->our_conn_id );
+  /* A server MUST treat receipt of a NEW_TOKEN frame as a connection
+     error of type PROTOCOL_VIOLATION. (RFC 9000 Section 19.7) */
+  if( FD_UNLIKELY( context->conn->server ) ) {
+    fd_quic_frame_error( context, FD_QUIC_CONN_REASON_PROTOCOL_VIOLATION, __LINE__ );
+    return FD_QUIC_PARSE_FAIL;
+  }
   return 0UL;
 }
 

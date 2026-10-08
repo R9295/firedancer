@@ -5,7 +5,7 @@
 #include "ag_bls_serde.h"
 
 #define AG_CERT_DE_SUCCESS   ( 0)
-#define AG_CERT_DE_ERR_SZ    (-1) /* Io(ReadSizeLimit), TrailingBytes, PreallocationSizeLimit, LengthEncodingOverflow */
+#define AG_CERT_DE_ERR_SZ    (-1) /* Io(ReadSizeLimit), PreallocationSizeLimit, LengthEncodingOverflow                */
 #define AG_CERT_DE_ERR_INVAL (-2) /* InvalidTagEncoding, InvalidValue                                                 */
 
 FD_STATIC_ASSERT( AG_BLS_DE_SUCCESS  ==AG_CERT_DE_SUCCESS,   ag_cert_serde );
@@ -55,6 +55,7 @@ ag_cert_ser( ag_cert_t const * self,
 
 int
 ag_cert_de( ag_cert_t *   cert,
+            ulong *       bit_cnt,
             uchar const * buf,
             ulong         buf_sz );
 

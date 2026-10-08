@@ -10,22 +10,27 @@
 #include "../../util/net/fd_net_headers.h"
 #include "../../util/net/fd_ip6.h"
 #include "../pack/fd_pack_acct_blocklist.h"
+#include "../keyguard/fd_keyguard.h"
 
 /* Maximum number of workspaces that may be present in a topology. */
-#define FD_TOPO_MAX_WKSPS         (256UL)
+#define FD_TOPO_MAX_WKSPS          ( 256UL)
 /* Maximum number of links that may be present in a topology. */
-#define FD_TOPO_MAX_LINKS         (256UL)
+#define FD_TOPO_MAX_LINKS          (1024UL)
 /* Maximum number of tiles that may be present in a topology. */
-#define FD_TOPO_MAX_TILES         (256UL)
+#define FD_TOPO_MAX_TILES          ( 256UL)
 /* Maximum number of objects that may be present in a topology. */
-#define FD_TOPO_MAX_OBJS          (4096UL)
+#define FD_TOPO_MAX_OBJS           (4096UL)
 /* Maximum number of links that may go into any one tile in the
    topology. */
-#define FD_TOPO_MAX_TILE_IN_LINKS  ( 128UL)
+#define FD_TOPO_MAX_TILE_IN_LINKS  ( 256UL)
 /* Maximum number of links that a tile may write to. */
-#define FD_TOPO_MAX_TILE_OUT_LINKS ( 32UL)
+#define FD_TOPO_MAX_TILE_OUT_LINKS (  64UL)
 /* Maximum number of objects that a tile can use. */
-#define FD_TOPO_MAX_TILE_OBJS      ( 256UL)
+#define FD_TOPO_MAX_TILE_OBJS      (1024UL)
+
+FD_STATIC_ASSERT( FD_SLEEP_LINK_MAX==FD_TOPO_MAX_LINKS,          sleep_limits );
+FD_STATIC_ASSERT( FD_SLEEP_IN_MAX  ==FD_TOPO_MAX_TILE_IN_LINKS,  sleep_limits );
+FD_STATIC_ASSERT( FD_SLEEP_OUT_MAX ==FD_TOPO_MAX_TILE_OUT_LINKS, sleep_limits );
 
 /* Maximum number of additional ip addresses */
 #define FD_NET_MAX_SRC_ADDR 4
@@ -96,12 +101,6 @@ typedef struct {
   uint permit_no_producers : 1;  /* Permit a topology where this link has no producers */
 } fd_topo_link_t;
 
-/* Be careful: ip and host are in different byte order */
-typedef struct {
-  uint   ip;   /* in network byte order */
-  ushort port; /* in host byte order */
-} fd_topo_ip_port_t;
-
 struct fd_topo_net_tile {
   ulong umem_dcache_obj_id;  /* dcache for network UMEM frames */
   uint  bind_address;
@@ -140,6 +139,7 @@ struct fd_topo_tile {
 
   ulong cpu_idx;                /* The CPU index to pin the tile on.  A value of ULONG_MAX or more indicates the tile should be floating and not pinned to a core. */
   int   floats;                 /* Scheduled by the kernel over the CPUs of the floating tiles on its NUMA node, never a pinned tile's CPU, instead of pinned to cpu_idx (efficient mode).  cpu_idx still places memory and isolation, and is the fallback when no such CPU remains. */
+  int   sleep_eventfd;          /* Parks in epoll on its own fds and is woken through the eventfd FD_SLEEP_EVENTFD( id ), not FUTEX_WAKE (efficient mode only) */
 
   ulong waker_client_idx;       /* Client slot in the fixed inherited fd range (inner epoll fd FD_WAKER_INNER_FD( idx )), or ULONG_MAX if not a waker client */
   ulong waker_fseq_obj_id;      /* fseq object holding the tile's waker readiness word or ULONG_MAX */
@@ -397,15 +397,17 @@ struct fd_topo_tile {
     struct {
       ulong             fec_exposure;
       ulong             fec_resolver_depth;
+      ulong             slot_max;
       char              identity_key_path[ PATH_MAX ];
       ushort            shred_listen_port;
       ulong             max_shreds_per_block;
       ulong             bench_max_shreds_per_block; /* [development.bench], floors the chain's per-slot limit */
       ushort            expected_shred_version;
-      ulong             adtl_dests_retransmit_cnt;
-      fd_topo_ip_port_t adtl_dests_retransmit[ FD_TOPO_ADTL_DESTS_MAX ];
-      ulong             adtl_dests_leader_cnt;
-      fd_topo_ip_port_t adtl_dests_leader[ FD_TOPO_ADTL_DESTS_MAX ];
+      ulong adtl_dests_retransmit_cnt;
+      char  adtl_dests_retransmit[ FD_TOPO_ADTL_DESTS_MAX ][ FD_HOSTPORT_BUF_MAX ];
+      ulong adtl_dests_leader_cnt;
+      char  adtl_dests_leader[ FD_TOPO_ADTL_DESTS_MAX ][ FD_HOSTPORT_BUF_MAX ];
+      int   alpenglow;
     } shred;
 
     struct {
@@ -415,7 +417,7 @@ struct fd_topo_tile {
     struct {
       char  identity_key_path[ PATH_MAX ];
       ulong authorized_voter_paths_cnt;
-      char  authorized_voter_paths[ 16 ][ PATH_MAX ];
+      char  authorized_voter_paths[ FD_KEYGUARD_AUTH_VOTERS_MAX ][ PATH_MAX ];
       struct {
         uchar tip_payment_program_addr[ 32 ];
         uchar tip_distribution_program_addr[ 32 ];
@@ -468,6 +470,7 @@ struct fd_topo_tile {
 
       char identity_key_path[ PATH_MAX ];
       int  delay_startup;
+      int  alpenglow;
 
       int    snapshot_server_enabled;
       char   snapshot_server_host[ FD_FQDN_BUF_MAX ];
@@ -508,6 +511,7 @@ struct fd_topo_tile {
       ulong heap_size_gib;
       ulong sched_depth;
       ulong max_live_slots;
+      ulong genesis_max_message_size;
       ulong full_snapshot_interval_blocks;
       ulong incremental_snapshot_interval_blocks;
 
@@ -595,7 +599,8 @@ struct fd_topo_tile {
       ushort  repair_client_listen_port;
       char    identity_key_path[ PATH_MAX ];
       ulong   slot_max;
-      ulong   max_shreds_per_block;
+      ulong   fec_max;
+      int     allow_private_address;
 
       ulong   repair_sign_depth;
       ulong   repair_sign_cnt;
@@ -606,6 +611,7 @@ struct fd_topo_tile {
       char   identity_key_path[ PATH_MAX ];
       ulong  ping_cache_entries;
       ulong  max_shreds_per_block;
+      ulong  blockdb_max; /* 0 disables the block metadata db */
     } rserve;
 
     struct {
@@ -641,18 +647,20 @@ struct fd_topo_tile {
       ulong accdb_obj_id;
 
       ulong authorized_voter_paths_cnt;
-      char  authorized_voter_paths[ 16 ][ PATH_MAX ];
+      char  authorized_voter_paths[ FD_KEYGUARD_AUTH_VOTERS_MAX ][ PATH_MAX ];
       int   hard_fork_fatal;
       int   wait_for_supermajority;
       ulong max_live_slots;
       char  identity_key[ PATH_MAX ];
       char  vote_account[ PATH_MAX ];
-      char  base_path[PATH_MAX];
+      char  tower_path[ PATH_MAX ];
       ulong max_shreds_per_block;
     } tower;
 
     struct {
       char   identity_key_path[ PATH_MAX ];
+      char   vote_history_path[ PATH_MAX ];
+      ulong  authorized_voter_paths_cnt;
       ushort quic_client_listen_port;
       ushort quic_server_listen_port;
       uint   ip_addr;
@@ -725,6 +733,7 @@ struct fd_topo_tile {
       ulong banks_obj_id;
       ulong shmem_obj_id; /* shared parallel snapin state */
       ulong max_txn_per_slot;
+      int   alpenglow;
     } snapin;
 
     struct {
@@ -1020,6 +1029,21 @@ fd_topo_find_link_producer( fd_topo_t const *      topo,
 
     for( ulong j=0; j<tile->out_cnt; j++ ) {
       if( FD_UNLIKELY( tile->out_link_id[ j ] == link->id ) ) return i;
+    }
+  }
+  return ULONG_MAX;
+}
+
+/* Find the id of the tile which is a consumer of the given link.  If
+   no tile is a consumer of the link, returns ULONG_MAX. */
+FD_FN_PURE static inline ulong
+fd_topo_find_link_consumer( fd_topo_t const *      topo,
+                            fd_topo_link_t const * link ) {
+  for( ulong i=0; i<topo->tile_cnt; i++ ) {
+    fd_topo_tile_t const * tile = &topo->tiles[ i ];
+
+    for( ulong j=0; j<tile->in_cnt; j++ ) {
+      if( FD_UNLIKELY( tile->in_link_id[ j ] == link->id ) ) return i;
     }
   }
   return ULONG_MAX;
@@ -1335,11 +1359,12 @@ fd_topo_run_tile( fd_topo_t *          topo,
    respectively, RLIMIT_MLOCK needs to be 9 MiB to allow all three
    process mlock() calls to succeed.
 
-   Tiles lock memory in three ways.  Any workspace they are using, they
+   Tiles lock memory in four ways.  Any workspace they are using, they
    lock the entire workspace.  Then each tile uses huge pages for the
    stack which are also locked, and finally some tiles use private
-   locked mmaps outside the workspace for storing key material.  The
-   results here include all of this memory together.
+   locked mmaps outside the workspace for storing key material.  Every
+   tile also locks the executable code.  The results here include all of
+   this memory together.
 
    The result is not necessarily the amount of memory used by the tile
    process, although it will be quite close.  Tiles could potentially
@@ -1349,6 +1374,21 @@ fd_topo_run_tile( fd_topo_t *          topo,
    actual amount of memory used will not be less than this value. */
 FD_FN_PURE ulong
 fd_topo_mlock_max_tile( fd_topo_t const * topo );
+
+/* fd_topo_mlock_code locks the code, rodata and initialized data of
+   every loaded ELF object into DRAM, so tiles cannot stall on major
+   faults when the page cache is evicted under memory pressure. */
+
+void
+fd_topo_mlock_code( void );
+
+/* fd_topo_code_footprint returns the bytes that would be locked by
+   fd_topo_mlock_code, either the read-only segments (writable==0),
+   which are page cache shared by all tiles, or the writable segments
+   (writable==1), which are private to each tile process. */
+
+ulong
+fd_topo_code_footprint( int writable );
 
 /* Same as fd_topo_mlock_max_tile, but for loading the entire topology
    into one process, rather than a separate process per tile.  This is
@@ -1379,7 +1419,8 @@ fd_topo_huge_page_cnt( fd_topo_t const * topo,
                        int               include_anonymous );
 
 /* Returns the number of normal (4 KiB) pages needed by the topology
-   for extra allocations like private key storage and XSK rings. */
+   for extra allocations like private key storage and XSK rings, plus
+   the locked code (read-only segments once, writable ones per tile). */
 
 FD_FN_PURE ulong
 fd_topo_normal_page_cnt( fd_topo_t const * topo );

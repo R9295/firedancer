@@ -1,4 +1,13 @@
-uint logfile_fd, uint in_full_fd, uint in_incr_fd, uint sockfd
+# epoll_inner_fd: Kernel file descriptors are waited by a separate tile
+#                 (the waker) for scheduling reasons, so file
+#                 descriptors from server connections should be added
+#                 to this epoll set.
+#
+# epoll_outer_fd: The waker puts our inner set into another set, so it
+#                 can poll all file descriptors across all tiles at once.
+#                 This tile needs access to the outer file descriptor to
+#                 rearm the inner set after a drain.
+uint logfile_fd, uint in_full_fd, uint in_incr_fd, uint sockfd, uint epoll_inner_fd, uint epoll_outer_fd
 
 # logging: all log messages are written to a file and/or pipe
 #
@@ -90,3 +99,33 @@ getrandom
 
 # shutdown: exit is called on shutdown
 exit: (eq (arg 0) 0)
+
+# waker: register/deregister connections and manage EPOLLOUT interest
+# in the tile's inner epoll set, and rearm the tile's entry in the
+# waker's outer epoll set after draining
+#
+# arg 0 is the epoll fd being modified.  The tile may modify its own
+# inner set freely, and may only touch its own inner fd's entry in the
+# outer set.
+epoll_ctl: (or (eq (arg 0) epoll_inner_fd)
+               (and (eq (arg 0) epoll_outer_fd)
+                    (eq (arg 2) epoll_inner_fd)))
+
+# power saving: sleep when there is no work to do
+#
+# In the efficient scheduler mode, an idle tile parks on its sleep word
+# with futex_wait until a producer has work for it or its next deadline
+# passes.
+#
+# arg 1 is the futex op, always FUTEX_WAIT_BITSET so the timeout is an
+# absolute deadline.  arg 2 is the expected value of the word, always 0
+# (parked).
+futex: (and (eq (arg 1) FUTEX_WAIT_BITSET)
+            (eq (arg 2) 0))
+
+# power saving: resume an interrupted sleep
+#
+# A signal delivered to a parked tile interrupts its futex_wait, and the
+# kernel resumes the wait with the remaining timeout via restart_syscall
+# when the tile next runs.
+restart_syscall

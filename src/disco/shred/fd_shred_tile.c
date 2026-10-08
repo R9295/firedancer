@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <linux/futex.h>
 #include "generated/fd_shred_tile_seccomp.h"
 #include "../../util/pod/fd_pod_format.h"
 #include "fd_shredder.h"
@@ -24,6 +25,7 @@
 #include "../keyguard/fd_keyswitch.h"
 #include "../fd_disco.h"
 #include "../net/fd_net_tile.h"
+#include "fd_shred_dest_resolver.h"
 #include "../../flamenco/leaders/fd_leaders.h"
 #include "../../util/net/fd_net_headers.h"
 #include "../../flamenco/gossip/fd_gossip_message.h"
@@ -257,10 +259,16 @@ typedef struct {
   ulong       shred_out_wmark;
   ulong       shred_out_chunk;
 
+  /* Highest slot relayed on turbine, published for rpc
+     (getMaxRetransmitSlot).  NULL if rpc is disabled. */
+  ulong *     rtx_fseq;
+  ulong       rtx_slot;
+
   fd_store_t    * store;
   fd_store_map_t  map_join[1];
   int             disk_fd;
   int             store_maintenance;
+  int             alpenglow;
 
   fd_gossip_update_message_t gossip_upd_buf[1];
 
@@ -402,6 +410,7 @@ during_housekeeping( fd_shred_ctx_t * ctx ) {
 
 static inline void
 metrics_write( fd_shred_ctx_t * ctx ) {
+  FD_MHIST_COPY( SHRED, REPAIR_COMPLETION_LAG_SECONDS, fd_fec_resolver_completion_lag_hist( ctx->resolver ) );
   FD_MHIST_COPY( SHRED, CONTACT_INFO_PER_MESSAGE,   ctx->metrics->contact_info_cnt             );
   FD_MHIST_COPY( SHRED, BATCH_SIZE_BYTES,           ctx->metrics->batch_sz                     );
   FD_MHIST_COPY( SHRED, MICROBLOCK_PER_BATCH,       ctx->metrics->batch_microblock_cnt         );
@@ -1066,6 +1075,7 @@ complete_fec_set( fd_shred_ctx_t *         ctx,
   /* Compute merkle root and chained merkle root. */
 
   int replay_fwd = 1;
+  int again      = 0;
   if( FD_LIKELY( ctx->store ) ) { /* firedancer-only */
 
     set->leader_bank = NULL; /* un-used by firedancer */
@@ -1073,9 +1083,10 @@ complete_fec_set( fd_shred_ctx_t *         ctx,
     fd_hash_t const * mr = fd_type_pun_const( merkle_root );
 
     fd_store_fec_t * fec;
-    int insert_err = fd_store_insert( ctx->store, ctx->map_join, mr, &fec );
+    int insert_err = fd_store_insert( ctx->store, ctx->map_join, mr, last->slot, ctx->round_robin_id, &fec );
     if( FD_UNLIKELY( insert_err==FD_MAP_ERR_KEY ) ) {
-      replay_fwd = 0;
+      replay_fwd = ctx->alpenglow;
+      again      = 1;
     } else {
       FD_TEST( !insert_err && fec );
 
@@ -1116,7 +1127,7 @@ complete_fec_set( fd_shred_ctx_t *         ctx,
     FD_STATIC_ASSERT( FD_SHRED_STEM_BURST>=32UL, shred_out_burst );
     ulong missing_chunk[ 32 ];
     ulong missing_cnt = 0UL;
-    for( int i=0; i<32; i++ ) {
+    for( int i=0; !again && i<32; i++ ) {
       if( fd_uint_extract_bit( set->data_shred_rcvd, i )==0 ) {
         fd_shred_t * const missing = &set->data_shreds[ i ].s[0];
 
@@ -1147,7 +1158,7 @@ complete_fec_set( fd_shred_ctx_t *         ctx,
        completed by the singular coding shred, and that also happens
        to evict a FEC set from the curr_map.  When fix-32 arrives, the
        link burst value can be lowered to 2. */
-    ulong sig = is_leader ? SHRED_SIG_FEC_COMPLETE_LEADER : SHRED_SIG_FEC_COMPLETE;
+    ulong sig = again ? SHRED_SIG_FEC_COMPLETE_AGAIN : ( is_leader ? SHRED_SIG_FEC_COMPLETE_LEADER : SHRED_SIG_FEC_COMPLETE );
 
     fd_fec_complete_t * complete_msg = fd_chunk_to_laddr( ctx->shred_out_mem, ctx->shred_out_chunk );
     complete_msg->last_shred_hdr = *last;
@@ -1390,6 +1401,10 @@ after_frag( fd_shred_ctx_t *    ctx,
     if( FD_LIKELY( fd_disco_netmux_sig_proto( sig ) != DST_PROTO_REPAIR &&
                  ( (rv==FD_FEC_RESOLVER_SHRED_OKAY) | (rv==FD_FEC_RESOLVER_SHRED_COMPLETES) ) ) ) {
       /* Relay this shred */
+      if( FD_UNLIKELY( ctx->rtx_fseq && shred->slot>ctx->rtx_slot ) ) {
+        ctx->rtx_slot = shred->slot;
+        fd_fseq_update( ctx->rtx_fseq, shred->slot );
+      }
       ulong max_dest_cnt[1];
       do {
         /* If we've validated the shred and it COMPLETES but we can't
@@ -1425,6 +1440,17 @@ privileged_init( fd_topo_t const *      topo,
     FD_LOG_ERR(( "identity_key_path not set" ));
 
   ctx->identity_key[ 0 ] = *(fd_pubkey_t const *)fd_type_pun_const( fd_keyload_load( tile->shred.identity_key_path, /* pubkey only: */ 1 ) );
+
+  ctx->adtl_dests_retransmit_cnt = tile->shred.adtl_dests_retransmit_cnt;
+  fd_shred_resolve_additional_destinations( tile->shred.adtl_dests_retransmit,
+                                            tile->shred.adtl_dests_retransmit_cnt,
+                                            "tiles.shred.additional_shred_destinations_retransmit",
+                                            ctx->adtl_dests_retransmit );
+  ctx->adtl_dests_leader_cnt = tile->shred.adtl_dests_leader_cnt;
+  fd_shred_resolve_additional_destinations( tile->shred.adtl_dests_leader,
+                                            tile->shred.adtl_dests_leader_cnt,
+                                            "tiles.shred.additional_shred_destinations_leader",
+                                            ctx->adtl_dests_leader );
 
   if( FD_UNLIKELY( !fd_rng_secure( &(ctx->resolver_seed), sizeof(ulong) ) ) ) {
     FD_LOG_CRIT(( "fd_rng_secure failed" ));
@@ -1483,6 +1509,7 @@ unprivileged_init( fd_topo_t const *      topo,
     FD_TEST( ctx->store->magic==FD_STORE_MAGIC );
     FD_TEST( fd_store_map_ljoin( ctx->store, ctx->map_join ) );
   }
+  ctx->alpenglow = tile->shred.alpenglow;
   /* With rserve disabled, shred:0 remains responsible for punching
      reclaimed spill pages, and will charge busy. */
   ctx->store_maintenance = !!ctx->store && !ctx->round_robin_id &&
@@ -1496,6 +1523,15 @@ unprivileged_init( fd_topo_t const *      topo,
   ulong fec_sets_required_sz   = fec_set_cnt*sizeof(fd_fec_set_t);
 
   void * fec_sets_shmem = NULL;
+
+  ctx->rtx_fseq = NULL;
+  ctx->rtx_slot = 0UL;
+  ulong rtx_obj_id = fd_pod_queryf_ulong( topo->props, ULONG_MAX, "shred_rtx.%lu", tile->kind_id );
+  if( FD_UNLIKELY( rtx_obj_id!=ULONG_MAX ) ) {
+    ctx->rtx_fseq = fd_fseq_join( fd_topo_obj_laddr( topo, rtx_obj_id ) );
+    FD_TEST( ctx->rtx_fseq );
+  }
+
   ctx->shred_out_idx = fd_topo_find_tile_out_link( topo, tile, "shred_out", ctx->round_robin_id );
   ctx->store_out_idx = fd_topo_find_tile_out_link( topo, tile, "shred_store",  ctx->round_robin_id );
   if( FD_LIKELY( ctx->shred_out_idx!=ULONG_MAX ) ) { /* firedancer-only */
@@ -1593,7 +1629,9 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->resolver = NONNULL( fd_fec_resolver_join ( fd_fec_resolver_new ( _resolver,
                                                                         tile->shred.fec_resolver_depth, 1UL,
                                                                         fec_exposure+1UL,
-                                                                        128UL * tile->shred.fec_resolver_depth, resolver_sets,
+                                                                        128UL * tile->shred.fec_resolver_depth,
+                                                                        tile->shred.alpenglow ? tile->shred.slot_max : 0UL,
+                                                                        resolver_sets,
                                                                         ctx->resolver_seed ) ) );
 
   if( FD_LIKELY( !!expected_shred_version ) ) {
@@ -1609,17 +1647,6 @@ unprivileged_init( fd_topo_t const *      topo,
 
   fd_ip4_udp_hdr_init( ctx->data_shred_net_hdr,   FD_SHRED_MIN_SZ, 0, tile->shred.shred_listen_port );
   fd_ip4_udp_hdr_init( ctx->parity_shred_net_hdr, FD_SHRED_MAX_SZ, 0, tile->shred.shred_listen_port );
-
-  ctx->adtl_dests_retransmit_cnt = tile->shred.adtl_dests_retransmit_cnt;
-  for( ulong i=0UL; i<ctx->adtl_dests_retransmit_cnt; i++) {
-    ctx->adtl_dests_retransmit[ i ].ip4 = tile->shred.adtl_dests_retransmit[ i ].ip;
-    ctx->adtl_dests_retransmit[ i ].port = tile->shred.adtl_dests_retransmit[ i ].port;
-  }
-  ctx->adtl_dests_leader_cnt = tile->shred.adtl_dests_leader_cnt;
-  for( ulong i=0UL; i<ctx->adtl_dests_leader_cnt; i++) {
-    ctx->adtl_dests_leader[i].ip4  = tile->shred.adtl_dests_leader[i].ip;
-    ctx->adtl_dests_leader[i].port = tile->shred.adtl_dests_leader[i].port;
-  }
 
   uchar has_contact_info_in = 0;
   for( ulong i=0UL; i<tile->in_cnt; i++ ) {
@@ -1639,13 +1666,13 @@ unprivileged_init( fd_topo_t const *      topo,
     else if( FD_LIKELY( !strcmp( link->name, "ipecho_out"   ) ) )   ctx->in_kind[ i ] = IN_KIND_IPECHO;
     else if( FD_LIKELY( !strcmp( link->name, "tower_out"    ) ) )   ctx->in_kind[ i ] = IN_KIND_ROOTED;
     else if( FD_LIKELY( !strcmp( link->name, "replay_resol" ) ) )   ctx->in_kind[ i ] = IN_KIND_ROOTEDH;
-    else if( FD_LIKELY( !strcmp( link->name, "replay_out"   ) ) )   ctx->in_kind[ i ] = IN_KIND_ROOTEDR;
+    else if( FD_LIKELY( !strcmp( link->name, "replay_slot"  ) ) )   ctx->in_kind[ i ] = IN_KIND_ROOTEDR;
     else if( FD_LIKELY( !strcmp( link->name, "crds_shred"   ) ) ) { ctx->in_kind[ i ] = IN_KIND_CONTACT;
-      if( FD_UNLIKELY( has_contact_info_in ) ) FD_LOG_ERR(( "shred tile has multiple contact info in link types, can only be either gossip_out or crds_shred" ));
+      if( FD_UNLIKELY( has_contact_info_in ) ) FD_LOG_ERR(( "shred tile has multiple contact info in link types, can only be either gossip_ciaddr or crds_shred" ));
       has_contact_info_in = 1;
     }
-    else if( FD_LIKELY( !strcmp( link->name, "gossip_out"   ) ) ) { ctx->in_kind[ i ] = IN_KIND_GOSSIP;
-      if( FD_UNLIKELY( has_contact_info_in ) ) FD_LOG_ERR(( "shred tile has multiple contact info in link types, can only be either gossip_out or crds_shred" ));
+    else if( FD_LIKELY( !strcmp( link->name, "gossip_ciaddr" ) ) ) { ctx->in_kind[ i ] = IN_KIND_GOSSIP;
+      if( FD_UNLIKELY( has_contact_info_in ) ) FD_LOG_ERR(( "shred tile has multiple contact info in link types, can only be either gossip_ciaddr or crds_shred" ));
       has_contact_info_in = 1;
     }
 

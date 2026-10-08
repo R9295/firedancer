@@ -12,6 +12,9 @@
    max_shreds_per_block at runtime. */
 #define FD_SCHED_MAX_MBLK_PER_SLOT (MAX_SKIPPED_TICKS)
 
+/* Most exec tiles a scheduler can dispatch to. */
+#define FD_SCHED_MAX_EXEC_TILE_CNT (64UL)
+
 /* fd_sched wraps all the smarts and mechanical chores around scheduling
    transactions for replay execution.  It is built on top of the
    dispatcher fd_rdisp.  The dispatcher is responsible for high
@@ -332,6 +335,11 @@ fd_sched_can_ingest_cnt( fd_sched_t * sched );
    so long as there are exec tiles available. */
 int
 fd_sched_is_drained( fd_sched_t * sched );
+
+/* Returns 1 if the active block has not been started yet, i.e. the
+   next task next_ready returns for it is a BLOCK_START, 0 otherwise. */
+int
+fd_sched_block_start_pending( fd_sched_t * sched );
 
 /* Obtain a transaction eligible for execution.  This implies that all
    prior transactions with w-r or w-w conflicts have completed.

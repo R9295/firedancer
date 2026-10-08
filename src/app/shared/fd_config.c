@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #include "fd_config.h"
-#include "fd_config_auto.h"
+#include "fd_auto_net.h"
 #include "fd_config_private.h"
 
 #include "../platform/fd_net_util.h"
@@ -114,6 +114,9 @@ fd_config_load_buf( fd_config_t * out,
 
 static void
 fd_config_fillf( fd_config_t * config ) {
+  if( FD_UNLIKELY( strcmp( config->firedancer.layout.mode, "performance" ) && strcmp( config->firedancer.layout.mode, "efficient" ) ) )
+    FD_LOG_ERR(( "[layout.mode] %s not recognized", config->firedancer.layout.mode ));
+
   if( FD_UNLIKELY( strcmp( config->paths.accounts, "" ) ) ) {
     replace( config->paths.accounts, "{user}", config->user );
     replace( config->paths.accounts, "{name}", config->name );
@@ -140,6 +143,13 @@ fd_config_fillf( fd_config_t * config ) {
     replace( config->paths.guidb, "{name}", config->name );
   } else {
     FD_TEST( fd_cstr_printf_check( config->paths.guidb, sizeof(config->paths.guidb), NULL, "%s/gui.db", config->paths.base ) );
+  }
+
+  if( FD_UNLIKELY( strcmp( config->paths.vote_history, "" ) ) ) {
+    replace( config->paths.vote_history, "{user}", config->user );
+    replace( config->paths.vote_history, "{name}", config->name );
+  } else {
+    fd_cstr_ncpy( config->paths.vote_history, config->paths.base, sizeof(config->paths.vote_history) );
   }
 
   for( ulong i=0UL; i<config->firedancer.paths.authorized_voter_paths_cnt; i++ ) {
@@ -248,6 +258,15 @@ fd_config_fill_net( fd_config_t * config ) {
 
   if( FD_UNLIKELY( !if_nametoindex( config->net.interface ) ) )
     FD_LOG_ERR(( "configuration specifies network interface `%s` which does not exist", config->net.interface ));
+
+  char driver[ NAME_SZ ];
+  fd_net_get_driver( driver, sizeof(driver), config->net.interface );
+  if( !strcmp( config->net.provider, "mlx5" ) && FD_UNLIKELY( strcmp( driver, "mlx5_core" ) ) ) {
+    FD_LOG_ERR(( "[net.provider] is set to \"mlx5\" but the network interface in use is not using the "
+                 "mlx5_core driver. Please ensure you are using a Mellanox ConnectX NIC of version 4 "
+                 "or newer. interface `%s` uses `%s`", config->net.interface, driver ));
+  }
+
   uint iface_ip;
   if( FD_UNLIKELY( -1==fd_net_util_if_addr( config->net.interface, &iface_ip ) ) )
     FD_LOG_ERR(( "could not get IP address for interface `%s`", config->net.interface ));
@@ -403,7 +422,7 @@ fd_config_fill( fd_config_t * config,
     fd_config_fillh( config );
   }
 
-  fd_config_auto( config );
+  fd_auto_net( config );
   if( FD_UNLIKELY( !strcmp( config->net.provider, "auto" ) ) ) {
     FD_LOG_ERR(( "failed to resolve automatic network provider" ));
   }
@@ -483,6 +502,7 @@ fd_config_fill( fd_config_t * config,
 
 static void
 fd_config_validatef( fd_configf_t const * config ) {
+  CFG_HAS_NON_EMPTY( layout.mode );
   CFG_HAS_NON_ZERO( layout.sign_tile_count );
   CFG_HAS_NON_ZERO( layout.resolv_tile_count );
   CFG_HAS_NON_ZERO( layout.execle_tile_count );
@@ -669,7 +689,6 @@ fd_config_validate( fd_config_t const * config ) {
 
   if( config->is_firedancer ) {
     CFG_HAS_POW2( tiles.repair.slot_max );
-    CFG_HAS_NON_ZERO( tiles.rotor.slot_max );
   }
 
   if( FD_UNLIKELY( config->tiles.bundle.keepalive_interval_millis <    3000 ||

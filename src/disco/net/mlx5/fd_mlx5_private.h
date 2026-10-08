@@ -23,6 +23,9 @@
 #define FD_MLX5_CQE_SZ        (64UL)
 #define FD_MLX5_PAGE_SZ       (4096UL)
 
+/* mlx5 CQ consumer indices are 24 bits. */
+#define FD_MLX5_CQ_CONS_IDX_MASK (0xffffffU)
+
 struct __attribute__((aligned(FD_MLX5_TX_WQE_SZ))) fd_mlx5_tx_wqe {
   uchar bytes[ FD_MLX5_TX_WQE_SZ ];
 };
@@ -52,8 +55,8 @@ struct fd_uverbs_ctx {
 typedef struct fd_uverbs_ctx fd_uverbs_ctx_t;
 
 /* fd_mlx5_cq_control is the mlx5 CQ doorbell record.  Linux names the
-   words set_ci_db and arm_db.  request_notification is unused because
-   the tile polls completion queues.  Both fields are stored big-endian. */
+   words set_ci_db and arm_db.  Only the RX CQ requests notifications,
+   when the tile prepares to park in efficient mode. */
 struct __attribute__((aligned(8UL))) fd_mlx5_cq_control {
   uint consumer_idx;
   uint request_notification;
@@ -62,7 +65,7 @@ typedef struct fd_mlx5_cq_control fd_mlx5_cq_control_t;
 
 /* fd_mlx5_qp_control is the mlx5 QP doorbell record in host memory,
    separate from UAR MMIO.  Linux names these words MLX5_RCV_DBR and
-   MLX5_SND_DBR.  Both fields are stored big-endian. */
+   MLX5_SND_DBR. */
 struct __attribute__((aligned(8UL))) fd_mlx5_qp_control {
   uint reserved;
   uint sq_prod;
@@ -83,8 +86,13 @@ FD_STATIC_ASSERT( sizeof(fd_mlx5_rx_wq_control_t)==8UL, mlx5_rx_wq_control_sz );
 struct fd_mlx5_cq {
   fd_mlx5_cqe_t *        entries;
   fd_mlx5_cq_control_t * control;
+  /* mlx5 CQ arm doorbell. */
+  volatile uchar *       request_notification_doorbell;
   uint                   depth;
   uint                   cons_idx;
+  uint                   cqn;
+  uint                   comp_channel_event_seq;
+  uint                   comp_channel_armed; /* cleared when its event is read */
 };
 typedef struct fd_mlx5_cq fd_mlx5_cq_t;
 
@@ -137,41 +145,31 @@ struct fd_mlx5_uverbs_tile {
   fd_mlx5_rx_wq_t * rx_wq;
   fd_mlx5_tx_qp_t * tx_qp;
   uint *            lkey;
+  int *             rx_comp_channel_fd; /* NULL in performance mode */
   void *            packet_memory;
   ulong             packet_memory_sz;
   ulong             packet_iova;
 };
 typedef struct fd_mlx5_uverbs_tile fd_mlx5_uverbs_tile_t;
 
-/* fd_netlink_rdma_ctx stores the state used to request one QP-bound counter
-   through Linux NETLINK_RDMA. */
-struct fd_netlink_rdma_ctx {
-  int  fd;         /* socket used to request RDMA QP counters. */
-  uint dev_idx;    /* selects the RDMA device in counter requests. */
-  uint port_num;   /* selects the device port in counter requests. */
-  uint counter_id; /* identifies the counter bound to this QP. */
-  uint seq;        /* matches each netlink reply to its request. */
-};
-typedef struct fd_netlink_rdma_ctx fd_netlink_rdma_ctx_t;
-
 FD_PROTOTYPES_BEGIN
 
 /* fd_uverbs_init creates one shared context, PD, receive indirection table,
    and two RSS QPs, one hashing outer headers and one hashing inner tunnel
    headers.  It creates an MR, UAR, RX CQ, TX CQ, receive WQ, and send-only QP
-   for each entry in tiles.  tile_cnt must be a power of two.  On failure,
-   process-scoped resources can remain live.  Callers must exit rather than
-   retry initialization. */
+   for each entry in tiles.  For entries with a non-NULL rx_comp_channel_fd, it also
+   attaches a uverbs completion channel to the RX CQ.  tile_cnt must be a
+   power of two. */
 fd_mlx5_rss_qp_t *
-fd_uverbs_init( fd_uverbs_ctx_t *         uverbs,
-                fd_mlx5_uverbs_tile_t *   tiles,
-                ulong                     tile_cnt,
-                fd_mlx5_rss_qp_t *        outer_rss_qp,
-                fd_mlx5_rss_qp_t *        gre_rss_qp,
-                char const *              rdma_name,
-                uint                      port_num );
+fd_uverbs_init( fd_uverbs_ctx_t *       uverbs,
+                fd_mlx5_uverbs_tile_t * tiles,
+                ulong                   tile_cnt,
+                fd_mlx5_rss_qp_t *      outer_rss_qp,
+                fd_mlx5_rss_qp_t *      gre_rss_qp,
+                char const *            rdma_name,
+                uint                    port_num );
 
-/* fd_uverbs_map_uar maps a previously allocated non-cached mlx5 UAR. */
+/* fd_uverbs_map_uar maps a previously allocated non-cached mlx5 UAR page. */
 volatile uchar *
 fd_uverbs_map_uar( fd_uverbs_ctx_t * uverbs,
                    ulong             mmap_offset );
@@ -190,20 +188,6 @@ fd_uverbs_create_gre_udp_flow( fd_uverbs_ctx_t *        uverbs,
                                fd_mlx5_rss_qp_t const * rss_qp,
                                uint                     inner_dst_ip,
                                ushort                   inner_dst_port );
-
-/* fd_mlx5_netlink_rdma_init binds a manual RDMA counter to qpn. */
-fd_netlink_rdma_ctx_t *
-fd_mlx5_netlink_rdma_init( fd_netlink_rdma_ctx_t * netlink_rdma,
-                           char const *            rdma_name,
-                           uint                    port_num,
-                           uint                    qpn );
-
-/* fd_mlx5_netlink_rdma_qp_counter_read returns the QP-specific mlx5
-   out_of_buffer counter.  This counts packets dropped because the RQ had no
-   WQE. */
-int
-fd_mlx5_netlink_rdma_qp_counter_read( fd_netlink_rdma_ctx_t * netlink_rdma,
-                                      ulong *                 out_of_buffer );
 
 FD_PROTOTYPES_END
 

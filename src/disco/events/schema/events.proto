@@ -428,23 +428,23 @@ enum AlpenglowVoteKind {
   ALPENGLOW_VOTE_KIND_UNSPECIFIED = 0;
   ALPENGLOW_VOTE_KIND_NOTAR = 1;  // Cast on the slot's first block once its parent is ready at a window start, or once we notarized its parent in the previous slot (Algorithm 2, Definition 15).
   ALPENGLOW_VOTE_KIND_FINAL = 2;  // Cast once the block we notarized has a notarization cert and we cast no skip or fallback vote in the slot (Algorithm 2, Definition 18). Names only the slot.
-  ALPENGLOW_VOTE_KIND_SKIP = 3;  // Cast for every unvoted slot of the leader window on timeout (Definition 17), on SafeToNotar or SafeToSkip (Algorithm 1), a dead block or the crashed-leader timer. Names only the slot.
+  ALPENGLOW_VOTE_KIND_SKIP = 3;  // Cast for every unvoted slot of the leader window on timeout (Definition 17), or on SafeToNotar or SafeToSkip (Algorithm 1). Names only the slot.
   ALPENGLOW_VOTE_KIND_NOTAR_FALLBACK = 4;  // Cast on SafeToNotar. At most three per slot (Definition 12).
   ALPENGLOW_VOTE_KIND_SKIP_FALLBACK = 5;  // Cast on SafeToSkip. Names only the slot.
 }
 
-// Why we cast the vote, based on the Alpenglow voting algorithm (not_broadcasted if it is not ours). References: Algorithms 1 and 2, Definitions 15, 16 and 17.
-enum AlpenglowVoteBroadcastReason {
-  ALPENGLOW_VOTE_BROADCAST_REASON_UNSPECIFIED = 0;
-  ALPENGLOW_VOTE_BROADCAST_REASON_NOT_BROADCASTED = 1;  // Not our vote, so we did not broadcast it; see our_vote.
-  ALPENGLOW_VOTE_BROADCAST_REASON_BLOCK_REPLAYED = 2;  // Replay completed the block normally, so we vote notar for it.
-  ALPENGLOW_VOTE_BROADCAST_REASON_BLOCK_DEAD = 3;  // Replay ruled the block dead, so we vote skip on the entire rest of the window containing this slot.
-  ALPENGLOW_VOTE_BROADCAST_REASON_PARENT_READY = 4;  // We hold the certs that make a block a valid parent for the leader window starting at this slot (a notar, notar-fallback or fast-final cert for it, or it is finalized, and skip certs for every slot in between), so we vote notar for the window's first block we held pending.
-  ALPENGLOW_VOTE_BROADCAST_REASON_BLOCK_NOTARIZED = 5;  // We hold a notar cert for the block we voted notar for and cast no skip or fallback vote in the slot, so we vote final for it.
-  ALPENGLOW_VOTE_BROADCAST_REASON_TIMEOUT = 6;  // The slot's timeout fired with no vote cast in it, so we vote skip on the entire rest of the window containing this slot.
-  ALPENGLOW_VOTE_BROADCAST_REASON_TIMEOUT_CRASHED_LEADER = 7;  // The window's crashed-leader timeout fired with no shred and no vote for its first slot, so we vote skip on every slot of the window.
-  ALPENGLOW_VOTE_BROADCAST_REASON_SAFE_TO_NOTAR = 8;  // No block but this one can be fast-finalized in the slot: notar votes for it reach 40% of stake, or 20% with skip votes bringing the total to 60%, and its parent is notar-fallback certified (Definition 16). Having voted skip or notar for another block in the slot, we vote notar-fallback for it and skip every unvoted slot of the window.
-  ALPENGLOW_VOTE_BROADCAST_REASON_SAFE_TO_SKIP = 9;  // No block can be fast-finalized in the slot: skip votes plus notar votes for every block but the most-voted one reach 40% of stake (Definition 16). Having voted notar in the slot, we vote skip-fallback for it and skip every unvoted slot of the window.
+// Why we cast the vote, based on the Alpenglow voting algorithm (not_our_vote if it is not ours). References: Algorithms 1 and 2, Definitions 15, 16 and 17.
+enum AlpenglowVoteReason {
+  ALPENGLOW_VOTE_REASON_UNSPECIFIED = 0;
+  ALPENGLOW_VOTE_REASON_NOT_OUR_VOTE = 1;  // Not our vote; see our_vote.
+  ALPENGLOW_VOTE_REASON_BLOCK_REPLAYED = 2;  // Replay completed the block normally, so we vote notar for it.
+  ALPENGLOW_VOTE_REASON_PARENT_READY = 3;  // We hold the certs that make a block a valid parent for the leader window starting at this slot (a notar, notar-fallback or fast-final cert for it, or it is finalized, and skip certs for every slot in between), so we vote notar for the window's first block we held pending.
+  ALPENGLOW_VOTE_REASON_BLOCK_NOTARIZED = 4;  // We hold a notar cert for the block we voted notar for and cast no skip or fallback vote in the slot, so we vote final for it.
+  ALPENGLOW_VOTE_REASON_TIMEOUT = 5;  // The slot's timeout fired with no vote cast in it, so we vote skip on the entire rest of the window containing this slot.
+  ALPENGLOW_VOTE_REASON_SAFE_TO_NOTAR = 6;  // No block but this one can be fast-finalized in the slot: notar votes for it reach 40% of stake, or 20% with skip votes bringing the total to 60%, and its parent is notar-fallback certified (Definition 16). Having voted skip or notar for another block in the slot, we vote notar-fallback for it and skip every unvoted slot of the window.
+  ALPENGLOW_VOTE_REASON_SAFE_TO_SKIP = 7;  // No block can be fast-finalized in the slot: skip votes plus notar votes for every block but the most-voted one reach 40% of stake (Definition 16). Having voted notar in the slot, we vote skip-fallback for it and skip every unvoted slot of the window.
+  ALPENGLOW_VOTE_REASON_REWARD = 8;  // Our notar or skip vote sent to the leader of slot+8, who packs the slot's reward cert, apart from the broadcast, and resent every probe timeout until that leader acknowledges it or we replay slot+8.
+  ALPENGLOW_VOTE_REASON_REWARD_ACKED = 9;  // The leader of slot+8 acknowledged a packet carrying our notar or skip vote, which ends its reward resends. The row timestamp is when the acknowledgement arrived; broadcast_to is empty.
 }
 
 // What we did with the vote. unknown_peer and banned_peer are decided on the connection before the vote is decoded, shred_version_mismatch and unranked_peer after decoding, in that order; the rest are Alpenglow-specific validation.
@@ -472,13 +472,6 @@ enum AlpenglowCertKind {
   ALPENGLOW_CERT_KIND_SKIP = 5;  // SkipVote or SkipFallbackVote aggregate that sums >= 60% of stake, for slot.
 }
 
-// Why we broadcast the cert (based on the Alpenglow certificate rules, see Table 6 and Definition 13) (not_broadcasted if we did not).
-enum AlpenglowCertBroadcastReason {
-  ALPENGLOW_CERT_BROADCAST_REASON_UNSPECIFIED = 0;
-  ALPENGLOW_CERT_BROADCAST_REASON_NOT_BROADCASTED = 1;  // We did not broadcast the cert for various reasons, see processing_result.
-  ALPENGLOW_CERT_BROADCAST_REASON_FIRST_VALID = 2;  // The first valid cert of its kind for the slot that we received or constructed; every node broadcasts these (Definition 13).
-}
-
 // What we did with the cert. unknown_peer and banned_peer are decided on the connection before the cert is decoded, shred_version_mismatch and unranked_peer after decoding, in that order; the rest are Alpenglow-specific.
 enum AlpenglowCertProcessingResult {
   ALPENGLOW_CERT_PROCESSING_RESULT_UNSPECIFIED = 0;
@@ -488,10 +481,30 @@ enum AlpenglowCertProcessingResult {
   ALPENGLOW_CERT_PROCESSING_RESULT_UNRANKED_PEER = 4;  // The peer has no rank in the slot's epoch.
   ALPENGLOW_CERT_PROCESSING_RESULT_SLOT_TOO_OLD = 5;  // The slot is behind our finality frontier, or in an earlier epoch we have no stake information for.
   ALPENGLOW_CERT_PROCESSING_RESULT_SLOT_TOO_NEW = 6;  // The slot is beyond our look-ahead window, or in an epoch we have no stake information for.
-  ALPENGLOW_CERT_PROCESSING_RESULT_DUPLICATE = 7;  // We already held a cert of this kind for the slot, or for this block if notar_fallback; we keep one per kind (Definition 13), so we dropped the copy without verifying it. The common case: every node broadcasts each cert it accepts.
+  ALPENGLOW_CERT_PROCESSING_RESULT_DUPLICATE = 7;  // We already held a cert of this kind for the slot, or for this block if notar_fallback; we keep one per kind (Definition 13), so we dropped the copy without verifying it. The common case: every node broadcasts each cert it accepts. Recorded for notar certs only.
   ALPENGLOW_CERT_PROCESSING_RESULT_IGNORED_REDUNDANT = 8;  // We already hold a valid cert that supersedes this one, e.g. a fast-finalization cert for the block a notarization cert arrives for; ignored.
   ALPENGLOW_CERT_PROCESSING_RESULT_FAILED_BLS_VERIFY = 9;  // The signers' stake is below the threshold (Table 6), a signer rank is outside the epoch, or the aggregate BLS signature is invalid; peer banned.
   ALPENGLOW_CERT_PROCESSING_RESULT_ACCEPTED = 10;  // BLS verified (stake threshold of Table 6 and aggregate BLS signature) and stored as the first cert of its kind for the slot, then broadcast to our peers (Definition 13); see broadcast_start_time and broadcast_to.
+}
+
+// The reason the block was no longer attempted to be repaired.
+enum BlockReceivedCancelledReason {
+  BLOCK_RECEIVED_CANCELLED_REASON_UNSPECIFIED = 0;
+  BLOCK_RECEIVED_CANCELLED_REASON_NOT_CANCELLED = 1;  // Not cancelled.
+  BLOCK_RECEIVED_CANCELLED_REASON_MERKLE_ROOT_MISMATCH = 2;  // Received two merkle roots for the same FEC set.
+  BLOCK_RECEIVED_CANCELLED_REASON_NOTARIZED_VERSION = 3;  // A verified version of the block became known.
+  BLOCK_RECEIVED_CANCELLED_REASON_VERIFIED_PARENT = 4;  // A verified version of a verified block's parent became known.
+  BLOCK_RECEIVED_CANCELLED_REASON_PARENT_OFF_MISMATCH = 5;  // A data shred's parent_off disagreed with the slot's other shreds or with its block header.
+  BLOCK_RECEIVED_CANCELLED_REASON_INVALID_BLOCK_HEADER = 6;  // Shred 0 did not carry a valid block header.
+  BLOCK_RECEIVED_CANCELLED_REASON_SLOT_COMPLETE_MISMATCH = 7;  // A data shred's slot complete flag disagreed with the slot's other shreds.
+}
+
+// The source of the final shred that completed the FEC set.
+enum BlockReceivedFecSetsFinalShredSource {
+  BLOCK_RECEIVED_FEC_SETS_FINAL_SHRED_SOURCE_UNSPECIFIED = 0;
+  BLOCK_RECEIVED_FEC_SETS_FINAL_SHRED_SOURCE_TURBINE = 1;  // Received via turbine.
+  BLOCK_RECEIVED_FEC_SETS_FINAL_SHRED_SOURCE_REPAIR = 2;  // Received via repair.
+  BLOCK_RECEIVED_FEC_SETS_FINAL_SHRED_SOURCE_LEADER = 3;  // Produced as our own leader shred.
 }
 
 // Slot that was voted on
@@ -816,6 +829,28 @@ message AlpenglowCertBroadcastTo {
   uint32 port = 3;
 }
 
+// Reception detail for one FEC set. A zero timestamp means the stage was never reached or its stamp was unavailable.
+message BlockReceivedFecSets {
+  // Merkle root of the FEC set: its identity. The final FEC set's merkle root is the block id.
+  bytes merkle_root = 1;
+  // Index of the FEC set's first data shred within the block; FEC sets are listed in block order, so for a fully received block the indices ascend from 0 without gaps.
+  uint32 index = 2;
+  // Bitmap of data shreds of the FEC set received (vs recovered). Bit j set if the data shred with data index j was received.
+  uint32 data_shreds_received_mask = 3;
+  // Bitmap of parity shreds of the FEC set received (vs recovered). Bit j set if the parity shred with parity index j was received.
+  uint32 parity_shreds_received_mask = 4;
+  // Bitmap of data shreds of the FEC set received via repair. Bit j set if the data shred with data index j arrived via repair.
+  uint32 repair_shreds_received_mask = 5;
+  // Number of duplicate shreds received for this FEC set; best-effort given upstream deduplication.
+  uint32 duplicate_shred_count = 6;
+  // Timestamp when the first shred of this FEC set arrived at the shred tile.
+  uint64 first_shred_received_time = 7;
+  // Timestamp when the FEC set was complete (assembled).
+  uint64 completed_time = 8;
+  // The source of the final shred that completed the FEC set.
+  BlockReceivedFecSetsFinalShredSource final_shred_source = 9;
+}
+
 // The validator received a verified, deduplicated transaction
 message Txn {
   // The source IP address of the transaction sender
@@ -932,6 +967,10 @@ message AccdbPartitionAdded {
   uint64 partition_sz = 6;
   // Total fallocated size of the accounts database file in bytes after this grow, equal to new_partition_max times partition_sz. Tracks the database's on-disk footprint over time.
   uint64 disk_allocated_bytes = 7;
+  // Wall time the fallocate call that grew the file by this partition took, in nanoseconds. Slow filesystems can take seconds.
+  uint64 duration_fallocate_nanos = 8;
+  // True if the accdb tile grew the file ahead of any write head so a later rotation does not wait on fallocate. layer is then 0 and prior_partition_idx is UINT64_MAX, and neither names a triggering write head.
+  bool preallocated = 9;
 }
 
 // Two different blocks (different block ids) were observed for the same slot. Emitted once when the validator first detects the equivocation, after both blocks are known.
@@ -1366,6 +1405,8 @@ message Boot {
   uint64 process_start_time = 74;
   // A numeric identifier summarizing the exact set of protocol features this build understands, used to detect when nodes disagree on consensus rules.
   uint32 feature_set_id = 75;
+  // For each logical processor, the last-level cache domain it shares (one per AMD CCD or CCX, usually one per socket on Intel), numbered from 0 in first-seen order; tiles that exchange data cheaply sit in the same domain. 65535 for an offline processor. Empty when the kernel does not expose level-3 cache topology.
+  repeated uint32 l3_cpu_to_domain = 76;
 }
 
 // The result of a snapshot production attempt.
@@ -1702,26 +1743,26 @@ message AlpenglowVote {
   bytes received_from_identity = 7;
   // Whether this is our own vote, which we store like any other; received_from_identity is then our identity.
   bool our_vote = 8;
-  // Why we cast the vote, based on the Alpenglow voting algorithm (not_broadcasted if it is not ours). References: Algorithms 1 and 2, Definitions 15, 16 and 17.
-  AlpenglowVoteBroadcastReason broadcast_reason = 9;
+  // Why we cast the vote, based on the Alpenglow voting algorithm (not_our_vote if it is not ours). References: Algorithms 1 and 2, Definitions 15, 16 and 17.
+  AlpenglowVoteReason reason = 9;
   // Who we sent the vote to, by rank like voters: identity and address at each rank, all zeros where we did not send (only if our_vote, empty otherwise).
   repeated AlpenglowVoteBroadcastTo broadcast_to = 10;
   // What we did with the vote. unknown_peer and banned_peer are decided on the connection before the vote is decoded, shred_version_mismatch and unranked_peer after decoding, in that order; the rest are Alpenglow-specific validation.
   AlpenglowVoteProcessingResult processing_result = 11;
-  // Notar votes for block_id reached 40% of stake, or 20% with skip votes bringing the total to 60% (Definition 16). Crossing a quorum triggers BLS verification of the votes (see verify_start_time).
-  bool quorum_reached_safe_to_notar = 12;
-  // Skip votes plus notar votes for every block but the most-voted one reached 40% of stake (Definition 16). Crossing a quorum triggers BLS verification of the votes (see verify_start_time).
-  bool quorum_reached_safe_to_skip = 13;
   // Final votes for the slot reached 60% of stake (Table 6). Crossing a quorum triggers BLS verification of the votes (see verify_start_time).
-  bool quorum_reached_final_cert = 14;
+  bool quorum_reached_final_cert = 12;
   // Notar votes for block_id reached 80% of stake (Table 6). Crossing a quorum triggers BLS verification of the votes (see verify_start_time).
-  bool quorum_reached_fast_final_cert = 15;
+  bool quorum_reached_fast_final_cert = 13;
   // Notar votes for block_id reached 60% of stake (Table 6). Crossing a quorum triggers BLS verification of the votes (see verify_start_time).
-  bool quorum_reached_notar_cert = 16;
+  bool quorum_reached_notar_cert = 14;
   // Notar and notar-fallback votes for block_id reached 60% of stake (Table 6). Crossing a quorum triggers BLS verification of the votes (see verify_start_time).
-  bool quorum_reached_notar_fallback_cert = 17;
+  bool quorum_reached_notar_fallback_cert = 15;
   // Skip and skip-fallback votes for the slot reached 60% of stake (Table 6). Crossing a quorum triggers BLS verification of the votes (see verify_start_time).
-  bool quorum_reached_skip_cert = 18;
+  bool quorum_reached_skip_cert = 16;
+  // Notar votes for block_id reached 40% of stake, or 20% with skip votes bringing the total to 60% (Definition 16). Crossing a quorum triggers BLS verification of the votes (see verify_start_time).
+  bool quorum_reached_safe_to_notar = 17;
+  // Skip votes plus notar votes for every block but the most-voted one reached 40% of stake (Definition 16). Crossing a quorum triggers BLS verification of the votes (see verify_start_time).
+  bool quorum_reached_safe_to_skip = 18;
   // When we started aggregating the vote into the running BLS aggregate for its slot, kind and block (only if processing_result is accepted, 0 otherwise).
   uint64 aggregation_start_time = 19;
   // When we started BLS verifying the aggregate this vote completed (only if this vote brought a tally to a quorum of Table 6 or Definition 16, which is when we verify signatures, 0 otherwise).
@@ -1740,28 +1781,96 @@ message AlpenglowCert {
   bytes block_id = 2;
   // What kind of cert is this.
   AlpenglowCertKind kind = 3;
-  // Which validators' primary votes the cert aggregates (NotarVote for notar, fast_final and notar_fallback; FinalVote for final; SkipVote for skip), indexed by the voter's rank in the slot's epoch.
-  repeated bool voters = 4;
-  // Fallback signer set (NotarFallbackVote for notar_fallback, SkipFallbackVote for skip) by rank. Empty for other kinds.
-  repeated bool fallback_voters = 5;
+  // Which validators' primary votes the cert aggregates (NotarVote for notar, fast_final and notar_fallback; FinalVote for final; SkipVote for skip), as a bitmap over the voter's rank in the slot's epoch: rank r is bit r%8 of byte r/8, bytes through the highest signer.
+  bytes voters = 4;
+  // Fallback signer set (NotarFallbackVote for notar_fallback, SkipFallbackVote for skip), a bitmap by rank like voters. Empty for other kinds.
+  bytes fallback_voters = 5;
   // IPv4 address of the peer that relayed the cert to us; ourselves if our_cert, stored as an IPv4-mapped IPv6 address (all zeros if unknown).
   bytes relayer_ip = 6;
   // Validator identity of the peer that relayed the cert to us (determined from the QUIC client-side TLS certificate); ourselves if our_cert (all zeros if unknown_peer). Not necessarily the creator of the cert: a node re-broadcasts the first valid cert it obtains (whether from self or others).
   bytes relayer_identity = 7;
   // Whether we constructed the cert ourselves from the votes we had received, rather than a peer delivering it first. Not every cert is self-made; when it is, we reached the threshold before any peer's copy arrived, i.e. we are running fast.
   bool our_cert = 8;
-  // Why we broadcast the cert (based on the Alpenglow certificate rules, see Table 6 and Definition 13) (not_broadcasted if we did not).
-  AlpenglowCertBroadcastReason broadcast_reason = 9;
-  // Who we sent the cert to, indexed by rank like voters: identity and address at each rank, all zeros where we did not send (only if broadcast_reason is first_valid, empty otherwise).
-  repeated AlpenglowCertBroadcastTo broadcast_to = 10;
+  // Who we sent the cert to, indexed by rank like voters: identity and address at each rank, all zeros where we did not send (only if our_cert, empty otherwise).
+  repeated AlpenglowCertBroadcastTo broadcast_to = 9;
   // What we did with the cert. unknown_peer and banned_peer are decided on the connection before the cert is decoded, shred_version_mismatch and unranked_peer after decoding, in that order; the rest are Alpenglow-specific.
-  AlpenglowCertProcessingResult processing_result = 11;
+  AlpenglowCertProcessingResult processing_result = 10;
   // When we started BLS verifying the cert (unset if our_cert).
-  uint64 verify_start_time = 12;
-  // When we started broadcasting the cert to our peers, BLS verification having finished (only if broadcast_reason is first_valid, 0 otherwise).
-  uint64 broadcast_start_time = 13;
+  uint64 verify_start_time = 11;
+  // When we started broadcasting the cert to our peers, BLS verification having finished (only if our_cert, 0 otherwise).
+  uint64 broadcast_start_time = 12;
   // When we finished processing the cert, may be any of the above stages including short-circuiting at earlier stages.
-  uint64 done_time = 14;
+  uint64 done_time = 13;
+}
+
+// A block that completed reception on this validator or was abandoned and pruned.  A block gets a row if it received a shred marked as final in the slot, and received all shreds up to the final shred, or if it was incomplete but collected later during pruning. Tallies are best-effort: on equivocated slots, shreds shared between versions of the slot may merge or double count. Delivery is best-effort: rows travel a lossy telemetry link, so a block_completed row can arrive without its block_received row or vice versa.
+message BlockReceived {
+  // Slot number of the block.
+  uint64 slot = 1;
+  // Block identifier; with slot, the alternate join key to block_completed. For blocks that never completed reception (or were abandoned early), this can be the null hash.
+  bytes block_id = 2;
+  // Slot number of the block's parent. If unknown, this will be UINT64_MAX, and likely means that a block header could not be parsed for this slot.
+  uint64 parent_slot = 3;
+  // Block identifier of the block's parent. If unknown, this will be the null hash, and likely means that a block header could not be parsed for this slot.
+  bytes parent_block_id = 4;
+  // Whether the block was cancelled due to a notar version becoming known. These blocks will only get reported if they are eventually pruned, so if the root does not advance, they will not be reported.
+  bool cancelled = 5;
+  // The reason the block was no longer attempted to be repaired.
+  BlockReceivedCancelledReason cancelled_reason = 6;
+  // When the block was cancelled. Only turbine versions are cancelled. Occurs when a votor-driven version of the slot arrives while this version's block id is still unknown, or for invalid turbine blocks. 0 if not cancelled.
+  uint64 cancelled_time = 7;
+  // Either reached SafeToNotar locally or attached to a NotarFallback or stronger cert, rather than being the version received over turbine. Always false for blocks this validator produced as leader. A slot can report both a notarized and a non-notarized version, on separate rows.
+  bool notarized = 8;
+  // Whether the block was produced as leader.
+  bool is_leader = 9;
+  // Whether the validator considered itself caught up to the cluster when the row was emitted. False from boot until rotor/repair closes on the network tip (set immediately for genesis bootstrap); otherwise during regular operation is set to True if the highest slot the validator has received completely is no more than one leader window behind its view of the current cluster slot.
+  bool caught_up = 10;
+  // Number of FEC sets in the block; for blocks that never completed reception, this could be 0 if the shred with the slot_complete flag never arrived.
+  uint64 fec_set_count = 11;
+  // Network arrival at the shred tile of the block's first shred, stamped before signature verification. Leader blocks: when the first entry batch reached the shredding stage, before any network send.
+  uint64 first_shred_received_time = 12;
+  // Network arrival of the shred that made the block contiguous; not necessarily the highest-numbered shred. Minus first_shred_received_time: reception duration, valid only when this is nonzero. Leader blocks: when the final entry batch reached the shredding stage. 0 if the block never became fully contiguous (pruned or abandoned mid-reception).
+  uint64 last_shred_received_time = 13;
+  // First repair request for a specific missing shred (window or ShredForBlockId request); highest-shred, orphan, ParentAndFecCount and FecRoot requests do not stamp this, so it can be 0 while their request counts are not. 0 if no window or ShredForBlockId request was sent; always 0 for leader blocks.
+  uint64 first_repair_request_time = 14;
+  // Network arrival at the shred tile of the last repair response matched to an outstanding specific-shred request; other responses do not stamp this. 0 if none was matched; always 0 for leader blocks.
+  uint64 last_repair_received_time = 15;
+  // Network arrival at the rotor tile of the block's first verified getParentAndFecCount or FecRoot response, including a FecRoot answer for a FEC set already held. 0 if no verified metadata response was received.
+  uint64 first_meta_received_time = 16;
+  // Shreds received over the network via turbine, plus repair deliveries whose provenance could not be verified (failed nonce) and coding shreds. Near 0 for leader blocks.
+  uint32 turbine_shred_received = 17;
+  // Parity (recovery) shreds received. Near 0 for leader blocks: only network echoes of the block's own parity shreds land here.
+  uint32 parity_shred_received = 18;
+  // Shreds obtained from peers via repair; nonce-verified deliveries only. Re-fetched pieces count once per delivery. Always 0 for leader blocks.
+  uint32 repair_shred_received = 19;
+  // Shreds reconstructed locally from parity data. Always 0 for leader blocks, which produce rather than recover their shreds.
+  uint32 recovered_shred_count = 20;
+  // FEC set index of the last piece of the block to complete Reed-Solomon reconstruction, which with out-of-order repair need not be the block's final index. UINT32_MAX if no FEC set was completed.
+  uint32 last_completed_fec_set_index = 21;
+  // Whether the shred marking the block complete was received, or it became known through a getParentAndFecCount request.
+  bool slot_complete = 22;
+  // Whether equivocating shreds were detected on this slot before any notarized version arrived.
+  bool equivocation_detected_shred = 23;
+  // Repair responses matched to an outstanding specific-shred request. Shreds delivered by verified highest-shred and orphan responses count in repair_shred_received but are not matched here, so this can be 0 while repair_shred_received is not. Always 0 for leader blocks.
+  uint32 repair_shred_responses_received = 24;
+  // Metadata responses matched to an outstanding getParentAndFecCount request that pass proof-check.
+  uint32 parent_fec_count_responses_received = 25;
+  // Metadata responses matched to an outstanding FecRoot request that pass proof-check.
+  uint32 fec_root_responses_received = 26;
+  // Repair requests for one specific missing shred, by index. Always 0 for leader blocks.
+  uint32 repair_request_window_count = 27;
+  // Repair requests for the highest-numbered shred a peer holds, used to learn the block's length. Highest-shred requests seeded at boot, before the block was tracked, bypass this counter. Always 0 for leader blocks.
+  uint32 repair_request_highest_window_count = 28;
+  // Repair requests for the block's ancestry when its parent is unknown; a response carries shreds from up to 11 ancestor blocks. Always 0 for leader blocks.
+  uint32 repair_request_orphan_count = 29;
+  // Alpenglow ShredForBlockId requests, analogous to legacy window requests. Asks a peer for a specific missing shred, addressed by the block id it belongs to. Always 0 before Alpenglow and for leader blocks.
+  uint32 repair_request_shred_for_block_id_count = 30;
+  // Alpenglow ParentAndFecCount requests, analogous to legacy orphan requests. Asks a peer for the block's parent and its FEC set count. Always 0 before Alpenglow and for leader blocks.
+  uint32 repair_request_parent_fec_count = 31;
+  // Alpenglow FecRoot requests. Asks a peer for the merkle root of the FEC set at a given index. Always 0 before Alpenglow and for leader blocks.
+  uint32 repair_request_fec_root_count = 32;
+  // Per-FEC-set reception detail, one entry per FEC set in block order: which pieces made up the block, how each arrived, and when. Summed, the counts may reconcile with the block-level shred counts on this row, except in the case of equivocation where FEC sets may be shared between versions of the slot. Best-effort for pruned incomplete blocks: empty does not mean the block had no FEC sets, but that the FEC may have been pruned before it was able to be reported.
+  repeated BlockReceivedFecSets fec_sets = 33;
 }
 
 // Combined event type
@@ -1787,5 +1896,6 @@ message Event {
     RuntimeVoteAccount runtime_vote_account = 18;
     AlpenglowVote alpenglow_vote = 19;
     AlpenglowCert alpenglow_cert = 20;
+    BlockReceived block_received = 21;
   }
 }

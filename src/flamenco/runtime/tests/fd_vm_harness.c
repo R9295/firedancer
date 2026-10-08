@@ -8,7 +8,6 @@
 #include "../../../ballet/sbpf/fd_sbpf_loader.h"
 #include "../../vm/fd_vm.h"
 #include "../../vm/fd_vm_private.h"
-#include "../../vm/test_vm_util.h"
 #include "generated/vm.pb.h"
 #include "generated/vm_serialization.pb.h"
 #include "../fd_bank.h"
@@ -103,6 +102,7 @@ fd_solfuzz_pb_syscall_run( fd_solfuzz_runner_t * runner,
   }
 
   if( input->vm_ctx.return_data.data && input->vm_ctx.return_data.data->size>0U ) {
+    if( FD_UNLIKELY( input->vm_ctx.return_data.data->size>sizeof(ctx->txn_out->details.return_data.data) ) ) goto error;
     ctx->txn_out->details.return_data.len = input->vm_ctx.return_data.data->size;
     fd_memcpy( ctx->txn_out->details.return_data.data, input->vm_ctx.return_data.data->bytes, ctx->txn_out->details.return_data.len );
   }
@@ -130,6 +130,8 @@ fd_solfuzz_pb_syscall_run( fd_solfuzz_runner_t * runner,
   if( input->vm_ctx.heap_max > FD_VM_HEAP_MAX ) {
     goto error;
   }
+
+  FD_TEST( input->vm_ctx.sbpf_version<=FD_SBPF_V3 );
 
   fd_vm_t * vm = fd_vm_join( fd_vm_new( fd_spad_alloc_check( spad, fd_vm_align(), fd_vm_footprint() ) ) );
   if ( !vm ) {
@@ -190,7 +192,7 @@ fd_solfuzz_pb_syscall_run( fd_solfuzz_runner_t * runner,
               0, // TODO, text_sz
               0, // TODO
               NULL, // TODO
-              TEST_VM_DEFAULT_SBPF_VERSION,
+              input->vm_ctx.sbpf_version,
               syscalls,
               NULL, // TODO
               sha,
@@ -249,7 +251,7 @@ fd_solfuzz_pb_syscall_run( fd_solfuzz_runner_t * runner,
   };
 
   /* Actually invoke the syscall */
-  int syscall_err = syscall->func( vm, vm->reg[1], vm->reg[2], vm->reg[3], vm->reg[4], vm->reg[5], &vm->reg[0] );
+  int syscall_err = syscall->func( vm, vm->reg[1], vm->reg[2], vm->reg[3], vm->reg[4], vm->reg[5] );
   int instr_end_err = fd_execute_instr_end( vm->instr_ctx, ctx->instr, syscall_err );
   if( instr_end_err ) {
     fd_log_collector_program_failure( vm->instr_ctx );

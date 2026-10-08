@@ -1,6 +1,7 @@
 #include "fd_vm_syscall.h"
 #include "../test_vm_util.h"
 #include "../../runtime/fd_bank.h"
+#include "../../../ballet/murmur3/fd_murmur3.h"
 
 #include <stdlib.h> // ARM64: malloc(3), free(3)
 
@@ -27,8 +28,9 @@ test_vm_syscall_sol_memset( char const * test_case_name,
                             int          expected_err ) {
   set_memory_region( vm->heap, vm->heap_max );
 
-  ulong ret = 0UL;
-  int   err = fd_vm_syscall_sol_memset( vm, dst_vaddr, val, sz, 0, 0, &ret );
+  vm->reg[0] = 0UL;
+  int   err = fd_vm_syscall_sol_memset( vm, dst_vaddr, val, sz, 0, 0 );
+  ulong ret = vm->reg[0];
   FD_TEST( ret==expected_ret );
   FD_TEST( err==expected_err );
 
@@ -54,8 +56,9 @@ test_vm_syscall_sol_memcpy( char const * test_case_name,
                             int          expected_err ) {
   set_memory_region( vm->heap, vm->heap_max );
 
-  ulong ret = 0UL;
-  int   err = fd_vm_syscall_sol_memcpy( vm, dst_vaddr, src_vaddr, sz, 0, 0, &ret );
+  vm->reg[0] = 0UL;
+  int   err = fd_vm_syscall_sol_memcpy( vm, dst_vaddr, src_vaddr, sz, 0, 0 );
+  ulong ret = vm->reg[0];
   FD_TEST( ret==expected_ret );
   FD_TEST( err==expected_err );
 
@@ -90,13 +93,13 @@ test_vm_syscall_sol_memcmp_search( fd_vm_t * vm ) {
       for( ulong i=0UL; i<sz; i++ ) if( m0[i]!=m1[i] ) { want = (int)m0[i] - (int)m1[i]; break; }
 
       *r = -12345;
-      ulong ret = 1UL;
+      vm->reg[0] = 1UL;
       int   err = fd_vm_syscall_sol_memcmp( vm,
                     FD_VM_MEM_MAP_HEAP_REGION_START + OFF0,
                     FD_VM_MEM_MAP_HEAP_REGION_START + OFF1, sz,
-                    FD_VM_MEM_MAP_HEAP_REGION_START + OFFR, 0UL, &ret );
+                    FD_VM_MEM_MAP_HEAP_REGION_START + OFFR, 0UL );
       FD_TEST( err==FD_VM_SUCCESS );
-      FD_TEST( ret==0UL       );
+      FD_TEST( vm->reg[0]==0UL );
       FD_TEST( *r ==want      );
     }
   }
@@ -123,13 +126,13 @@ test_vm_syscall_sol_memcmp_alias( fd_vm_t * vm ) {
     for( ulong i=0UL; i<sz; i++ ) m[i] = (uchar)( i*7UL+1UL );
 
     *r = -12345;
-    ulong ret = 1UL;
+    vm->reg[0] = 1UL;
     int   err = fd_vm_syscall_sol_memcmp( vm,
                   FD_VM_MEM_MAP_HEAP_REGION_START + OFF,
                   FD_VM_MEM_MAP_HEAP_REGION_START + OFF, sz,
-                  FD_VM_MEM_MAP_HEAP_REGION_START + OFFR, 0UL, &ret );
+                  FD_VM_MEM_MAP_HEAP_REGION_START + OFFR, 0UL );
     FD_TEST( err==FD_VM_SUCCESS );
-    FD_TEST( ret==0UL           );
+    FD_TEST( vm->reg[0]==0UL    );
     FD_TEST( *r ==0             );
   }
 
@@ -148,8 +151,9 @@ test_vm_syscall_sol_memcmp( char const * test_case_name,
                             ulong        sz,
                             ulong        expected_ret,
                             int          expected_err ) {
-  ulong ret = 0UL;
-  int   err = fd_vm_syscall_sol_memcmp( vm, vaddr_1, vaddr_2, sz, vm_cmp_result_addr, 0, &ret );
+  vm->reg[0] = 0UL;
+  int   err = fd_vm_syscall_sol_memcmp( vm, vaddr_1, vaddr_2, sz, vm_cmp_result_addr, 0 );
+  ulong ret = vm->reg[0];
   FD_TEST( ret==expected_ret );
   FD_TEST( err==expected_err );
 
@@ -175,8 +179,9 @@ test_vm_syscall_sol_memmove( char const * test_case_name,
   FD_TEST( temp );
   memcpy( temp, (void *)src_haddr, sz );
 
-  ulong ret = 0UL;
-  int   err = fd_vm_syscall_sol_memmove( vm, dst_vaddr, src_vaddr, sz, 0, 0, &ret );
+  vm->reg[0] = 0UL;
+  int   err = fd_vm_syscall_sol_memmove( vm, dst_vaddr, src_vaddr, sz, 0, 0 );
+  ulong ret = vm->reg[0];
   FD_TEST( ret==expected_ret );
   FD_TEST( err==expected_err );
   if( !ret && !err ) FD_TEST( !memcmp( (void *)dst_haddr, temp, sz ) );
@@ -199,8 +204,9 @@ test_vm_syscall_sol_log( char const *            test_case_name,
   fd_log_collector_t * log = vm->instr_ctx->runtime->log.log_collector;
   ulong log_vec_len = fd_log_collector_debug_len( log );
 
-  ulong ret = 0UL;
-  int   err = fd_vm_syscall_sol_log( vm, msg_vaddr, msg_len, 0, 0, 0, &ret );
+  vm->reg[0] = 0UL;
+  int   err = fd_vm_syscall_sol_log( vm, msg_vaddr, msg_len, 0, 0, 0 );
+  ulong ret = vm->reg[0];
   FD_TEST( ret==expected_ret );
   FD_TEST( err==expected_err );
   if( !ret && !err ) {
@@ -228,8 +234,9 @@ test_vm_syscall_sol_log_64( char const *            test_case_name,
   fd_log_collector_t * log = vm->instr_ctx->runtime->log.log_collector;
   ulong log_vec_len = fd_log_collector_debug_len( log );
 
-  ulong ret = 0UL;
-  int   err = fd_vm_syscall_sol_log_64( vm, r1, r2, r3, r4, r5, &ret );
+  vm->reg[0] = 0UL;
+  int   err = fd_vm_syscall_sol_log_64( vm, r1, r2, r3, r4, r5 );
+  ulong ret = vm->reg[0];
   FD_TEST( ret==expected_ret );
   FD_TEST( err==expected_err );
   if( !ret && !err ) {
@@ -254,8 +261,9 @@ test_vm_syscall_sol_log_data( char const *            test_case_name,
   fd_log_collector_t * log = vm->instr_ctx->runtime->log.log_collector;
   ulong log_vec_len = fd_log_collector_debug_len( log );
 
-  ulong ret = 0UL;
-  int   err = fd_vm_syscall_sol_log_data( vm, data_vaddr, data_len, 0, 0, 0, &ret );
+  vm->reg[0] = 0UL;
+  int   err = fd_vm_syscall_sol_log_data( vm, data_vaddr, data_len, 0, 0, 0 );
+  ulong ret = vm->reg[0];
   FD_TEST( ret==expected_ret );
   FD_TEST( err==expected_err );
   if( !ret && !err ) {
@@ -284,6 +292,32 @@ dump_syscall_table( void ) {
       FD_LOG_NOTICE(( "  %08x %s", (uint)entry->key, entry->name ));
     }
   }
+
+  fd_sbpf_syscalls_delete( fd_sbpf_syscalls_leave( syscalls ) );
+}
+
+/* Feature-gated syscalls must stay unregistered at slot 0 when their
+   feature is disabled (slot 0 is a valid feature_slot). */
+
+static void
+test_register_slot0( void ) {
+  fd_sbpf_syscalls_t _syscalls[ 1UL<<FD_SBPF_SYSCALLS_LG_SLOT_CNT ] = {0};
+  fd_sbpf_syscalls_t * syscalls = fd_sbpf_syscalls_join( fd_sbpf_syscalls_new( _syscalls ) );
+  FD_TEST( syscalls );
+
+  ulong sha512_key = (ulong)fd_murmur3_32( "sol_sha512", 10UL, 0U );
+
+  fd_features_t features[1];
+  fd_features_disable_all( features );
+  FD_TEST( fd_vm_syscall_register_slot( syscalls, 0UL, features, 0 )==FD_VM_SUCCESS );
+  FD_TEST( !fd_sbpf_syscalls_query( syscalls, sha512_key, NULL ) );
+
+  features->enable_sha512_syscall = 0UL;
+  FD_TEST( fd_vm_syscall_register_slot( syscalls, 0UL, features, 0 )==FD_VM_SUCCESS );
+  FD_TEST( fd_sbpf_syscalls_query( syscalls, sha512_key, NULL ) );
+
+  FD_TEST( fd_vm_syscall_register_all( syscalls, 0 )==FD_VM_SUCCESS );
+  FD_TEST( fd_sbpf_syscalls_query( syscalls, sha512_key, NULL ) );
 
   fd_sbpf_syscalls_delete( fd_sbpf_syscalls_leave( syscalls ) );
 }
@@ -884,6 +918,29 @@ main( int     argc,
                                 data_chunk_num,
                                 0UL, FD_VM_SUCCESS, expected_log, expected_log_sz );
 
+  /* With logs disabled, log_data must still charge CUs and fault on
+     bad memory, but record nothing */
+
+  fd_log_collector_t * log = vm->instr_ctx->runtime->log.log_collector;
+  fd_log_collector_init( log, 0 );
+
+  vm->reg[0] = 0UL;
+  FD_TEST( fd_vm_syscall_sol_log_data( vm, FD_VM_MEM_MAP_HEAP_REGION_START, data_chunk_num, 0, 0, 0 )==FD_VM_SUCCESS );
+  FD_TEST( vm->reg[0]==0UL );
+  FD_TEST( fd_log_collector_debug_len( log )==0UL );
+  FD_TEST( log->buf_sz==0UL );
+  test_vm_clear_txn_ctx_err( vm->instr_ctx->txn_out );
+
+  fd_vm_vec_t oob_vec = { .addr = FD_VM_MEM_MAP_HEAP_REGION_START + vm->heap_max, .len = 5UL };
+  memcpy( &vm->heap[0] + sizeof(fd_vm_vec_t), &oob_vec, sizeof(oob_vec) );
+  FD_TEST( fd_vm_syscall_sol_log_data( vm, FD_VM_MEM_MAP_HEAP_REGION_START, data_chunk_num, 0, 0, 0 )==FD_VM_SYSCALL_ERR_SEGFAULT );
+  FD_TEST( log->buf_sz==0UL );
+  test_vm_clear_txn_ctx_err( vm->instr_ctx->txn_out );
+
+  FD_TEST( fd_vm_syscall_sol_log_data( vm, FD_VM_MEM_MAP_HEAP_REGION_START + vm->heap_max, 1UL, 0, 0, 0 )==FD_VM_SYSCALL_ERR_SEGFAULT );
+  FD_TEST( log->buf_sz==0UL );
+  test_vm_clear_txn_ctx_err( vm->instr_ctx->txn_out );
+
 # undef APPEND
 
   fd_vm_delete    ( fd_vm_leave    ( vm  ) );
@@ -891,6 +948,7 @@ main( int     argc,
   fd_rng_delete   ( fd_rng_leave   ( rng ) );
 
   dump_syscall_table();
+  test_register_slot0();
 
   FD_LOG_NOTICE(( "pass" ));
   fd_halt();

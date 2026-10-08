@@ -15,6 +15,7 @@ extern fd_topo_obj_callbacks_t fd_obj_cb_netdev_tbl;
 extern fd_topo_obj_callbacks_t fd_obj_cb_neigh4_hmap;
 extern fd_topo_obj_callbacks_t fd_obj_cb_keyswitch;
 extern fd_topo_obj_callbacks_t fd_obj_cb_node_info;
+extern fd_topo_obj_callbacks_t fd_obj_cb_wait_info;
 extern fd_topo_obj_callbacks_t fd_obj_cb_leader_txn_timing;
 extern fd_topo_obj_callbacks_t fd_obj_cb_tile;
 extern fd_topo_obj_callbacks_t fd_obj_cb_store;
@@ -38,6 +39,7 @@ fd_topo_obj_callbacks_t * CALLBACKS[] = {
   &fd_obj_cb_neigh4_hmap,
   &fd_obj_cb_keyswitch,
   &fd_obj_cb_node_info,
+  &fd_obj_cb_wait_info,
   &fd_obj_cb_leader_txn_timing,
   &fd_obj_cb_tile,
   &fd_obj_cb_store,
@@ -55,6 +57,7 @@ fd_topo_obj_callbacks_t * CALLBACKS[] = {
 };
 
 configure_stage_t * STAGES[] = {
+  &fd_cfg_stage_uverbs,
   &fd_cfg_stage_hugetlbfs,
   &fd_cfg_stage_sysctl,
   &fd_cfg_stage_bonding,
@@ -94,6 +97,7 @@ extern fd_topo_run_tile_t fd_tile_metric;
 extern fd_topo_run_tile_t fd_tile_event;
 extern fd_topo_run_tile_t fd_tile_diag;
 extern fd_topo_run_tile_t fd_tile_waker;
+extern fd_topo_run_tile_t fd_tile_mwaitx;
 extern fd_topo_run_tile_t fd_tile_gui;
 extern fd_topo_run_tile_t fd_tile_rpc;
 extern fd_topo_run_tile_t fd_tile_bundle;
@@ -140,6 +144,7 @@ fd_topo_run_tile_t * TILES[] = {
   &fd_tile_event,
   &fd_tile_diag,
   &fd_tile_waker,
+  &fd_tile_mwaitx,
   &fd_tile_gui,
   &fd_tile_rpc,
   &fd_tile_bundle,
@@ -191,6 +196,7 @@ extern action_t fd_action_get_identity;
 extern action_t fd_action_ps;
 extern action_t fd_action_monitor_gossip;
 extern action_t fd_action_snapshot_create;
+extern action_t fd_action_wait;
 
 action_t * ACTIONS[] = {
   &fd_action_run,
@@ -213,6 +219,7 @@ action_t * ACTIONS[] = {
   &fd_action_get_identity,
   &fd_action_ps,
   &fd_action_snapshot_create,
+  &fd_action_wait,
   NULL,
 };
 

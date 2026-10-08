@@ -105,6 +105,8 @@ struct fd_configf {
   } accounts;
 
   struct {
+    char mode[ 16 ];
+
     int  enable_block_production;
     int  enable_snapshot_production;
     uint sign_tile_count;
@@ -131,6 +133,7 @@ struct fd_configf {
 
   struct {
     char wait_for_supermajority_with_bank_hash[ FD_BASE58_ENCODED_32_SZ ];
+    int  alpenglow;
   } consensus;
 
   struct {
@@ -175,7 +178,6 @@ struct fd_configf {
   struct {
     int hard_fork_fatal;
     int fixed_fec_sets;
-    int alpenglow;
 
     struct {
       ulong max_stake_accounts;
@@ -215,7 +217,7 @@ struct fd_configf {
 
   struct {
     ulong authorized_voter_paths_cnt;
-    char  authorized_voter_paths[ 16 ][ PATH_MAX ];
+    char  authorized_voter_paths[ FD_KEYGUARD_AUTH_VOTERS_MAX ][ PATH_MAX ];
   } paths;
 
 };
@@ -315,6 +317,7 @@ struct fd_config {
     char stake_delegations[ PATH_MAX ];
     char shredb[ PATH_MAX ];
     char guidb[ PATH_MAX ];
+    char vote_history[ PATH_MAX ];
   } paths;
 
   struct {
@@ -510,9 +513,9 @@ struct fd_config {
       uint   max_pending_shred_sets;
       ushort shred_listen_port;
       ulong  additional_shred_destinations_retransmit_cnt;
-      char   additional_shred_destinations_retransmit[ FD_TOPO_ADTL_DESTS_MAX ][ sizeof("255.255.255.255:65536") ];
+      char   additional_shred_destinations_retransmit[ FD_TOPO_ADTL_DESTS_MAX ][ FD_HOSTPORT_BUF_MAX ];
       ulong  additional_shred_destinations_leader_cnt;
-      char   additional_shred_destinations_leader[ FD_TOPO_ADTL_DESTS_MAX ][ sizeof("255.255.255.255:65536") ];
+      char   additional_shred_destinations_leader[ FD_TOPO_ADTL_DESTS_MAX ][ FD_HOSTPORT_BUF_MAX ];
       ulong  shred_cache_size_mib;
     } shred;
 
@@ -551,14 +554,18 @@ struct fd_config {
     } repair;
 
     struct {
-      ulong  slot_max;
-    } rotor;
-
-    struct {
       int    enabled;
       ushort repair_serve_listen_port;
       ulong  shred_storage_limit_gib;
     } rserve;
+
+    struct {
+      int write_vote_history_file;
+    } tower;
+
+    struct {
+      int write_vote_history_file;
+    } votor;
 
     struct {
       ulong max_transaction_lookahead_buffer_size;

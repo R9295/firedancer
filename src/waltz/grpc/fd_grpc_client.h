@@ -97,8 +97,8 @@ struct fd_grpc_client_callbacks {
   void
   (* conn_established)( void * app_ctx );
 
-  /* conn_dead is called when the HTTP/2 connection ends.  To recover
-     from this condition, call fd_grpc_client_reset(). */
+  /* conn_dead is called when the HTTP/2 connection ends.  To recover,
+     call fd_grpc_client_reset() after the invoking call returns. */
 
   void
   (* conn_dead)( void * app_ctx,
@@ -176,8 +176,9 @@ void *
 fd_grpc_client_delete( fd_grpc_client_t * client );
 
 /* fd_grpc_client_next_deadline returns the earliest stream deadline
-   (header or rx-end) across all inflight requests, or LONG_MAX if no
-   stream has a deadline armed. */
+   (header or rx-end) across all inflight requests, 0 if a timed-out
+   stream's RST_STREAM can be sent now, or LONG_MAX if no stream has a
+   deadline armed. */
 
 FD_FN_PURE long
 fd_grpc_client_next_deadline( fd_grpc_client_t const * client );
@@ -212,7 +213,8 @@ fd_grpc_client_tx_starved( fd_grpc_client_t const * client );
 
 /* fd_grpc_client_reset cancels all inflight requests and abandons the
    HTTP/2 client connection.  Config params are kept intact (e.g. host,
-   port, version). */
+   port, version).  Defer reset requested by a client callback until
+   the call that invoked the callback returns. */
 
 void
 fd_grpc_client_reset( fd_grpc_client_t * client );

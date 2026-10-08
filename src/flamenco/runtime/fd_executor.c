@@ -1227,8 +1227,10 @@ fd_execute_instr( fd_runtime_t *      runtime,
   }
 
   if( FD_LIKELY( native_prog_fn!=NULL ) ) {
-    /* If this branch is taken, we've found an entrypoint to execute. */
-    fd_log_collector_program_invoke( ctx );
+    /* If this branch is taken, we've found an entrypoint to execute.
+       Precompiles run without program log lines.
+       https://github.com/anza-xyz/agave/blob/v4.3.0/program-runtime/src/invoke_context.rs#L618-L631 */
+    if( FD_LIKELY( !is_precompile ) ) fd_log_collector_program_invoke( ctx );
 
     /* Only reset the return data when executing a native builtin program (not a precompile)
        https://github.com/anza-xyz/agave/blob/v2.1.6/program-runtime/src/invoke_context.rs#L536-L537 */
@@ -1249,7 +1251,7 @@ fd_execute_instr( fd_runtime_t *      runtime,
 
   if( FD_LIKELY( instr_exec_result==FD_EXECUTOR_INSTR_SUCCESS ) ) {
     /* Log success */
-    fd_log_collector_program_success( ctx );
+    if( FD_LIKELY( !is_precompile ) ) fd_log_collector_program_success( ctx );
   } else {
     /* Log failure cases.
        We assume that the correct type of error is stored in ctx.
@@ -1263,9 +1265,9 @@ fd_execute_instr( fd_runtime_t *      runtime,
     if( !txn_out->err.exec_err ) {
       FD_TXN_PREPARE_ERR_OVERWRITE( txn_out );
       FD_TXN_ERR_FOR_LOG_INSTR( txn_out, instr_exec_result, txn_out->err.exec_err_idx );
-      fd_log_collector_program_failure( ctx );
+      if( FD_LIKELY( !is_precompile ) ) fd_log_collector_program_failure( ctx );
     } else {
-      fd_log_collector_program_failure( ctx );
+      if( FD_LIKELY( !is_precompile ) ) fd_log_collector_program_failure( ctx );
       FD_TXN_PREPARE_ERR_OVERWRITE( txn_out );
       FD_TXN_ERR_FOR_LOG_INSTR( txn_out, instr_exec_result, txn_out->err.exec_err_idx );
     }
@@ -1326,10 +1328,12 @@ fd_executor_setup_accounts_for_txn_bundle( fd_runtime_t *      runtime,
 
         /* If this txn writes the account, transfer ownership of the accdb
           ref to it and carry forward the vote and stake cache update
-          flags. */
+          flags.  The owner commits the account if any bundle txn up to
+          it touched it. */
         if( txn_out->accounts.is_writable[ i ] ) {
           txn_out->accounts.stake_update[ i ]    |= prev_txn->accounts.stake_update[ k ]; prev_txn->accounts.stake_update[ k ] = 0;
           txn_out->accounts.vote_update [ i ]    |= prev_txn->accounts.vote_update [ k ]; prev_txn->accounts.vote_update [ k ] = 0;
+          txn_out->accounts.touched     [ i ]    |= prev_txn->accounts.touched     [ k ];
           prev_txn->accounts.account_acquired[ k ]  = 0U;
           txn_out->accounts.account_acquired[ i ] = 1U;
         }
@@ -1421,7 +1425,6 @@ fd_executor_setup_accounts_for_txn( fd_runtime_t *      runtime,
   ushort executable_acquire_cnt = 0;
   ushort executable_acquire_idx[ MAX_TX_ACCOUNT_LOCKS ];
   fd_pubkey_t programdata_keys[ MAX_TX_ACCOUNT_LOCKS ];
-  int writable[ MAX_TX_ACCOUNT_LOCKS ];
   uchar const * pubkeys[ MAX_TX_ACCOUNT_LOCKS ];
   for( ushort i=0; i<txn_out->accounts.cnt; i++ ) {
     fd_acc_t * acc = txn_out->accounts.account[ i ];
@@ -1462,7 +1465,6 @@ fd_executor_setup_accounts_for_txn( fd_runtime_t *      runtime,
       continue;
     }
 
-    writable[ executable_acquire_cnt ]               = 0;
     executable_acquire_idx[ executable_acquire_cnt ] = executable_account_cnt;
     /* Keep the derived programdata address in stable storage until
        fd_accdb_acquire_b() consumes the pubkey array below. */
@@ -1477,7 +1479,7 @@ fd_executor_setup_accounts_for_txn( fd_runtime_t *      runtime,
      and not txn_out->accounts.cnt. */
   FD_TEST( runtime->accounts.executable_cnt+executable_acquire_cnt<=FD_PACK_MAX_TXN_PER_BUNDLE*MAX_TX_ACCOUNT_LOCKS );
   fd_acc_t * acquire_base = &runtime->accounts.executable[ runtime->accounts.executable_cnt ];
-  fd_accdb_acquire_b( runtime->accdb, bank->parent_accdb_fork_id, acquire_cnt, executable_acquire_cnt, pubkeys, writable, acquire_base );
+  fd_accdb_acquire_b( runtime->accdb, bank->parent_accdb_fork_id, acquire_cnt, executable_acquire_cnt, pubkeys, acquire_base );
   int acquired_from_parent = bank->parent_accdb_fork_id.val!=bank->accdb_fork_id.val;
   for( ushort i=0; i<executable_acquire_cnt; i++ ) {
     ushort exe_idx = executable_acquire_idx[ i ];
@@ -1501,8 +1503,9 @@ fd_executor_setup_accounts_for_txn( fd_runtime_t *      runtime,
 }
 
 int
-fd_executor_txn_verify( fd_txn_p_t *  txn_p,
-                        fd_sha512_t * shas[ FD_TXN_SIG_MAX ] ) {
+fd_executor_txn_verify( fd_txn_p_t *         txn_p,
+                        fd_sha512_t *        shas[ FD_TXN_SIG_MAX ],
+                        fd_ed25519_cache_t * cache ) {
   fd_txn_t * txn = TXN( txn_p );
 
   uchar * signatures = txn_p->payload + txn->signature_off;
@@ -1510,7 +1513,8 @@ fd_executor_txn_verify( fd_txn_p_t *  txn_p,
   uchar * msg        = txn_p->payload + txn->message_off;
   ulong   msg_sz     = fd_txn_msg_sz( txn, txn_p->payload_sz );
 
-  int res = fd_ed25519_verify_batch_single_msg( msg, msg_sz, signatures, pubkeys, shas, txn->signature_cnt );
+  int res = cache ? fd_ed25519_verify_batch_single_msg_cached( msg, msg_sz, signatures, pubkeys, shas, txn->signature_cnt, cache ) :
+                    fd_ed25519_verify_batch_single_msg       ( msg, msg_sz, signatures, pubkeys, shas, txn->signature_cnt        );
   if( FD_UNLIKELY( res!=FD_ED25519_SUCCESS ) ) return FD_RUNTIME_TXN_ERR_SIGNATURE_FAILURE;
 
   return FD_RUNTIME_EXECUTE_SUCCESS;
@@ -1584,6 +1588,11 @@ fd_executor_txn_check( fd_bank_t *    bank,
     if     ( !memcmp( acc->owner, &fd_solana_stake_program_id, sizeof(fd_pubkey_t) ) ) txn_out->accounts.stake_update[ i ] = 1;
     else if( !memcmp( acc->owner, &fd_solana_vote_program_id,  sizeof(fd_pubkey_t) ) ) txn_out->accounts.vote_update[ i ] = 1;
   }
+
+  /* The fee payer (account index 0) is debited during loading, outside
+     the VM, so it carries no touch flag but must still be written back.
+     https://github.com/anza-xyz/agave/blob/v4.2.0-beta.0/svm/src/transaction_processor.rs#L1116-L1120 */
+  txn_out->accounts.touched[ 0 ] = 1;
 
   /* https://github.com/anza-xyz/agave/blob/v4.2.0-beta.0/svm/src/transaction_processor.rs#L1126-L1132 */
   if( FD_UNLIKELY( ending_lamports_l!=starting_lamports_l || ending_lamports_h!=starting_lamports_h ) ) {

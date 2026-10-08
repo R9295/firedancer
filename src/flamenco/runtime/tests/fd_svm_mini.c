@@ -122,7 +122,7 @@ fd_svm_mini_wksp_data_max( fd_svm_mini_limits_t const * limits ) {
   ulong accdb_shmem_sz = fd_accdb_shmem_footprint( limits->max_accounts, limits->max_live_slots,
                                                     TEST_WRITES_PER_SLOT, TEST_PARTITION_CNT,
                                                     TEST_CACHE_FOOTPRINT, TEST_CACHE_MIN_RESERVED, joiner_cnt, 0UL );
-  ulong accdb_join_sz  = fd_accdb_footprint( limits->max_live_slots );
+  ulong accdb_join_sz  = fd_accdb_footprint( limits->max_live_slots, 1 );
 
 # define WKSP_ALLOC(a,s) fd_ulong_align_up( fd_ulong_max((s),1UL), fd_ulong_max((a),FD_WKSP_ALIGN_DEFAULT) )
   ulong sz = 0UL;
@@ -162,7 +162,7 @@ fd_svm_mini_create( fd_wksp_t *                  wksp,
   ulong accdb_shmem_sz = fd_accdb_shmem_footprint( limits->max_accounts, limits->max_live_slots,
                                                     TEST_WRITES_PER_SLOT, TEST_PARTITION_CNT,
                                                     TEST_CACHE_FOOTPRINT, TEST_CACHE_MIN_RESERVED, joiner_cnt, 0UL );
-  ulong accdb_join_sz  = fd_accdb_footprint( limits->max_live_slots );
+  ulong accdb_join_sz  = fd_accdb_footprint( limits->max_live_slots, 1 );
 
   /* Allocate objects */
 
@@ -195,7 +195,7 @@ fd_svm_mini_create( fd_wksp_t *                  wksp,
                           TEST_WRITES_PER_SLOT, TEST_PARTITION_CNT,
                           TEST_PARTITION_SZ, TEST_CACHE_FOOTPRINT, TEST_CACHE_MIN_RESERVED, 0, 42UL, joiner_cnt, 0UL ) );
   FD_TEST( shmem );
-  fd_accdb_t * accdb = fd_accdb_join( fd_accdb_new( accdb_join, shmem, accdb_fd, 0UL, NULL ) );
+  fd_accdb_t * accdb = fd_accdb_join( fd_accdb_new( accdb_join, shmem, accdb_fd, 0UL, NULL, NULL, 0UL, 1 ) );
   FD_TEST( accdb );
 
   /* Save accdb init params for reset */
@@ -401,8 +401,9 @@ fd_svm_mini_init_mock_validators( fd_svm_mini_t *              mini,
 
     fd_epoch_credits_t * epoch_credits = &fd_bank_epoch_credits( bank )[ i ];
     fd_memcpy( epoch_credits->pubkey, &vote_key, sizeof(fd_pubkey_t) );
-    epoch_credits->cnt          = 0UL;
-    epoch_credits->base_credits = 0UL;
+    epoch_credits->cnt                     = 0UL;
+    epoch_credits->base_credits            = 0UL;
+    epoch_credits->has_ag_migration_marker = 0;
 
     fd_stake_delegations_root_update( stake_delegations,
                                       &stake_key, &vote_key,
@@ -411,8 +412,7 @@ fd_svm_mini_init_mock_validators( fd_svm_mini_t *              mini,
                                       ULONG_MAX,  /* deactivation_epoch */
                                       0UL,        /* credits_observed */
                                       fd_ulong_max( stake_min_bal, uniform_stake ),
-                                      (uint)FD_STAKE_STATE_SZ,
-                                      FD_STAKE_DELEGATIONS_WARMUP_COOLDOWN_RATE_ENUM_025 /* warmup_cooldown_rate */ );
+                                      (uint)FD_STAKE_STATE_SZ );
 
     stakes[i] = (fd_vote_stake_weight_t){
       .vote_key = vote_key,
@@ -463,7 +463,7 @@ fd_svm_mini_reset( fd_svm_mini_t *        mini,
   FD_TEST( 0==ftruncate( accdb_fd, 0 ) );
 
   /* Re-initialize accdb join in place */
-  fd_accdb_t * accdb = fd_accdb_join( fd_accdb_new( mini->accdb_join_mem, shmem, accdb_fd, 0UL, NULL ) );
+  fd_accdb_t * accdb = fd_accdb_join( fd_accdb_new( mini->accdb_join_mem, shmem, accdb_fd, 0UL, NULL, NULL, 0UL, 1 ) );
   FD_TEST( accdb );
   mini->runtime->accdb = accdb;
 

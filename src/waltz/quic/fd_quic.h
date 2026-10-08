@@ -161,6 +161,7 @@ struct __attribute__((aligned(16UL))) fd_quic_config {
   X( identity_public_key,         "%x",     hex32, "",             __VA_ARGS__ ) \
   X( sign,                        "%p",     ptr,   "",             __VA_ARGS__ ) \
   X( sign_ctx,                    "%p",     ptr,   "",             __VA_ARGS__ ) \
+  X( req_client_cert,             "%d",     bool,  "bool",         __VA_ARGS__ ) \
   X( initial_rx_max_stream_data,  "%lu",    units, "bytes",        __VA_ARGS__ ) \
   X( max_datagram_frame_size,     "%lu",    units, "bytes",        __VA_ARGS__ ) \
   X( net.dscp,                    "0x%02x", value, "",             __VA_ARGS__ )
@@ -216,6 +217,11 @@ struct __attribute__((aligned(16UL))) fd_quic_config {
   /* alpn: either "solana-tpu" or "alpenglow-v1" */
   uchar alpn[ 32 ];
   ulong alpn_sz;
+
+  /* req_client_cert (server): request a client certificate during the
+     TLS handshake.  Clients are then required to authenticate with an
+     Ed25519 key, available at conn->tls_hs->hs.srv.client_pubkey. */
+  int req_client_cert;
 
   ulong initial_rx_max_stream_data; /* per-stream, rx buf sz in bytes, set by the user. */
   ulong max_datagram_frame_size;    /* RFC 9221 RX frame limit; zero disables DATAGRAM */
@@ -289,6 +295,15 @@ typedef void
 (* fd_quic_cb_tls_keylog_t)( void *       quic_ctx,
                              char const * line );
 
+/* fd_quic_cb_ack_range_t is called for each range of 1-RTT packet
+   numbers [pkt_num_lo,pkt_num_hi] acknowledged by an ACK frame.  Ranges
+   may overlap previously reported ones. */
+typedef void
+(* fd_quic_cb_ack_range_t)( fd_quic_conn_t * conn,
+                            ulong            pkt_num_lo,
+                            ulong            pkt_num_hi,
+                            void *           quic_ctx );
+
 /* fd_quic_callbacks_t defines the set of user-provided callbacks that
    are invoked by the QUIC library.  Resets on leave. */
 
@@ -305,6 +320,7 @@ struct fd_quic_callbacks {
   fd_quic_cb_stream_rx_t               stream_rx;         /* non-NULL, with stream_ctx */
   fd_quic_cb_datagram_rx_t             datagram_rx;       /* nullable, with quic_ctx   */
   fd_quic_cb_tls_keylog_t              tls_keylog;        /* nullable, with quic_ctx   */
+  fd_quic_cb_ack_range_t               ack_range;         /* nullable, with quic_ctx   */
 
 };
 typedef struct fd_quic_callbacks fd_quic_callbacks_t;
@@ -579,7 +595,8 @@ fd_quic_conn_let_die( fd_quic_conn_t * conn,
    dgram is the content of the DATAGRAM frame (dgram_sz bytes size).
 
    On success, returns UDP payload size and uses up the next conn TX
-   packet number.  Returns 0 on failure.  Reasons for failure include:
+   packet number, which is written to *opt_pkt_num if non-NULL.
+   Returns 0 on failure.  Reasons for failure include:
    - connection is not yet established
    - peer does not support the DATAGRAM extension
    - dgram_sz exceed's the peer's limit
@@ -590,12 +607,13 @@ fd_quic_conn_tx_dgram( fd_quic_conn_t * conn,
                        uchar *          pkt,
                        ulong            pkt_sz,
                        uchar const *    dgram,
-                       ulong            dgram_sz );
+                       ulong            dgram_sz,
+                       ulong *          opt_pkt_num );
 
 /* Service API ********************************************************/
 
-/* fd_quic_get_next_wakeup returns the next requested service time.
-   This is only intended for unit tests. */
+/* fd_quic_get_next_wakeup returns the next requested service time, or
+   LONG_MAX if nothing is scheduled. */
 
 FD_QUIC_API long
 fd_quic_get_next_wakeup( fd_quic_t * quic );

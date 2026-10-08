@@ -58,7 +58,8 @@ FD_FN_CONST ulong
 fd_accdb_align( void );
 
 FD_FN_CONST ulong
-fd_accdb_footprint( ulong max_live_slots );
+fd_accdb_footprint( ulong max_live_slots,
+                    int   compaction );
 
 /* fd_accdb_new constructs the local joiner state for an accdb writer
    (or compaction tile).  fd is an O_RDWR fd of the on-disk file.
@@ -77,14 +78,26 @@ fd_accdb_footprint( ulong max_live_slots );
    any joiner that is not the compaction tile, or a writer-only
    topology), pass external_epoch_cnt=0 and external_epoch_slots=NULL.
    The pointer array is borrowed and must remain valid for the
-   lifetime of the join. */
+   lifetime of the join.
+
+   sleep, if non-NULL, is the sleep object the accdb tile parks on and
+   sleep_tile_id its tile id there.  The join rings it whenever it hands
+   the tile work (a command, or the cache free list crossing its low
+   water mark).  NULL when the accdb tile spins.
+
+   compaction must match the value given to fd_accdb_footprint. */
+
+struct fd_sleep_private;
 
 void *
-fd_accdb_new( void *              ljoin,
-              fd_accdb_shmem_t *  shmem,
-              int                 fd,
-              ulong               external_epoch_cnt,
-              ulong const **      external_epoch_slots );
+fd_accdb_new( void *                    ljoin,
+              fd_accdb_shmem_t *        shmem,
+              int                       fd,
+              ulong                     external_epoch_cnt,
+              ulong const **            external_epoch_slots,
+              struct fd_sleep_private * sleep,
+              ulong                     sleep_tile_id,
+              int                       compaction );
 
 fd_accdb_t *
 fd_accdb_join( void * shaccdb );
@@ -227,6 +240,13 @@ void
 fd_accdb_advance_root( fd_accdb_t *       accdb,
                        fd_accdb_fork_id_t fork_id );
 
+/* fd_accdb_cmd_pending returns 1 if the accdb tile has not finished
+   the last submitted background command (e.g. advance_root), so the
+   next advance_root or purge would block, 0 otherwise. */
+
+int
+fd_accdb_cmd_pending( fd_accdb_t const * accdb );
+
 /* fd_accdb_purge removes the provided fork and all of its descendants
    from the accounts database.  This is an extremely rare operation,
    used to handle cases where a leader equivocated and produced two
@@ -359,7 +379,6 @@ fd_accdb_acquire_b( fd_accdb_t *          accdb,
                     ulong                 reserved_cnt,
                     ulong                 pubkeys_cnt,
                     uchar const * const * pubkeys,
-                    int *                 writable,
                     fd_acc_t *            out_accs );
 
 /* fd_accdb_release releases previously acquired accounts back to the
@@ -531,6 +550,9 @@ fd_accdb_snapshot_reserve_write( fd_accdb_t * accdb,
 
    file_offsets[i] is the pre-reserved on-disk location for pubkeys[i].
 
+   results receives one FD_ACCDB_SNAPSHOT_WRITE_* code per account.
+   Not meaningful when -1 is returned.
+
    fork_id controls recovery behavior:
 
      USHORT_MAX, full-snapshot mode.  Existing entries with the same
@@ -542,6 +564,11 @@ fd_accdb_snapshot_reserve_write( fd_accdb_t * accdb,
                  create a txn record on fork_id, so fd_accdb_purge can
                  revert the incremental writes on failure.  Intra-fork
                  duplicates are replaced in-place. */
+
+#define FD_ACCDB_SNAPSHOT_WRITE_IGNORED        (0) /* a newer version existed, write dropped */
+#define FD_ACCDB_SNAPSHOT_WRITE_LOADED         (1) /* no prior funded version */
+#define FD_ACCDB_SNAPSHOT_WRITE_REPLACED       (2) /* superseded a funded version from this load */
+#define FD_ACCDB_SNAPSHOT_WRITE_REPLACED_CROSS (3) /* superseded a funded version from an earlier snapshot */
 
 int
 fd_accdb_snapshot_write_batch( fd_accdb_t *        accdb,
@@ -557,7 +584,8 @@ fd_accdb_snapshot_write_batch( fd_accdb_t *        accdb,
                                ulong *             accounts_replaced,
                                ulong *             accounts_loaded,
                                ulong *             out_replaced_lamports,
-                               ulong *             out_ignored_lamports );
+                               ulong *             out_ignored_lamports,
+                               uchar *             results );
 
 /* fd_accdb_background performs one unit of background work.
 
@@ -588,9 +616,11 @@ fd_accdb_snapshot_write_batch( fd_accdb_t *        accdb,
 
    First checks for a pending advance_root or purge command from T1; if
    one is present it executes the command, sets *charge_busy to 1, and
-   returns immediately without doing compaction. Otherwise, attempts one
-   step of compaction at each layer, setting *charge_busy if work was
-   done. */
+   returns immediately without doing compaction. Otherwise, if every
+   fallocated partition is in use, grows the file by one partition
+   (fallocate, can take seconds on slow filesystems), sets *charge_busy
+   and returns.  Otherwise, attempts one step of compaction at each
+   layer, setting *charge_busy if work was done. */
 
 void
 fd_accdb_background( fd_accdb_t * accdb,

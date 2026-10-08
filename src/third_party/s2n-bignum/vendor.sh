@@ -33,10 +33,15 @@ readonly -a S2N_HDRS=(
 )
 
 readonly -a S2N_FILES=(
+  x86/curve25519/bignum_inv_p25519.S
   x86/curve25519/curve25519_x25519.S
   x86/curve25519/curve25519_x25519_alt.S
   x86/curve25519/curve25519_x25519base.S
   x86/curve25519/curve25519_x25519base_alt.S
+  x86/curve25519/edwards25519_scalarmuldouble.S
+  x86/curve25519/edwards25519_scalarmuldouble_alt.S
+  x86/curve25519/edwards25519_scalarmulbase.S
+  x86/curve25519/edwards25519_scalarmulbase_alt.S
   x86/fastmul/bignum_mul_4_8.S
   x86/fastmul/bignum_mul_4_8_alt.S
   x86/fastmul/bignum_mul_6_12.S
@@ -103,8 +108,11 @@ readonly -a S2N_FILES=(
   x86/secp256k1/bignum_triple_p256k1.S
   x86/secp256k1/bignum_triple_p256k1_alt.S
   x86/sha3/sha3_keccak_f1600.S
+  arm/curve25519/bignum_inv_p25519.S
   arm/curve25519/curve25519_x25519_byte_alt.S
   arm/curve25519/curve25519_x25519base_byte_alt.S
+  arm/curve25519/edwards25519_scalarmuldouble_alt.S
+  arm/curve25519/edwards25519_scalarmulbase_alt.S
   arm/fastmul/bignum_mul_4_8_alt.S
   arm/fastmul/bignum_mul_6_12_alt.S
   arm/generic/bignum_demont.S

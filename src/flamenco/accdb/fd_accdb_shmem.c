@@ -114,7 +114,7 @@ fd_accdb_shmem_footprint( ulong max_accounts,
   l = FD_LAYOUT_APPEND( l, deferred_free_dlist_align(), deferred_free_dlist_footprint()                      );
   l = FD_LAYOUT_APPEND( l, alignof(uint),            txn_max*sizeof(uint)                                    );
   for( ulong c=0UL; c<FD_ACCDB_CACHE_CLASS_CNT; c++ ) {
-    l = FD_LAYOUT_APPEND( l, FD_ACCDB_CACHE_META_SZ, cache_class_max[c]*fd_accdb_cache_slot_sz[c]            );
+    l = FD_LAYOUT_APPEND( l, alignof(fd_accdb_cache_line_t), cache_class_max[c]*fd_accdb_cache_slot_sz[c]   );
   }
   l = FD_LAYOUT_APPEND( l, alignof(uint),            delta_chain_cnt*sizeof(uint)                            );
   l = FD_LAYOUT_APPEND( l, alignof(fd_accdb_delta_t),max_incremental_accounts*sizeof(fd_accdb_delta_t)       );
@@ -300,7 +300,7 @@ fd_accdb_shmem_new( void * shmem,
   void * _deferred_acc_buf    = FD_SCRATCH_ALLOC_APPEND( l, alignof(uint),            txn_max*sizeof(uint)                                 );
   void * _cache_regions[ FD_ACCDB_CACHE_CLASS_CNT ];
   for( ulong c=0UL; c<FD_ACCDB_CACHE_CLASS_CNT; c++ ) {
-    _cache_regions[ c ] = FD_SCRATCH_ALLOC_APPEND( l, FD_ACCDB_CACHE_META_SZ, cache_class_max[c]*fd_accdb_cache_slot_sz[c]                 );
+    _cache_regions[ c ] = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_accdb_cache_line_t), cache_class_max[c]*fd_accdb_cache_slot_sz[c]        );
   }
   void * _delta_map  = FD_SCRATCH_ALLOC_APPEND( l, alignof(uint),             delta_chain_cnt*sizeof(uint)                      );
   void * _delta_pool = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_accdb_delta_t), max_incremental_accounts*sizeof(fd_accdb_delta_t) );
@@ -352,6 +352,7 @@ fd_accdb_shmem_new( void * shmem,
   accdb->generation = 0U;
 
   accdb->partition_lock   = 0;
+  accdb->grow_lock        = 0;
   accdb->snapshot_loading = 0;
   accdb->bundle_enabled   = bundle_enabled;
 
@@ -392,6 +393,7 @@ fd_accdb_shmem_new( void * shmem,
   accdb->partition_cnt    = partition_cnt;
   accdb->partition_sz     = partition_sz;
   accdb->partition_max    = 0UL;
+  accdb->partition_fallocated = 0UL;
 
   accdb->partition_pool_off = (ulong)partition_pool - (ulong)shmem;
   for( ulong k=0UL; k<FD_ACCDB_COMPACTION_LAYER_CNT; k++ ) {

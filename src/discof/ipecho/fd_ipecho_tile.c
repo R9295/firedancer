@@ -1,5 +1,6 @@
 #include "fd_ipecho_client.h"
 #include "fd_ipecho_server.h"
+#include "fd_ipecho_server_port_check.h"
 
 #include "../genesis/fd_genesi_tile.h"
 #include "../genesis/genesis_hash.h"
@@ -7,12 +8,14 @@
 #include "../../disco/topo/fd_dns_resolve.h"
 #include "../../disco/metrics/fd_metrics.h"
 #include "../../disco/waker/fd_waker.h"
+#include "../../disco/fd_clock_tile.h"
 
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <time.h> /* CLOCK_REALTIME for seccomp filter */
 #include <poll.h>
 
+#include <linux/futex.h>
 #include "generated/fd_ipecho_tile_seccomp.h"
 
 #define FD_IPECHO_MAX_CONNECTION_CNT (1024UL)
@@ -25,6 +28,8 @@ struct fd_ipecho_tile_ctx {
 
   ulong   waker_client_idx;
   ulong * waker_fseq;
+
+  fd_clock_tile_t clock[1];
 
   uint   bind_address;
   ushort bind_port;
@@ -68,6 +73,12 @@ metrics_write( fd_ipecho_tile_ctx_t * ctx ) {
   conn_closed[ FD_METRICS_ENUM_CONN_CLOSE_RESULT_V_OK_IDX    ] = metrics->connections_closed_ok;
   conn_closed[ FD_METRICS_ENUM_CONN_CLOSE_RESULT_V_ERROR_IDX ] = metrics->connections_closed_error;
   FD_MCNT_ENUM_COPY( IPECHO, CONN_CLOSED, conn_closed );
+
+  fd_ipecho_server_port_check_metrics_t * pc_metrics = fd_ipecho_server_port_check_metrics(
+    fd_ipecho_server_port_check( ctx->server ) );
+  FD_MCNT_SET(       IPECHO, PORT_CHECK_UDP_SENT,   pc_metrics->udp_sent );
+  FD_MCNT_ENUM_COPY( IPECHO, PORT_CHECK_TCP,        pc_metrics->tcp      );
+  FD_MGAUGE_SET(     IPECHO, PORT_CHECK_TCP_ACTIVE, pc_metrics->active   );
 }
 
 static inline void
@@ -77,7 +88,7 @@ poll_client( fd_ipecho_tile_ctx_t * ctx,
   if( FD_UNLIKELY( !ctx->client ) ) return;
 
   ushort shred_version;
-  int result = fd_ipecho_client_poll( ctx->client, &shred_version, charge_busy );
+  int result = fd_ipecho_client_poll( ctx->client, fd_clock_tile_now( ctx->clock ), &shred_version, charge_busy );
   if( FD_UNLIKELY( !result ) ) {
     if( FD_UNLIKELY( ctx->expected_shred_version && ctx->expected_shred_version!=shred_version ) ) {
       FD_LOG_ERR(( "Expected shred version %hu but entrypoint returned %hu",
@@ -96,6 +107,21 @@ poll_client( fd_ipecho_tile_ctx_t * ctx,
   }
 }
 
+static void
+during_housekeeping( fd_ipecho_tile_ctx_t * ctx ) {
+  if( FD_UNLIKELY( fd_clock_tile_recal_due( ctx->clock ) ) ) fd_clock_tile_recal( ctx->clock );
+  fd_ipecho_server_port_check_prune( fd_ipecho_server_port_check( ctx->server ), fd_tickcount() );
+}
+
+static inline long
+next_deadline( fd_ipecho_tile_ctx_t * ctx ) {
+  if( FD_LIKELY( !ctx->retrieving || !ctx->client ) ) return LONG_MAX;
+
+  long deadline = fd_ipecho_client_deadline_nanos( ctx->client );
+  if( FD_UNLIKELY( deadline==LONG_MAX ) ) return 0L; /* first poll starts the clock */
+  return fd_clock_tile_wallclock_to_tickcount( ctx->clock, deadline );
+}
+
 static inline void
 after_credit( fd_ipecho_tile_ctx_t * ctx,
               fd_stem_context_t *    stem,
@@ -104,15 +130,18 @@ after_credit( fd_ipecho_tile_ctx_t * ctx,
   (void)opt_poll_in;
 
   if( FD_UNLIKELY( ctx->retrieving ) ) {
+    int fired = fd_fseq_query( ctx->waker_fseq )==1UL;
+    if( FD_LIKELY( fired ) ) fd_fseq_update( ctx->waker_fseq, 0UL );
     poll_client( ctx, stem, charge_busy );
+    if( FD_LIKELY( fired ) ) fd_waker_client_rearm( ctx->waker_client_idx );
     return;
   }
 
   if( FD_UNLIKELY( fd_fseq_query( ctx->waker_fseq )==1UL ) ) {
     fd_fseq_update( ctx->waker_fseq, 0UL );
-    fd_ipecho_server_epoll_poll( ctx->server, charge_busy ); /* one batch; the rearm re-fires leftovers */
+    fd_ipecho_server_epoll_poll( ctx->server, fd_tickcount(), charge_busy ); /* one batch; the rearm re-fires leftovers */
     fd_waker_client_rearm( ctx->waker_client_idx );
-  } else {
+  } else if( FD_LIKELY( !stem->sleep ) ) {
     fd_log_sleep( (long)1e6 );
   }
 }
@@ -166,7 +195,7 @@ privileged_init( fd_topo_t const *      topo,
   if( FD_LIKELY( ctx->entrypoints_cnt ) ) {
     ctx->client = fd_ipecho_client_join( fd_ipecho_client_new( _client ) );
     FD_TEST( ctx->client );
-    fd_ipecho_client_init( ctx->client, ctx->entrypoints, ctx->entrypoints_cnt );
+    fd_ipecho_client_init( ctx->client, ctx->entrypoints, ctx->entrypoints_cnt, FD_WAKER_INNER_FD( tile->waker_client_idx ) );
   } else {
     ctx->client = NULL;
   }
@@ -196,6 +225,8 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->waker_fseq = fd_fseq_join( fd_topo_obj_laddr( topo, tile->waker_fseq_obj_id ) );
   FD_TEST( ctx->waker_fseq );
 
+  fd_clock_tile_init( ctx->clock );
+
   /* In some topologies (e.g. firedancer-dev gossip), the ipecho tile
      has no input links. Guard against dereferencing a missing
      link/dcache. */
@@ -215,12 +246,14 @@ unprivileged_init( fd_topo_t const *      topo,
 static ulong
 rlimit_file_cnt( fd_topo_t const *      topo FD_PARAM_UNUSED,
                  fd_topo_tile_t const * tile ) {
-  /* pipefd, socket, stderr, logfile, and one spare for
-     new accept() connections */
-  ulong base = 5UL;
+  /* stderr, logfile, the listen socket, the waker's inner and outer
+     epoll fds, and one spare for new accept() connections */
+  ulong base = 6UL;
   return base +
-         tile->ipecho.entrypoints_cnt + /* for the client */
-         FD_IPECHO_MAX_CONNECTION_CNT;  /* for the server's connections */
+         tile->ipecho.entrypoints_cnt +        /* for the client */
+         1UL +                                 /* for the port check's UDP socket */
+         FD_IPECHO_MAX_CONNECTION_CNT +        /* for the server's connections */
+         FD_IPECHO_SERVER_PORT_CHECK_CONN_MAX; /* for the port check's outgoing TCP connections */
 }
 
 static ulong
@@ -228,12 +261,15 @@ populate_allowed_seccomp( fd_topo_t const *      topo,
                           fd_topo_tile_t const * tile,
                           ulong                  out_cnt,
                           struct sock_filter *   out ) {
-  (void)topo;
+  void * scratch             = fd_topo_obj_laddr( topo, tile->tile_obj_id );
+  FD_SCRATCH_ALLOC_INIT( l, scratch );
+  fd_ipecho_tile_ctx_t * ctx = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_ipecho_tile_ctx_t), sizeof(fd_ipecho_tile_ctx_t) );
 
-  uint epoll_inner_fd = (uint)FD_WAKER_INNER_FD( tile->waker_client_idx );
-  uint epoll_outer_fd = (uint)FD_WAKER_OUTER_FD;
+  uint epoll_inner_fd    = (uint)FD_WAKER_INNER_FD( tile->waker_client_idx );
+  uint epoll_outer_fd    = (uint)FD_WAKER_OUTER_FD;
+  uint port_check_udp_fd = (uint)fd_ipecho_server_port_check_udp_sockfd( fd_ipecho_server_port_check( ctx->server ) );
 
-  populate_sock_filter_policy_fd_ipecho_tile( out_cnt, out, (uint)fd_log_private_logfile_fd(), epoll_inner_fd, epoll_outer_fd );
+  populate_sock_filter_policy_fd_ipecho_tile( out_cnt, out, (uint)fd_log_private_logfile_fd(), epoll_inner_fd, epoll_outer_fd, port_check_udp_fd );
   return sock_filter_policy_fd_ipecho_tile_instr_cnt;
 }
 
@@ -247,7 +283,7 @@ populate_allowed_fds( fd_topo_t const *      topo,
   FD_SCRATCH_ALLOC_INIT( l, scratch );
   fd_ipecho_tile_ctx_t * ctx = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_ipecho_tile_ctx_t), sizeof(fd_ipecho_tile_ctx_t) );
 
-  if( FD_UNLIKELY( out_fds_cnt<5UL+tile->ipecho.entrypoints_cnt ) ) FD_LOG_ERR(( "out_fds_cnt %lu", out_fds_cnt ));
+  if( FD_UNLIKELY( out_fds_cnt<6UL+tile->ipecho.entrypoints_cnt ) ) FD_LOG_ERR(( "out_fds_cnt %lu", out_fds_cnt ));
 
   ulong out_cnt = 0UL;
   out_fds[ out_cnt++ ] = 2; /* stderr */
@@ -260,8 +296,9 @@ populate_allowed_fds( fd_topo_t const *      topo,
     if( FD_LIKELY( fd!=-1 ) ) out_fds[ out_cnt++ ] = fd;
   }
 
-  /* The server's socket. */
+  /* The server's listen socket and the port check's UDP socket. */
   out_fds[ out_cnt++ ] = fd_ipecho_server_sockfd( ctx->server );
+  out_fds[ out_cnt++ ] = fd_ipecho_server_port_check_udp_sockfd( fd_ipecho_server_port_check( ctx->server ) );
 
   out_fds[ out_cnt++ ] = FD_WAKER_OUTER_FD;                           /* waker outer epoll fd (rearm) */
   out_fds[ out_cnt++ ] = FD_WAKER_INNER_FD( tile->waker_client_idx ); /* waker inner epoll fd */
@@ -274,9 +311,11 @@ populate_allowed_fds( fd_topo_t const *      topo,
 #define STEM_CALLBACK_CONTEXT_TYPE  fd_ipecho_tile_ctx_t
 #define STEM_CALLBACK_CONTEXT_ALIGN alignof(fd_ipecho_tile_ctx_t)
 
-#define STEM_CALLBACK_METRICS_WRITE   metrics_write
-#define STEM_CALLBACK_AFTER_CREDIT    after_credit
-#define STEM_CALLBACK_RETURNABLE_FRAG returnable_frag
+#define STEM_CALLBACK_DURING_HOUSEKEEPING during_housekeeping
+#define STEM_CALLBACK_NEXT_DEADLINE       next_deadline
+#define STEM_CALLBACK_METRICS_WRITE       metrics_write
+#define STEM_CALLBACK_AFTER_CREDIT        after_credit
+#define STEM_CALLBACK_RETURNABLE_FRAG     returnable_frag
 
 #include "../../disco/stem/fd_stem.c"
 

@@ -2,6 +2,7 @@
 #define HEADER_fd_src_disco_fd_txn_p_h
 
 #include "../ballet/txn/fd_txn.h"
+#include <stddef.h>
 
 struct __attribute__((aligned(64))) fd_txn_p {
   uchar payload[FD_TPU_MTU];
@@ -25,7 +26,7 @@ struct __attribute__((aligned(64))) fd_txn_p {
      uint rebated_cus; /* requested_exec_plus_acct_data_cus-actual used CUs. Pack reads this for CU rebating. */
      uint actual_consumed_cus; /* non_execution_cus+real execution CUs+real account data cus. PoH reads this for block CU counting. */
    } execle_cu; /* Populated by execle. */
-   ulong blockhash_slot; /* Slot provided by resolv tile when txn arrives at the pack tile. Used when txn is in extra storage in pack. */
+   ulong blockhash_height; /* block height provided by resolv tile when txn arrives at the pack tile. Used when txn is in extra storage in pack. */
   };
   /* Wallclock nanoseconds at which the transaction arrived to the pack tile. Set by pack and intended to be read from a transaction on a pack->execle link. */
   long scheduler_arrival_time_nanos;
@@ -67,6 +68,17 @@ FD_STATIC_ASSERT( FD_TPU_MTU<=USHORT_MAX, fd_txn_p_payload_sz );
 FD_STATIC_ASSERT( sizeof(fd_txn_p_t)==4992UL, fd_txn_p_layout );
 
 #define TXN(txn_p) ((fd_txn_t *)( (txn_p)->_ ))
+
+static inline void
+fd_txn_p_copy( fd_txn_p_t *       dst,
+               fd_txn_p_t const * src ) {
+  fd_txn_t const * txn = TXN( src );
+  ulong meta_off = offsetof(fd_txn_p_t, payload_sz);
+  ulong desc_sz  = fd_txn_footprint( txn->instr_cnt, txn->addr_table_lookup_cnt );
+  fd_memcpy( dst->payload, src->payload, src->payload_sz );
+  fd_memcpy( (uchar *)dst+meta_off, (uchar const *)src+meta_off, offsetof(fd_txn_p_t, _)-meta_off );
+  fd_memcpy( dst->_, src->_, desc_sz );
+}
 
 /* fd_txn_e_t: An fd_txn_p_t with expanded address lookup tables */
 struct __attribute__((aligned(64))) fd_txn_e {

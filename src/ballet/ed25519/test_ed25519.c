@@ -2,6 +2,7 @@
 #include "fd_ed25519.h"
 #include "fd_curve25519.h"
 #include "../hex/fd_hex.h"
+#include <stdlib.h>
 #include "test_ed25519_wycheproof.c"
 #include "test_ed25519_cctv.c"
 
@@ -301,10 +302,76 @@ test_fe_sq( fd_rng_t * rng ) {
   log_bench( "fd_f25519_sqr", iter, dt );
 }
 
+/* ref_inv is the inversion as an exponentiation, a^(p-2) with
+   p-2 = 2^255-21 = 8*(2^252-3)+3, through the pow22523 addition chain
+   (the old fd_f25519_inv was another addition chain for the same
+   exponent).  0 maps to 0. */
+
+static fd_f25519_t *
+ref_inv( fd_f25519_t *       r,
+         fd_f25519_t const * a ) {
+  fd_f25519_t e[1], a3[1];
+  fd_f25519_pow22523( e, a );
+  fd_f25519_sqr( e, e );
+  fd_f25519_sqr( e, e );
+  fd_f25519_sqr( e, e );
+  fd_f25519_sqr( a3, a );
+  fd_f25519_mul( a3, a3, a );
+  return fd_f25519_mul( r, e, a3 );
+}
+
+/* fe_bytes_p_plus writes the 32 little endian bytes of p+d, |d|<2^62 */
+
+static void
+fe_bytes_p_plus( uchar buf[ 32 ],
+                 long  d ) {
+  long  e = d-19L; /* p+d = 2^255+e */
+  ulong w[ 4 ];
+  if( e>=0L ) { w[0] = (ulong)e; w[1] = 0UL;       w[2] = 0UL;       w[3] = 1UL<<63;      }
+  else        { w[0] = (ulong)e; w[1] = ULONG_MAX; w[2] = ULONG_MAX; w[3] = ULONG_MAX>>1; } /* 2^256+e-2^255 */
+  memcpy( buf, w, 32UL );
+}
+
+static void
+check_inv( uchar const buf[ 32 ] ) {
+  fd_f25519_t a[1], h[1], e[1];
+  uchar hb[ 32 ], eb[ 32 ];
+  fd_f25519_frombytes( a, buf );
+  fd_f25519_inv( h, a );
+  ref_inv( e, a );
+  fd_f25519_tobytes( hb, h );
+  fd_f25519_tobytes( eb, e );
+  if( FD_UNLIKELY( memcmp( hb, eb, 32UL ) ) ) {
+    FD_LOG_HEXDUMP_WARNING(( "input",    buf, 32UL ));
+    FD_LOG_HEXDUMP_WARNING(( "inv",      hb,  32UL ));
+    FD_LOG_HEXDUMP_WARNING(( "expected", eb,  32UL ));
+    FD_LOG_ERR(( "fd_f25519_inv mismatch" ));
+  }
+  /* a*inv(a)==1 unless a==0, in which case inv(a)==0 */
+  fd_f25519_mul( e, a, h );
+  FD_TEST( fd_f25519_is_zero( a ) ? fd_f25519_is_zero( h ) : fd_f25519_eq( e, fd_f25519_one ) );
+  /* in place */
+  fd_f25519_inv( a, a );
+  FD_TEST( fd_f25519_eq( a, h ) );
+}
+
 void
 test_fe_invert( fd_rng_t * rng ) {
   fd_f25519_t _f[1]; fd_f25519_t * f = _f;
   fd_f25519_t _h[1]; fd_f25519_t * h = _h;
+
+  /* Differential against the exponentiation: edge cases (0, 1, small
+     values, p-1, p and other non-canonical encodings, the top bit
+     that frombytes ignores) then random elements. */
+  uchar buf[ 32 ];
+  for( ulong k=0UL; k<300UL; k++ ) { memset( buf, 0, 32UL ); buf[0] = (uchar)k; buf[1] = (uchar)(k>>8); check_inv( buf ); } /* 0 .. 299 */
+  for( long d=-300L; d<300L; d++ ) { fe_bytes_p_plus( buf, d ); check_inv( buf ); } /* p-300 .. p+299 (p+d, d>=0, is non-canonical) */
+  memset( buf, 0, 32UL ); buf[31] = 0x80; check_inv( buf ); /* bit 255 set: read as 0 */
+  memset( buf, 0xff, 32UL ); check_inv( buf );              /* read as 2^255-1 = p+18 */
+  for( ulong k=0UL; k<(g_bench ? 1000000UL : 20000UL); k++ ) {
+    for( ulong i=0UL; i<32UL; i++ ) buf[ i ] = fd_rng_uchar( rng );
+    check_inv( buf );
+  }
 
   fd_f25519_rng_unsafe( f, rng );
   ulong iter = g_bench ? 10000UL : 0UL;
@@ -553,6 +620,213 @@ test_point_validate( FD_PARAM_UNUSED fd_rng_t * rng ) {
 
   fd_hex_decode( buf, "b898e00f6f6df758b3f9a05cbf73b15fd392a008a9a417d471c178c1b28c7447", 32 );
   FD_CHECK_ERR( !fd_ed25519_point_validate( buf ), "!fd_ed25519_point_validate(02..00)" );
+}
+
+/* Reference implementations: a^((p-1)/2) = pow22523(a)^4 * a^2 and
+   full decompression. */
+
+static int
+ref_is_square( fd_f25519_t const * a ) {
+  fd_f25519_t e[1], a2[1];
+  fd_f25519_pow22523( e, a );
+  fd_f25519_sqr( e, e );
+  fd_f25519_sqr( e, e );
+  fd_f25519_sqr( a2, a );
+  fd_f25519_mul( e, e, a2 );
+  int ref = fd_f25519_is_zero( a ) || fd_f25519_eq( e, fd_f25519_one );
+  /* is_square_var falls back to sqrt_ratio if the Jacobi symbol does
+     not converge, check that too */
+  FD_TEST( fd_f25519_sqrt_ratio( e, a, fd_f25519_one )==ref );
+  return ref;
+}
+
+static int
+ref_point_validate( uchar const buf[ 32 ] ) {
+  fd_ed25519_point_t t[1];
+  return !!fd_ed25519_point_frombytes( t, buf );
+}
+
+/* check_validate checks fd_ed25519_point_validate against decompression
+   on buf with both sign bits.  Returns the number of valid inputs. */
+
+static ulong
+check_validate( uchar const buf[ 32 ] ) {
+  uchar b[32]; memcpy( b, buf, 32UL );
+  ulong valid_cnt = 0UL;
+  for( int sign=0; sign<2; sign++ ) {
+    b[31] = (uchar)( (b[31] & 0x7f) | (sign<<7) );
+    int ref = ref_point_validate( b );
+    int got = fd_ed25519_point_validate( b );
+    if( FD_UNLIKELY( ref!=got ) ) {
+      FD_LOG_HEXDUMP_WARNING(( "input", b, 32UL ));
+      FD_LOG_ERR(( "fd_ed25519_point_validate mismatch (got %d, expected %d)", got, ref ));
+    }
+    valid_cnt += (ulong)got;
+  }
+  return valid_cnt;
+}
+
+/* le_add_small sets r = a + k (mod 2^256) for 32-byte little endian a. */
+
+static void
+le_add_small( uchar       r[ 32 ],
+              uchar const a[ 32 ],
+              long        k ) {
+  ulong w[4]; memcpy( w, a, 32UL );
+  ulong c = (ulong)k;
+  ulong ext = k<0L ? ULONG_MAX : 0UL;
+  for( int i=0; i<4; i++ ) {
+    ulong s  = w[i] + c;
+    ulong c0 = (ulong)(s<w[i]);
+    w[i] = s;
+    c = ext + c0;
+  }
+  memcpy( r, w, 32UL );
+}
+
+static void
+test_point_validate_diff( fd_rng_t * rng,
+                          ulong      iter ) {
+  static char const * p_hex = "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f";
+  uchar p[32];  fd_hex_decode( p, p_hex, 32 );
+  uchar b[32];
+  fd_f25519_t a[1];
+
+  /* is_square_var vs Euler's criterion: small values, values near p,
+     powers of two and random elements. */
+
+  for( long k=-2000L; k<=2000L; k++ ) {
+    if( k>=0L ) { memset( b, 0, 32UL ); b[0] = (uchar)(k & 0xff); b[1] = (uchar)(k>>8); }
+    else        le_add_small( b, p, k );
+    fd_f25519_frombytes( a, b );
+    FD_TEST( fd_f25519_is_square_var( a )==ref_is_square( a ) );
+  }
+  for( int i=0; i<255; i++ ) {
+    memset( b, 0, 32UL ); b[i/8] = (uchar)(1<<(i%8));
+    fd_f25519_frombytes( a, b );
+    FD_TEST( fd_f25519_is_square_var( a )==ref_is_square( a ) );
+    le_add_small( b, b, -1L );
+    fd_f25519_frombytes( a, b );
+    FD_TEST( fd_f25519_is_square_var( a )==ref_is_square( a ) );
+  }
+  ulong sq_cnt = 0UL;
+  for( ulong i=0UL; i<iter/8UL; i++ ) {
+    fd_f25519_rng_unsafe( a, rng );
+    int got = fd_f25519_is_square_var( a );
+    FD_TEST( got==ref_is_square( a ) );
+    sq_cnt += (ulong)got;
+  }
+  FD_LOG_NOTICE(( "fd_f25519_is_square_var: %lu/%lu random elements are squares", sq_cnt, iter/8UL ));
+
+  /* Structured y: 0..4096 and p-4096..2^255-1 (the latter covers all
+     non-canonical y in [p,2^255)), both sign bits. */
+
+  ulong edge_cnt = 0UL;
+  for( long k=0L; k<=4096L; k++ ) {
+    memset( b, 0, 32UL ); b[0] = (uchar)(k & 0xff); b[1] = (uchar)(k>>8);
+    check_validate( b ); edge_cnt += 2UL;
+  }
+  for( long k=-4096L; k<=18L; k++ ) {
+    le_add_small( b, p, k );
+    check_validate( b ); edge_cnt += 2UL;
+  }
+
+  /* Torsion points (y=1, y=-1, y=0 and the two order 8 y's) and
+     non-canonical encodings of y=0, y=1 and y=2^255-1. */
+
+  static char const * torsion_hex[] = {
+    "0100000000000000000000000000000000000000000000000000000000000000",
+    "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
+    "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+    "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", /* y=p   (0) */
+    "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", /* y=p+1 (1) */
+    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", /* y=2^255-1 */
+    NULL
+  };
+  for( ulong i=0UL; torsion_hex[i]; i++ ) {
+    fd_hex_decode( b, torsion_hex[i], 32 );
+    FD_TEST( check_validate( b )==2UL );
+    edge_cnt += 2UL;
+  }
+
+  /* Points from keys, multiples of the base point, their negations and
+     the same points shifted by each torsion point.  Every encoding must
+     validate; y+-small must match decompression. */
+
+  fd_ed25519_point_t tors[8];
+  fd_hex_decode( b, torsion_hex[3], 32 ); FD_TEST( fd_ed25519_point_frombytes( &tors[0], b ) );
+  for( ulong i=1UL; i<8UL; i++ ) fd_ed25519_point_add( &tors[i], &tors[i-1], &tors[0] );
+
+  fd_sha512_t _sha[1]; fd_sha512_t * sha = fd_sha512_join( fd_sha512_new( _sha ) );
+  ulong key_cnt = fd_ulong_max( iter/1000UL, 64UL );
+  for( ulong i=0UL; i<key_cnt; i++ ) {
+    uchar prv[32], pub[32];
+    fd_rng_b256( rng, prv );
+    fd_ed25519_public_from_private( pub, prv, sha );
+    FD_TEST( check_validate( pub )==2UL );
+    fd_ed25519_point_t pt[1], q[1];
+    FD_TEST( fd_ed25519_point_frombytes( pt, pub ) );
+    for( ulong j=0UL; j<8UL; j++ ) {
+      fd_ed25519_point_add( q, pt, &tors[j] );
+      fd_ed25519_point_tobytes( b, q );
+      FD_TEST( check_validate( b )==2UL );
+      edge_cnt += 2UL;
+    }
+    for( long k=-2L; k<=2L; k++ ) { le_add_small( b, pub, k ); check_validate( b ); edge_cnt += 2UL; }
+    edge_cnt += 2UL;
+  }
+  fd_sha512_delete( fd_sha512_leave( sha ) );
+
+  /* Random 32 byte inputs (as PDAs are sha256 outputs), plus low
+     Hamming weight and near-p/near-2^255 variants. */
+
+  ulong valid_cnt = 0UL;
+  for( ulong i=0UL; i<iter; i++ ) {
+    fd_rng_b256( rng, b );
+    switch( i & 7UL ) {
+    case 5UL: /* sparse */
+      for( ulong j=0UL; j<32UL; j++ ) b[j] &= fd_rng_uchar( rng ) & fd_rng_uchar( rng );
+      break;
+    case 6UL: /* top bits set */
+      for( ulong j=8UL; j<32UL; j++ ) b[j] = 0xff;
+      break;
+    case 7UL: /* y close to 0 */
+      for( ulong j=8UL; j<32UL; j++ ) b[j] = 0x00;
+      break;
+    default:
+      break;
+    }
+    b[31] &= 0x7f;
+    valid_cnt += check_validate( b );
+  }
+  FD_LOG_NOTICE(( "fd_ed25519_point_validate: %lu edge inputs, %lu/%lu random inputs valid: ok",
+                  edge_cnt, valid_cnt, 2UL*iter ));
+
+  /* bench (random inputs, ~50% valid) */
+
+  if( g_bench ) {
+    ulong const n = 1024UL;
+    static uchar in[ 1024 ][ 32 ];
+    for( ulong i=0UL; i<n; i++ ) fd_rng_b256( rng, in[i] );
+    ulong bench_iter = 200000UL;
+    int acc = 0;
+    long dt = fd_log_wallclock();
+    for( ulong i=0UL; i<bench_iter; i++ ) { acc += ref_point_validate( in[i&(n-1UL)] ); FD_COMPILER_FORGET( acc ); }
+    dt = fd_log_wallclock() - dt;
+    log_bench( "fd_ed25519_point_frombytes(1)", bench_iter, dt );
+    dt = fd_log_wallclock();
+    for( ulong i=0UL; i<bench_iter; i++ ) { acc += fd_ed25519_point_validate( in[i&(n-1UL)] ); FD_COMPILER_FORGET( acc ); }
+    dt = fd_log_wallclock() - dt;
+    log_bench( "fd_ed25519_point_validate", bench_iter, dt );
+    fd_f25519_t fe[ 64 ];
+    for( ulong i=0UL; i<64UL; i++ ) fd_f25519_rng_unsafe( &fe[i], rng );
+    dt = fd_log_wallclock();
+    for( ulong i=0UL; i<bench_iter; i++ ) { acc += fd_f25519_is_square_var( &fe[i&63UL] ); FD_COMPILER_FORGET( acc ); }
+    dt = fd_log_wallclock() - dt;
+    log_bench( "fd_f25519_is_square_var", bench_iter, dt );
+  }
 }
 
 static void
@@ -855,6 +1129,111 @@ test_sc_muladd( fd_rng_t * rng ) {
   }
   dt = fd_log_wallclock() - dt;
   log_bench( "fd_curve25519_scalar_muladd", iter, dt );
+}
+
+/* ref_wnaf is the previous bit-at-a-time implementation of
+   fd_curve25519_scalar_wnaf, kept as the reference for the
+   differential test below. */
+
+static void FD_FN_NO_ASAN
+ref_wnaf( short       _t[ 256 ],
+          uchar const _s[ 32 ],
+          int         bits ) {
+  short max = (short)((1 << bits) - 1);
+
+  for( int i=0; i<255; i++ ) _t[i] = ((short)_s[i>>3] >> (i&7)) & 1;
+  _t[255] = 0;
+
+  int i;
+  for( i=0; i<256; i++ ) if( _t[i] ) break;
+
+  while( i<256 ) {
+    short ti = 1;
+    int j;
+    for( j=i+1; j<256; j++ ) {
+      short tj = _t[j];
+      if( !tj ) continue;
+      short delta = (short)(1 << fd_int_min( j-i, 14 ));
+      if( delta>(2*max) ) break;
+      short tip = (short)(ti + delta);
+      if( tip<=max ) { ti = tip; _t[j] = 0; continue; }
+      short tim = (short)(ti - delta);
+      if( tim>=-max ) {
+        ti = tim; _t[j] = 0;
+        for(;;) {
+          j++;
+          if( !_t[j] ) { _t[j] = 1; break; }
+          _t[j] = 0;
+        }
+        break;
+      }
+      break;
+    }
+    _t[i] = ti;
+    i = j;
+  }
+}
+
+/* wnaf_scalar fills s with the case-th test scalar: random, all ones,
+   sparse, dense, single bit (top bit set), zero low limbs, and the all
+   ones top limb.  Bit 255 is randomly set to check it is ignored. */
+
+static void
+wnaf_scalar( fd_rng_t * rng,
+             uchar      s[ 32 ],
+             ulong      kase ) {
+  ulong * u = (ulong *)s;
+  switch( kase%7UL ) {
+  case 0: fd_rng_b256( rng, s ); break;
+  case 1: memset( s, 0xff, 32UL ); break;
+  case 2: fd_rng_b256( rng, s ); for( ulong i=0UL; i<4UL; i++ ) u[i] &= fd_rng_ulong( rng ) & fd_rng_ulong( rng ); break;
+  case 3: fd_rng_b256( rng, s ); for( ulong i=0UL; i<4UL; i++ ) u[i] |= fd_rng_ulong( rng ) | fd_rng_ulong( rng ); break;
+  case 4: memset( s, 0, 32UL ); u[ fd_rng_ulong_roll( rng, 4UL ) ] |= 1UL<<fd_rng_ulong_roll( rng, 64UL ); u[3] |= 1UL<<62; break;
+  case 5: fd_rng_b256( rng, s ); for( ulong i=0UL; i<fd_rng_ulong_roll( rng, 4UL ); i++ ) u[i] = 0UL; break;
+  default: fd_rng_b256( rng, s ); u[3] = ULONG_MAX; break;
+  }
+  u[3] = (u[3] & ~(1UL<<63)) | (fd_rng_ulong( rng ) & (1UL<<63));
+}
+
+void
+test_sc_wnaf( fd_rng_t * rng ) {
+  ulong iter = g_bench ? 3000000UL : 100000UL;
+  for( ulong i=0UL; i<iter; i++ ) {
+    uchar s[32]; wnaf_scalar( rng, s, i );
+    int bits = 1 + (int)fd_rng_uint_roll( rng, 12U );
+    short t0[256], t1[256];
+    ref_wnaf( t0, s, bits );
+    fd_curve25519_scalar_wnaf( t1, s, bits );
+    if( FD_UNLIKELY( !fd_memeq( t0, t1, sizeof(t0) ) ) ) {
+      FD_LOG_ERR(( "fd_curve25519_scalar_wnaf mismatch: scalar " FD_LOG_HEX16_FMT " " FD_LOG_HEX16_FMT " bits %i",
+                   FD_LOG_HEX16_FMT_ARGS( s ), FD_LOG_HEX16_FMT_ARGS( s+16 ), bits ));
+    }
+  }
+  FD_LOG_NOTICE(( "fd_curve25519_scalar_wnaf: ok (%lu cases)", iter ));
+
+  /* bench over random reduced scalars (branch behaviour matters) */
+
+  static uchar s[ 1024 ][ 32 ];
+  for( ulong i=0UL; i<1024UL; i++ ) { uchar h[64]; fd_curve25519_scalar_reduce( s[i], fd_rng_b512( rng, h ) ); }
+  iter = g_bench ? 1000000UL : 0UL;
+  for( int bits=4; bits<=8; bits+=4 ) {
+    short _t[256]; short * t = _t;
+    char cstr[128];
+    long dt = fd_log_wallclock();
+    for( ulong rem=iter; rem; rem-- ) {
+      FD_COMPILER_FORGET( t );
+      ref_wnaf( t, s[ rem&1023UL ], bits );
+    }
+    dt = fd_log_wallclock() - dt;
+    log_bench( fd_cstr_printf( cstr, 128UL, NULL, "ref_wnaf(%i)", bits ), iter, dt );
+    dt = fd_log_wallclock();
+    for( ulong rem=iter; rem; rem-- ) {
+      FD_COMPILER_FORGET( t );
+      fd_curve25519_scalar_wnaf( t, s[ rem&1023UL ], bits );
+    }
+    dt = fd_log_wallclock() - dt;
+    log_bench( fd_cstr_printf( cstr, 128UL, NULL, "fd_curve25519_scalar_wnaf(%i)", bits ), iter, dt );
+  }
 }
 
 void
@@ -1233,6 +1612,454 @@ test_cctv_batch( fd_rng_t * rng, fd_sha512_t * sha ) {
   FD_LOG_NOTICE(( "fd_ed25519_verify_cctv_batch: ok" ));
 }
 
+/* Cached verify tests.  Every cached result is compared against the
+   uncached one on the same inputs. */
+
+static fd_ed25519_cache_t *
+cache_create( ulong ent_cnt,
+              ulong seed ) {
+  void * mem = aligned_alloc( fd_ed25519_cache_align(), fd_ed25519_cache_footprint( ent_cnt ) );
+  FD_TEST( mem );
+  fd_ed25519_cache_t * cache = fd_ed25519_cache_join( fd_ed25519_cache_new( mem, ent_cnt, seed ) );
+  FD_TEST( cache );
+  return cache;
+}
+
+static void
+cache_destroy( fd_ed25519_cache_t * cache ) {
+  free( fd_ed25519_cache_delete( fd_ed25519_cache_leave( cache ) ) );
+}
+
+/* check_cached verifies (msg,sig,pub) cold, then several times so the
+   key gets cached, and checks every result matches uncached verify. */
+
+static int
+check_cached( uchar const *        msg,
+              ulong                msg_sz,
+              uchar const *        sig,
+              uchar const *        pub,
+              fd_sha512_t *        sha,
+              fd_ed25519_cache_t * cache,
+              ulong                rep ) {
+  int expected = fd_ed25519_verify( msg, msg_sz, sig, pub, sha );
+  for( ulong i=0UL; i<rep; i++ ) FD_TEST( fd_ed25519_verify_cached( msg, msg_sz, sig, pub, sha, cache )==expected );
+  return expected;
+}
+
+/* mutate applies a random corruption to a signature / key / msg */
+
+static void
+mutate( fd_rng_t * rng,
+        uchar *    msg,
+        ulong      msg_sz,
+        uchar *    sig,
+        uchar *    pub ) {
+  switch( fd_rng_uint_roll( rng, 9U ) ) {
+  case 0: break;                                                                              /* good */
+  case 1: if( msg_sz ) msg[ fd_rng_ulong_roll( rng, msg_sz ) ] ^= (uchar)(1U<<fd_rng_uint_roll( rng, 8U )); break; /* bad msg */
+  case 2: sig[ fd_rng_uint_roll( rng, 32U ) ] ^= (uchar)(1U<<fd_rng_uint_roll( rng, 8U )); break; /* bad R */
+  case 3: sig[ 32U+fd_rng_uint_roll( rng, 32U ) ] ^= (uchar)(1U<<fd_rng_uint_roll( rng, 8U )); break; /* bad S (maybe non-canonical) */
+  case 4: pub[ fd_rng_uint_roll( rng, 32U ) ] ^= (uchar)(1U<<fd_rng_uint_roll( rng, 8U )); break; /* bad A */
+  case 5: fd_rng_b256( rng, sig ); break;                                                    /* random R */
+  case 6: fd_rng_b256( rng, pub ); break;                                                    /* random A */
+  case 7: { /* S+L (malleable, rejected) */
+    static uchar const L[32] = { 0xed,0xd3,0xf5,0x5c,0x1a,0x63,0x12,0x58,0xd6,0x9c,0xf7,0xa2,0xde,0xf9,0xde,0x14,
+                                 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0x10 };
+    uint c = 0U;
+    for( ulong i=0UL; i<32UL; i++ ) { c += (uint)sig[32UL+i] + (uint)L[i]; sig[32UL+i] = (uchar)c; c >>= 8; }
+    break;
+  }
+  case 8: pub[31] ^= 0x80; break;                                                            /* flip x sign of A */
+  }
+}
+
+/* Small order points and non-canonical encodings of them */
+
+static char const * const small_order_hex[] = {
+  "0100000000000000000000000000000000000000000000000000000000000000",
+  "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+  "0000000000000000000000000000000000000000000000000000000000000000",
+  "0000000000000000000000000000000000000000000000000000000000000080",
+  "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
+  "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
+  "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+  "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
+  "0100000000000000000000000000000000000000000000000000000000000080",
+  "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+  "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+  "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  NULL
+};
+
+static void
+test_verify_cached( fd_rng_t *    rng,
+                    fd_sha512_t * sha ) {
+
+  /* Split double scalar mul matches the regular one for random points
+     (including mixed order points A+T) and scalars. */
+
+  static fd_ed25519_point_t b_tbl[ FD_ED25519_SPLIT_B_TBL_CNT ];
+  fd_ed25519_split_table_b( b_tbl );
+  for( ulong iter=0UL; iter<2000UL; iter++ ) {
+    uchar buf[32]; uchar h[64]; uchar n1[32]; uchar n2[32];
+    fd_ed25519_point_t A[1];
+    do { fd_rng_b256( rng, buf ); } while( fd_ed25519_point_frombytes_1x( A, buf ) );
+    if( iter&1UL ) { /* add a torsion component */
+      fd_ed25519_point_t T[1];
+      fd_hex_decode( h, small_order_hex[ fd_rng_uint_roll( rng, 8U ) ], 32 );
+      FD_TEST( !fd_ed25519_point_frombytes_1x( T, h ) );
+      fd_ed25519_point_add( A, A, T );
+    }
+    fd_curve25519_into_affine( A );
+    fd_curve25519_scalar_reduce( n1, fd_rng_b512( rng, h ) );
+    fd_curve25519_scalar_reduce( n2, fd_rng_b512( rng, h ) );
+    if( iter%7UL==0UL ) memset( n1, 0, 32 );
+    if( iter%11UL==0UL ) memset( n2, 0, 32 );
+    static fd_ed25519_point_t a_tbl[ FD_ED25519_SPLIT_A_TBL_CNT ];
+    fd_ed25519_split_table_a( a_tbl, A );
+    fd_ed25519_point_t r0[1], r1[1];
+    fd_ed25519_double_scalar_mul_base      ( r0, n1, A, n2 );
+    fd_ed25519_double_scalar_mul_base_split( r1, n1, a_tbl, n2, b_tbl );
+    FD_TEST( fd_ed25519_point_eq( r0, r1 ) );
+  }
+
+  /* frombytes_1x is bit identical to either slot of frombytes_2x */
+
+  for( ulong iter=0UL; iter<20000UL; iter++ ) {
+    uchar a[32], b[32];
+    fd_ed25519_point_t p1[1], p2a[1], p2b[1];
+    fd_rng_b256( rng, a );
+    if( iter<14UL ) fd_hex_decode( a, small_order_hex[ iter ], 32 );
+    do { fd_rng_b256( rng, b ); } while( fd_ed25519_point_frombytes_1x( p1, b ) ); /* b valid */
+    int e1 = fd_ed25519_point_frombytes_1x( p1, a );
+    int e2 = fd_ed25519_point_frombytes_2x( p2a, a, p2b, b );
+    FD_TEST( e2==(e1 ? -1 : 0) );
+    if( !e1 ) FD_TEST( fd_memeq( p1, p2a, sizeof(fd_ed25519_point_t) ) );
+    e2 = fd_ed25519_point_frombytes_2x( p2a, b, p2b, a );
+    FD_TEST( e2==(e1 ? -2 : 0) );
+    if( !e1 ) FD_TEST( fd_memeq( p1, p2b, sizeof(fd_ed25519_point_t) ) );
+  }
+
+  /* Staged decode matches frombytes_1x for any step schedule */
+
+  ulong decode_iter = g_bench ? 1000000UL : 50000UL;
+  for( ulong iter=0UL; iter<decode_iter; iter++ ) {
+    uchar a[32];
+    fd_ed25519_point_t p1[1], p2[1];
+    switch( iter%4UL ) {
+    case 0: fd_rng_b256( rng, a ); break;
+    case 1: fd_hex_decode( a, small_order_hex[ fd_rng_uint_roll( rng, 14U ) ], 32 ); break;
+    case 2: do { fd_rng_b256( rng, a ); } while( fd_ed25519_point_frombytes_1x( p1, a ) ); a[ fd_rng_uint_roll( rng, 32U ) ] ^= (uchar)(1U<<fd_rng_uint_roll( rng, 8U )); break;
+    default: do { fd_rng_b256( rng, a ); } while( fd_ed25519_point_frombytes_1x( p1, a ) ); a[31] ^= 0x80; break;
+    }
+    memset( p1, 0xa5, sizeof(fd_ed25519_point_t) ); memset( p2, 0x5a, sizeof(fd_ed25519_point_t) );
+    int e1 = fd_ed25519_point_frombytes_1x( p1, a );
+    fd_ed25519_point_decode_t dec[1];
+    fd_ed25519_point_decode_init( dec, a );
+    memset( a, 0, 32 ); /* buf is only read by init */
+    if( iter%5UL==0UL ) fd_ed25519_point_decode_step( dec, ULONG_MAX ); /* all at once */
+    else if( iter%3UL ) {                                                 /* random schedule (none when iter%3==0) */
+      ulong budget = fd_rng_ulong_roll( rng, 400UL );
+      while( budget ) { ulong n = fd_ulong_min( budget, 1UL+fd_rng_ulong_roll( rng, 7UL ) ); fd_ed25519_point_decode_step( dec, n ); budget -= n; }
+    }
+    int e2 = fd_ed25519_point_decode_fini( p2, dec );
+    FD_TEST( e1==e2 );
+    if( !e1 ) FD_TEST( fd_memeq( p1, p2, sizeof(fd_ed25519_point_t) ) );
+  }
+  if( g_bench ) {
+    uchar _a[32]; uchar * a = _a; fd_ed25519_point_t p[1];
+    do { fd_rng_b256( rng, a ); } while( fd_ed25519_point_frombytes_1x( p, a ) );
+    ulong iter = 100000UL;
+    long dt = fd_log_wallclock();
+    for( ulong rem=iter; rem; rem-- ) { FD_COMPILER_FORGET( a ); fd_ed25519_point_frombytes_1x( p, a ); }
+    dt = fd_log_wallclock() - dt;
+    log_bench( "fd_ed25519_point_frombytes_1x", iter, dt );
+    dt = fd_log_wallclock();
+    for( ulong rem=iter; rem; rem-- ) { fd_ed25519_point_decode_t dec[1]; FD_COMPILER_FORGET( a ); fd_ed25519_point_decode_init( dec, a ); fd_ed25519_point_decode_fini( p, dec ); }
+    dt = fd_log_wallclock() - dt;
+    log_bench( "fd_ed25519_point_decode (staged)", iter, dt );
+  }
+
+  /* Fused split scalar mul matches the plain one */
+
+  for( ulong iter=0UL; iter<500UL; iter++ ) {
+    uchar buf[32]; uchar h[64]; uchar n1[32]; uchar n2[32]; uchar enc[32];
+    fd_ed25519_point_t A[1], p1[1], p2[1];
+    do { fd_rng_b256( rng, buf ); } while( fd_ed25519_point_frombytes_1x( A, buf ) );
+    fd_curve25519_into_affine( A );
+    fd_curve25519_scalar_reduce( n1, fd_rng_b512( rng, h ) );
+    fd_curve25519_scalar_reduce( n2, fd_rng_b512( rng, h ) );
+    if( iter%7UL==0UL ) memset( n1, 0, 32 );
+    if( iter%11UL==0UL ) memset( n2, 0, 32 );
+    if( iter%13UL==0UL ) { memset( n1, 0, 32 ); memset( n2, 0, 32 ); }
+    fd_rng_b256( rng, enc );
+    static fd_ed25519_point_t a_tbl[ FD_ED25519_SPLIT_A_TBL_CNT ];
+    fd_ed25519_split_table_a( a_tbl, A );
+    fd_ed25519_point_t r0[1], r1[1];
+    fd_ed25519_point_decode_t dec[1];
+    fd_ed25519_point_decode_init( dec, enc );
+    fd_ed25519_double_scalar_mul_base_split       ( r0, n1, a_tbl, n2, b_tbl );
+    fd_ed25519_double_scalar_mul_base_split_decode( r1, n1, a_tbl, n2, b_tbl, dec );
+    FD_TEST( fd_memeq( r0, r1, sizeof(fd_ed25519_point_t) ) );
+    int e1 = fd_ed25519_point_frombytes_1x( p1, enc );
+    int e2 = fd_ed25519_point_decode_fini( p2, dec );
+    FD_TEST( e1==e2 );
+    if( !e1 ) FD_TEST( fd_memeq( p1, p2, sizeof(fd_ed25519_point_t) ) );
+  }
+
+  /* Differential: random keys with repeats, random corruptions,
+     small caches to exercise eviction. */
+
+  ulong const ent_cnts[3] = { 4UL, 16UL, 1024UL };
+  for( ulong ci=0UL; ci<3UL; ci++ ) {
+    fd_ed25519_cache_t * cache = cache_create( ent_cnts[ci], fd_rng_ulong( rng ) );
+#   define KEY_CNT 64UL
+    uchar prv[ KEY_CNT ][ 32 ], pubk[ KEY_CNT ][ 32 ];
+    for( ulong i=0UL; i<KEY_CNT; i++ ) fd_ed25519_public_from_private( pubk[i], fd_rng_b256( rng, prv[i] ), sha );
+    ulong good = 0UL, bad[4] = {0};
+    for( ulong iter=0UL; iter<6000UL; iter++ ) {
+      ulong  i = fd_rng_ulong_roll( rng, iter<3000UL ? 8UL : KEY_CNT ); /* hot keys first, then more keys than fit */
+      uchar  msg[ 256 ]; ulong msg_sz = fd_rng_ulong_roll( rng, 257UL );
+      for( ulong b=0UL; b<msg_sz; b++ ) msg[b] = fd_rng_uchar( rng );
+      uchar  sig[ 64 ], pub[ 32 ];
+      memcpy( pub, pubk[i], 32 );
+      fd_ed25519_sign( sig, msg, msg_sz, pub, prv[i], sha );
+      mutate( rng, msg, msg_sz, sig, pub );
+      int res = check_cached( msg, msg_sz, sig, pub, sha, cache, 1UL+fd_rng_ulong_roll( rng, 3UL ) );
+      if( !res ) good++; else bad[ -res ]++;
+    }
+    FD_LOG_NOTICE(( "cached differential ent_cnt=%lu: good %lu err_sig %lu err_pubkey %lu err_msg %lu; hit %lu miss %lu insert %lu",
+                    ent_cnts[ci], good, bad[1], bad[2], bad[3],
+                    fd_ed25519_cache_hit_cnt( cache ), fd_ed25519_cache_miss_cnt( cache ), fd_ed25519_cache_insert_cnt( cache ) ));
+    FD_TEST( good && bad[1] && bad[2] && bad[3] );
+    FD_TEST( fd_ed25519_cache_hit_cnt( cache ) && fd_ed25519_cache_insert_cnt( cache ) );
+
+    /* Batch: mixes of cached and uncached keys, errors at any index */
+
+    for( ulong iter=0UL; iter<1500UL; iter++ ) {
+      uchar msg[ 128 ]; ulong msg_sz = fd_rng_ulong_roll( rng, 129UL );
+      for( ulong b=0UL; b<msg_sz; b++ ) msg[b] = fd_rng_uchar( rng );
+      uchar batch = (uchar)(1UL+fd_rng_ulong_roll( rng, 12UL ));
+      if( iter%100UL==0UL ) batch = (uchar)( iter%200UL ? 0 : 17 );
+      uchar sigs[ 64*17 ], pubs[ 32*17 ];
+      fd_sha512_t * shas[ 17 ];
+      for( ulong j=0UL; j<17UL; j++ ) shas[j] = sha;
+      for( ulong j=0UL; j<batch; j++ ) {
+        ulong i = fd_rng_ulong_roll( rng, 16UL );
+        memcpy( pubs+32*j, pubk[i], 32 );
+        fd_ed25519_sign( sigs+64*j, msg, msg_sz, pubs+32*j, prv[i], sha );
+      }
+      for( ulong j=0UL; j<batch; j++ ) if( !fd_rng_uint_roll( rng, 6U ) ) {
+        uchar m2[1];
+        mutate( rng, m2, 0UL, sigs+64*j, pubs+32*j );
+      }
+      int expected = fd_ed25519_verify_batch_single_msg( msg, msg_sz, sigs, pubs, shas, batch );
+      for( ulong r=0UL; r<3UL; r++ ) {
+        FD_TEST( fd_ed25519_verify_batch_single_msg_cached( msg, msg_sz, sigs, pubs, shas, batch, cache )==expected );
+      }
+    }
+    cache_destroy( cache );
+  }
+
+  /* Small order / non-canonical keys and R's are never cached and give
+     the same results.  Use a valid signature for R and S so that the
+     key checks are what fails. */
+
+  {
+    fd_ed25519_cache_t * cache = cache_create( 16UL, 1UL );
+    uchar prv[32], pub[32], sig[64], msg[32];
+    fd_ed25519_point_t R0[1];
+    fd_ed25519_public_from_private( pub, fd_rng_b256( rng, prv ), sha );
+    fd_rng_b256( rng, msg );
+    fd_ed25519_sign( sig, msg, 32UL, pub, prv, sha );
+    for( ulong i=0UL; small_order_hex[i]; i++ ) {
+      uchar bad[32]; fd_hex_decode( bad, small_order_hex[i], 32 );
+      FD_TEST( check_cached( msg, 32UL, sig, bad, sha, cache, 4UL )==FD_ED25519_ERR_PUBKEY );
+      uchar sig2[64]; memcpy( sig2, bad, 32 ); memcpy( sig2+32, sig+32, 32 );
+      FD_TEST( check_cached( msg, 32UL, sig2, pub, sha, cache, 4UL )==FD_ED25519_ERR_SIG );
+    }
+    FD_TEST( check_cached( msg, 32UL, sig, pub, sha, cache, 4UL )==FD_ED25519_SUCCESS );
+    /* Now that pub is cached, bad R must still be rejected identically */
+    FD_TEST( fd_ed25519_cache_insert_cnt( cache )==1UL );
+    for( ulong i=0UL; small_order_hex[i]; i++ ) {
+      uchar sig2[64]; fd_hex_decode( sig2, small_order_hex[i], 32 ); memcpy( sig2+32, sig+32, 32 );
+      FD_TEST( check_cached( msg, 32UL, sig2, pub, sha, cache, 2UL )==FD_ED25519_ERR_SIG );
+    }
+    FD_TEST( fd_ed25519_cache_insert_cnt( cache )==1UL );
+
+    /* Bad R or S gives the same error cached or not, and a cached
+       failure earns no credit */
+
+    for( ulong iter=0UL; iter<2000UL; iter++ ) {
+      uchar sig2[64]; memcpy( sig2, sig, 64 );
+      int expect_sig = 1;
+      switch( iter%4UL ) {
+      case 0: do { fd_rng_b256( rng, sig2 ); } while( !fd_ed25519_point_frombytes_1x( &R0[0], sig2 ) ); break; /* not on curve */
+      case 1: fd_hex_decode( sig2, small_order_hex[ fd_rng_uint_roll( rng, 14U ) ], 32 ); break;              /* small order */
+      case 2: sig2[ fd_rng_uint_roll( rng, 32U ) ] ^= (uchar)(1U<<fd_rng_uint_roll( rng, 8U )); expect_sig = 0; break; /* bit flip in R */
+      default: do { fd_rng_b256( rng, sig2 ); } while( fd_ed25519_point_frombytes_1x( &R0[0], sig2 ) ); expect_sig = 0; break; /* random point */
+      }
+      ulong hit0 = fd_ed25519_cache_hit_cnt( cache );
+      int res = check_cached( msg, 32UL, sig2, pub, sha, cache, 2UL );
+      FD_TEST( fd_ed25519_cache_hit_cnt( cache )==hit0+2UL ); /* took the cached path */
+      if( expect_sig ) FD_TEST( res==FD_ED25519_ERR_SIG );
+      else             FD_TEST( res==FD_ED25519_ERR_SIG || res==FD_ED25519_ERR_MSG );
+      /* and with a key that is not cached */
+      uchar prv2[32], pub2[32], sig3[64];
+      fd_ed25519_public_from_private( pub2, fd_rng_b256( rng, prv2 ), sha );
+      fd_ed25519_sign( sig3, msg, 32UL, pub2, prv2, sha );
+      memcpy( sig3, sig2, 32 );
+      FD_TEST( check_cached( msg, 32UL, sig3, pub2, sha, cache, 1UL )==( expect_sig ? FD_ED25519_ERR_SIG : (res==FD_ED25519_ERR_SIG ? FD_ED25519_ERR_SIG : FD_ED25519_ERR_MSG) ) );
+    }
+    FD_TEST( fd_ed25519_cache_insert_cnt( cache )==1UL );
+    /* batch: invalid R after an earlier failure still gives ERR_SIG */
+    {
+      uchar sigs[128], pubs[64]; fd_sha512_t * shas[2] = { sha, sha };
+      memcpy( sigs, sig, 64 ); sigs[40] ^= 1; /* S off by 2^64: still canonical, group equation fails */
+      memcpy( pubs, pub, 32 );
+      memcpy( sigs+64, sig, 64 ); fd_hex_decode( sigs+64, small_order_hex[4], 32 );
+      memcpy( pubs+32, pub, 32 );
+      int expected = fd_ed25519_verify_batch_single_msg( msg, 32UL, sigs, pubs, shas, 2 );
+      FD_TEST( expected==FD_ED25519_ERR_SIG );
+      FD_TEST( fd_ed25519_verify_batch_single_msg_cached( msg, 32UL, sigs, pubs, shas, 2, cache )==expected );
+      do { fd_rng_b256( rng, sigs+64 ); } while( !fd_ed25519_point_frombytes_1x( &R0[0], sigs+64 ) );
+      expected = fd_ed25519_verify_batch_single_msg( msg, 32UL, sigs, pubs, shas, 2 );
+      FD_TEST( expected==FD_ED25519_ERR_SIG );
+      FD_TEST( fd_ed25519_verify_batch_single_msg_cached( msg, 32UL, sigs, pubs, shas, 2, cache )==expected );
+    }
+    cache_destroy( cache );
+  }
+
+  /* Table builds are rate limited: with every key new, at most ~1 in 8
+     verifies builds a table (plus the initial burst). */
+
+  {
+    fd_ed25519_cache_t * cache = cache_create( 1024UL, 4UL );
+    ulong n = 1000UL;
+    for( ulong i=0UL; i<n; i++ ) {
+      uchar prv[32], pub[32], sig[64], msg[8];
+      fd_ed25519_public_from_private( pub, fd_rng_b256( rng, prv ), sha );
+      for( ulong r=0UL; r<2UL; r++ ) {
+        memcpy( msg, &r, 8 );
+        fd_ed25519_sign( sig, msg, 8UL, pub, prv, sha );
+        FD_TEST( check_cached( msg, 8UL, sig, pub, sha, cache, 1UL )==FD_ED25519_SUCCESS );
+      }
+    }
+    ulong ins = fd_ed25519_cache_insert_cnt( cache );
+    FD_LOG_NOTICE(( "rate limit: %lu inserts for %lu new keys", ins, n ));
+    FD_TEST( ins>=64UL && ins<=64UL+2UL*n/8UL+1UL );
+    cache_destroy( cache );
+  }
+
+  /* Vector suites through the cached path: each vector repeated so its
+     key gets cached where possible, then again with a warm cache. */
+
+  {
+    fd_ed25519_cache_t * cache = cache_create( 4096UL, 2UL );
+    for( ulong pass=0UL; pass<2UL; pass++ ) {
+      for( fd_ed25519_verify_wycheproof_t const * proof = ed25519_verify_wycheproofs; proof->msg; proof++ ) {
+        int res = check_cached( proof->msg, proof->msg_sz, proof->sig, proof->pub, sha, cache, 3UL );
+        FD_TEST( (res==FD_ED25519_SUCCESS)==proof->ok );
+      }
+      for( fd_ed25519_verify_cctv_t const * proof = ed25519_verify_cctvs; proof->msg; proof++ ) {
+        int res = check_cached( proof->msg, proof->msg_sz, proof->sig, proof->pub, sha, cache, 3UL );
+        FD_TEST( (res==FD_ED25519_SUCCESS)==proof->ok );
+      }
+    }
+    FD_LOG_NOTICE(( "cached vectors: hit %lu miss %lu insert %lu",
+                    fd_ed25519_cache_hit_cnt( cache ), fd_ed25519_cache_miss_cnt( cache ), fd_ed25519_cache_insert_cnt( cache ) ));
+    FD_TEST( fd_ed25519_cache_hit_cnt( cache ) );
+
+    /* cctv vectors (mixed order / non-canonical A and R) against a
+       cached key in slot 0 and 2 of a batch */
+
+    uchar const * msg    = ed25519_verify_cctvs[7].msg;
+    ulong         msg_sz = ed25519_verify_cctvs[7].msg_sz;
+    uchar sigs[ 64*4 ], pubs[ 32*4 ];
+    fd_sha512_t * shas[4] = { sha, sha, sha, sha };
+    for( ulong j=0UL; j<4UL; j++ ) {
+      uchar prv[32];
+      fd_ed25519_public_from_private( pubs+32*j, fd_rng_b256( rng, prv ), sha );
+      fd_ed25519_sign( sigs+64*j, msg, msg_sz, pubs+32*j, prv, sha );
+    }
+    for( fd_ed25519_verify_cctv_t const * proof = ed25519_verify_cctvs; proof->msg; proof++ ) {
+      if( proof->msg_sz!=msg_sz || !fd_memeq( proof->msg, msg, msg_sz ) ) continue;
+      memcpy( sigs+64, proof->sig, 64 ); memcpy( pubs+32, proof->pub, 32 );
+      int expected = fd_ed25519_verify_batch_single_msg( msg, msg_sz, sigs, pubs, shas, 4 );
+      FD_TEST( (expected==FD_ED25519_SUCCESS)==proof->ok );
+      for( ulong r=0UL; r<3UL; r++ ) FD_TEST( fd_ed25519_verify_batch_single_msg_cached( msg, msg_sz, sigs, pubs, shas, 4, cache )==expected );
+    }
+    cache_destroy( cache );
+  }
+
+  FD_LOG_NOTICE(( "test_verify_cached: ok" ));
+
+  if( !g_bench ) return;
+
+  /* Bench: keys signing random messages, random key order */
+
+  ulong const key_cnts[4] = { 1UL, 256UL, 2048UL, 4096UL };
+  for( ulong ki=0UL; ki<4UL; ki++ ) {
+    ulong key_cnt = key_cnts[ki];
+    fd_ed25519_cache_t * cache = cache_create( 4096UL, 3UL );
+    uchar (* pubs)[32]  = aligned_alloc( 64UL, key_cnt*32UL  );
+    uchar (* sigs)[64]  = aligned_alloc( 64UL, key_cnt*64UL  );
+    uchar (* msgs)[200] = aligned_alloc( 64UL, key_cnt*200UL );
+    for( ulong i=0UL; i<key_cnt; i++ ) {
+      uchar prv[32];
+      fd_ed25519_public_from_private( pubs[i], fd_rng_b256( rng, prv ), sha );
+      for( ulong b=0UL; b<200UL; b++ ) msgs[i][b] = fd_rng_uchar( rng );
+      fd_ed25519_sign( sigs[i], msgs[i], 200UL, pubs[i], prv, sha );
+    }
+    ulong iter = 20000UL;
+    char cstr[128];
+
+    long dt = fd_log_wallclock();
+    for( ulong rem=iter; rem; rem-- ) {
+      ulong i = fd_rng_ulong_roll( rng, key_cnt );
+      FD_TEST( !fd_ed25519_verify( msgs[i], 200UL, sigs[i], pubs[i], sha ) );
+    }
+    dt = fd_log_wallclock() - dt;
+    log_bench( fd_cstr_printf( cstr, 128UL, NULL, "verify uncached keys=%lu", key_cnt ), iter, dt );
+
+    /* cold: a key's first verify (miss, same work as uncached) */
+    dt = fd_log_wallclock();
+    for( ulong i=0UL; i<key_cnt; i++ ) FD_TEST( !fd_ed25519_verify_cached( msgs[i], 200UL, sigs[i], pubs[i], sha, cache ) );
+    dt = fd_log_wallclock() - dt;
+    log_bench( fd_cstr_printf( cstr, 128UL, NULL, "verify cached miss keys=%lu", key_cnt ), key_cnt, dt );
+
+    /* warm up until every key that fits is cached */
+    for( ulong pass=0UL; pass<64UL; pass++ ) {
+      for( ulong i=0UL; i<key_cnt; i++ ) FD_TEST( !fd_ed25519_verify_cached( msgs[i], 200UL, sigs[i], pubs[i], sha, cache ) );
+    }
+
+    ulong hit0 = fd_ed25519_cache_hit_cnt( cache ), miss0 = fd_ed25519_cache_miss_cnt( cache );
+    dt = fd_log_wallclock();
+    for( ulong rem=iter; rem; rem-- ) {
+      ulong i = fd_rng_ulong_roll( rng, key_cnt );
+      FD_TEST( !fd_ed25519_verify_cached( msgs[i], 200UL, sigs[i], pubs[i], sha, cache ) );
+    }
+    dt = fd_log_wallclock() - dt;
+    log_bench( fd_cstr_printf( cstr, 128UL, NULL, "verify cached warm keys=%lu", key_cnt ), iter, dt );
+    ulong hit = fd_ed25519_cache_hit_cnt( cache )-hit0, miss = fd_ed25519_cache_miss_cnt( cache )-miss0;
+    FD_LOG_NOTICE(( "  warm hit rate %.1f%% (inserted %lu)", 100.*(double)hit/(double)(hit+miss), fd_ed25519_cache_insert_cnt( cache ) ));
+
+    /* table build cost */
+    static fd_ed25519_point_t a_tbl[ FD_ED25519_SPLIT_A_TBL_CNT ];
+    fd_ed25519_point_t A[1];
+    FD_TEST( !fd_ed25519_point_frombytes_1x( A, pubs[0] ) );
+    dt = fd_log_wallclock();
+    for( ulong rem=1000UL; rem; rem-- ) { FD_COMPILER_MFENCE(); fd_ed25519_split_table_a( a_tbl, A ); }
+    dt = fd_log_wallclock() - dt;
+    if( !ki ) log_bench( "fd_ed25519_split_table_a", 1000UL, dt );
+
+    free( pubs ); free( sigs ); free( msgs );
+    cache_destroy( cache );
+  }
+}
+
 /**********************************************************************/
 
 int
@@ -1240,7 +2067,11 @@ main( int     argc,
       char ** argv ) {
   fd_boot( &argc, &argv );
   g_bench = fd_env_strip_cmdline_contains( &argc, &argv, "--bench" );
-  fd_rng_t _rng[1]; fd_rng_t * rng = fd_rng_join( fd_rng_new( _rng, 0U, 0UL ) );
+  /* Random inputs for the point_validate differential test, raise with
+     --validate-iter or FD_ED25519_VALIDATE_ITER (and vary --seed) */
+  ulong validate_iter = fd_env_strip_cmdline_ulong( &argc, &argv, "--validate-iter", "FD_ED25519_VALIDATE_ITER", g_bench ? 10000000UL : 100000UL );
+  uint  seed          = fd_env_strip_cmdline_uint ( &argc, &argv, "--seed",          NULL,                       0U );
+  fd_rng_t _rng[1]; fd_rng_t * rng = fd_rng_join( fd_rng_new( _rng, seed, 0UL ) );
   fd_sha512_t _sha[1]; fd_sha512_t * sha = fd_sha512_join( fd_sha512_new( _sha ) );
 
   test_fe_frombytes ( rng );
@@ -1262,6 +2093,7 @@ main( int     argc,
   test_frombytes_2x          ( rng );
 
   test_point_validate( rng );
+  test_point_validate_diff( rng, validate_iter );
   test_point_frombytes( rng );
   test_point_neg_if( rng );
   test_point_sub( rng );
@@ -1271,6 +2103,7 @@ main( int     argc,
   test_sc_validate  ( rng );
   test_sc_reduce    ( rng );
   test_sc_muladd    ( rng );
+  test_sc_wnaf      ( rng );
   test_sc_unaligned_output( rng );
 
   test_public_from_private( rng, sha );
@@ -1281,6 +2114,8 @@ main( int     argc,
   test_wycheproofs( sha );
   test_cctv       ( sha );
   test_cctv_batch ( rng, sha );
+
+  test_verify_cached( rng, sha );
 
   fd_sha512_delete( fd_sha512_leave( sha ) );
   fd_rng_delete( fd_rng_leave( rng ) );

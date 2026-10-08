@@ -43,7 +43,7 @@ gossip_cmd_topo( config_t * config ) {
   fd_core_subtopo(   config, tile_to_cpu );
   fd_gossip_subtopo( config, tile_to_cpu );
 
-  fd_topob_tile_in( topo, "gossip", 0UL, "metric_in", "sign_gossip",  0UL, FD_TOPOB_UNRELIABLE, FD_TOPOB_UNPOLLED );
+  fd_topob_tile_in( topo, "gossip", 0UL, "metric_in", "sign_gossip",  0UL, FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
   for( ulong i=0UL; i<net_tile_cnt; i++ ) fd_topos_net_tile_finish( topo, i );
   fd_topob_auto_layout( topo, 0 );
   fd_topob_waker( topo );
@@ -139,21 +139,24 @@ fd_gossip_subtopo( config_t * config, ulong tile_to_cpu[ FD_TILE_MAX ] FD_PARAM_
 
   fd_topob_wksp( topo, "gossvf_gossip" );
   fd_topob_wksp( topo, "gossip_gossvf" );
-  fd_topob_wksp( topo, "gossip_out" );
+  fd_topob_wksp( topo, "gossip_ciaddr" );
+  fd_topob_wksp( topo, "gossip_misc"   );
 
   fd_topob_link(     topo, "gossip_gossvf", "gossip_gossvf", 65536UL*4, sizeof(fd_gossip_ping_update_t), 1UL );
   fd_topob_tile_out( topo, "gossip", 0UL, "gossip_gossvf", 0UL );
 
-  fd_topob_link( topo, "gossip_out", "gossip_out", 65536UL*4, sizeof(fd_gossip_update_message_t), 1UL );
-  fd_topob_tile_out( topo, "gossip", 0UL, "gossip_out", 0UL );
+  fd_topob_link( topo, "gossip_ciaddr", "gossip_ciaddr", 65536UL*2, sizeof(fd_gossip_update_message_t), 1UL );
+  fd_topob_link( topo, "gossip_misc",   "gossip_misc",   65536UL*2, sizeof(fd_gossip_update_message_t), 1UL )->permit_no_consumers = 1;
+  fd_topob_tile_out( topo, "gossip", 0UL, "gossip_ciaddr", 0UL );
+  fd_topob_tile_out( topo, "gossip", 0UL, "gossip_misc",   0UL );
   for( ulong i=0UL; i<gossvf_tile_count; i++ ) {
     fd_topob_link(     topo, "gossvf_gossip", "gossvf_gossip", 65536UL*4, FD_GOSSIP_GOSSVF_MTU, 1UL );
     fd_topob_tile_out( topo, "gossvf", i, "gossvf_gossip", i );
     fd_topob_tile_in(  topo, "gossip", 0UL, "metric_in", "gossvf_gossip", i, FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED );
 
-    /* Only one link_kind for gossip_out broadcast link */
+    /* Only one link_kind for gossip_ciaddr broadcast link */
     fd_topob_tile_in( topo, "gossvf", i, "metric_in", "gossip_gossvf", 0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
-    fd_topob_tile_in( topo, "gossvf", i, "metric_in", "gossip_out",    0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
+    fd_topob_tile_in( topo, "gossvf", i, "metric_in", "gossip_ciaddr", 0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
   }
 
   fd_topob_wksp( topo, "gossip_sign"  );
@@ -172,6 +175,7 @@ configure_args( void ) {
   };
 
   ulong stage_idx = 0UL;
+  args.configure.stages[ stage_idx++ ] = &fd_cfg_stage_uverbs;
   args.configure.stages[ stage_idx++ ] = &fd_cfg_stage_hugetlbfs;
   args.configure.stages[ stage_idx++ ] = &fd_cfg_stage_sysctl;
   args.configure.stages[ stage_idx++ ] = &fd_cfg_stage_bonding;

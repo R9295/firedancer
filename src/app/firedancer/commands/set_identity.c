@@ -9,6 +9,8 @@
 #include "../../../ballet/base58/fd_base58.h"
 #include "../../../ballet/ed25519/fd_ed25519.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <strings.h>
 #include <unistd.h>
 #include <sys/resource.h>
@@ -30,11 +32,37 @@ set_identity_cmd_args( int *    pargc,
   char const * name = fd_env_strip_cmdline_cstr( pargc, pargv, "--name", NULL, NULL );
   if( FD_UNLIKELY( name ) ) fd_cstr_ncpy( args->set_identity.name, name, sizeof(args->set_identity.name) );
 
+  if( FD_UNLIKELY( *pargc && !strcmp( (*pargv)[ *pargc-1 ], "--vote-history-file" ) ) ) goto err;
+  char const * vote_history_file = fd_env_strip_cmdline_cstr( pargc, pargv, "--vote-history-file", NULL, NULL );
+
   if( FD_UNLIKELY( *pargc<1 ) ) goto err;
 
   char const * path = *pargv[0];
   (*pargc)--;
   (*pargv)++;
+
+  /* Copy in the contents of the vote history or tower file into a fixed
+     size buffer.*/
+  args->set_identity.vote_history_sz = 0UL;
+  if( vote_history_file ) {
+    int fd = open( vote_history_file, O_RDONLY );
+    if( FD_UNLIKELY( -1==fd ) ) FD_LOG_ERR(( "open(%s) failed (%i-%s)", vote_history_file, errno, fd_io_strerror( errno ) ));
+
+    int err = fd_io_read( fd, args->set_identity.vote_history,
+                         sizeof(args->set_identity.vote_history), sizeof(args->set_identity.vote_history),
+                         &args->set_identity.vote_history_sz );
+    if( FD_UNLIKELY( -1==close( fd ) ) ) FD_LOG_ERR(( "close() failed (%i-%s)", errno, fd_io_strerror( errno ) ));
+    if( FD_UNLIKELY( err>0 ) ) FD_LOG_ERR(( "read(%s) failed (%i-%s)", vote_history_file, err, fd_io_strerror( err ) ));
+    if( FD_UNLIKELY( !args->set_identity.vote_history_sz ) ) {
+      FD_LOG_ERR(( "vote history file %s is empty.  If you wish to change a running validator's identity without "
+                   "a vote history file, you can omit the --vote-history-file argument.", vote_history_file ));
+    }
+    if( FD_UNLIKELY( args->set_identity.vote_history_sz>AG_VOTE_HISTORY_FILE_MAX ) ) {
+      FD_LOG_ERR(( "vote history file %s exceeds %lu bytes.  The firedancer validator will not be able to process this file. "
+                   "Retry without the --vote-history-file argument.", vote_history_file, AG_VOTE_HISTORY_FILE_MAX ));
+
+    }
+  }
 
   if( FD_UNLIKELY( !strcmp( path, "-" ) ) ) {
     uchar * keypair_wr = fd_keyload_alloc_protected_pages( 1UL, 2UL );
@@ -48,7 +76,7 @@ set_identity_cmd_args( int *    pargc,
   return;
 
 err:
-  FD_LOG_ERR(( "Usage: %s set-identity <keypair>", FD_BINARY_NAME ));
+  FD_LOG_ERR(( "Usage: %s set-identity <keypair> [--name <name>] [--vote-history-file <path>]", FD_BINARY_NAME ));
 }
 
 static void FD_FN_SENSITIVE
@@ -79,8 +107,10 @@ set_identity( args_t *   args,
   if( FD_UNLIKELY( sizeof(fd_adminctl_set_identity_t)>payload_max ) ) FD_LOG_ERR(( "adminctl set-identity payload too large" ));
 
   fd_adminctl_set_identity_t * req = (fd_adminctl_set_identity_t *)payload;
-  req->version = FD_ADMINCTL_SET_IDENTITY_PAYLOAD_VERSION;
+  req->version         = FD_ADMINCTL_SET_IDENTITY_PAYLOAD_VERSION;
+  req->vote_history_sz = args->set_identity.vote_history_sz;
   memcpy( req->keypair, args->set_identity.keypair, 64UL );
+  memcpy( req->vote_history, args->set_identity.vote_history, args->set_identity.vote_history_sz );
 
   uchar * keypair_wr = fd_keyload_mprotect_wr( args->set_identity.keypair, 0 );
   fd_memzero_explicit( keypair_wr, 64UL );
@@ -93,6 +123,9 @@ set_identity( args_t *   args,
     case FD_ADMINCTL_RESULT_SUCCESS:
       FD_LOG_NOTICE(( "validator identity key switched to %s%s%s", fd_log_style_bold(), identity_key_base58, fd_log_style_normal() ));
       break;
+    case FD_SET_IDENTITY_RESULT_INVALID_VOTE_HISTORY:
+      FD_LOG_ERR(( "Failed to set identity: the vote history file is invalid or does not belong to the new identity. "
+                   "If you believe the vote history file is valid, please contact the Firedancer team for additional assistance." ));
     case FD_ADMINCTL_RESULT_UNKNOWN_COMMAND:
     case FD_ADMINCTL_RESULT_ABI_VERSION_MISMATCH:
     case FD_ADMINCTL_RESULT_ABI_SIZE_MISMATCH:
@@ -115,11 +148,12 @@ set_identity_cmd_fn( args_t *   args,
 
 static void
 set_identity_args_help( fd_action_help_t * help ) {
-  fd_action_help_arg( help, "<keypair>", NULL,   "Path to the new identity keypair, in the standard Solana keypair file\n"
-                                                 "format (the 64-byte JSON array).  Pass `-` to read the same JSON\n"
-                                                 "array from stdin instead of from a file" );
-  fd_action_help_arg( help, "--name", "<name>",  "Name of the validator instance to attach to, if more than one is\n"
-                                                 "running on this host" );
+  fd_action_help_arg( help, "<keypair>",           NULL,     "Path to the new identity keypair, in the standard Solana keypair file\n"
+                                                             "format (the 64-byte JSON array).  Pass `-` to read the same JSON\n"
+                                                             "array from stdin instead of from a file" );
+  fd_action_help_arg( help, "--name",              "<name>", "Name of the validator instance to attach to, if more than one is\n"
+                                                             "running on this host" );
+  fd_action_help_arg( help, "--vote-history-file", "<path>", "Path to the vote history or tower file for the new identity" );
 }
 
 action_t fd_action_set_identity = {
@@ -131,10 +165,21 @@ action_t fd_action_set_identity = {
   .description    = "Change the identity of a running validator",
   .detail         = "Switches the gossip/voting/block-production identity key of an already\n"
                     "running validator to the keypair you provide, without restarting it.  The\n"
-                    "switch is atomic: the validator briefly pauses block production so it never\n"
-                    "signs with a mix of the old and new keys, then resumes under the new\n"
+                    "switch is atomic: the validator briefly pauses replay and block production so\n"
+                    "it never signs with a mix of the old and new keys, then resumes under the new\n"
                     "identity.  On success it prints `Validator identity key switched to <pubkey>`\n"
-                    "and exits 0; on any error it exits non-zero and the identity is unchanged.\n"
+                    "and exits 0; a rejected request exits non-zero.\n"
+                    "\n"
+                    "With --vote-history-file, the saved tower is verified before switching.  The\n"
+                    "validator takes its votes on blocks it has replayed, and does not vote until\n"
+                    "its votes on blocks it has not replayed, or on forks outside its rooted\n"
+                    "history, stop locking it out.  Agave instead stops if the tower file\n"
+                    "conflicts with the running validator's rooted history.  Without a file, or if\n"
+                    "the tower is behind the validator's root, voting history is reconstructed\n"
+                    "from on-chain state.\n"
+                    "\n"
+                    "With Alpenglow, pass the vote history file instead.  The validator does not\n"
+                    "vote until the leader window after the highest slot the file voted in.\n"
                     "\n"
                     "This command does not start a validator; it attaches to one that is already\n"
                     "running.  With no arguments it discovers the running validator automatically.\n"
@@ -146,6 +191,6 @@ action_t fd_action_set_identity = {
                     "The change is live only: it is not written back to the config file, so the\n"
                     "validator reverts to the configured [paths.identity_key] on its next restart.\n"
                     "To make the new identity permanent, also update that path in the config.\n",
-  .usage          = "set-identity <keypair> [--name <name>]",
+  .usage          = "set-identity <keypair> [--name <name>] [--vote-history-file <path>]",
   .args_help      = set_identity_args_help,
 };

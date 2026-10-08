@@ -65,6 +65,24 @@ fd_ed25519_point_frombytes( fd_ed25519_point_t * r,
   return r;
 }
 
+/* fd_ed25519_point_frombytes (like Dalek's decompress) takes y mod p
+   (non-canonical y accepted), ignores the sign bit for validity (x=0
+   with sign 1 is accepted) and succeeds iff u/v is a square or zero,
+   with u=y^2-1 and v=d*y^2+1.  v is never 0 as d is a non-square and -1
+   is a square, so this is the same as u*v being a square or zero, which
+   a Jacobi symbol decides much faster than a square root. */
+int
+fd_ed25519_point_validate( uchar const buf[ 32 ] ) {
+  fd_f25519_t y[1], u[1], v[1];
+  fd_f25519_frombytes( y, buf );
+  fd_f25519_sqr( u, y                );
+  fd_f25519_mul( v, u, fd_f25519_d   );
+  fd_f25519_sub( u, u, fd_f25519_one ); /* u = y^2-1 */
+  fd_f25519_add( v, v, fd_f25519_one ); /* v = dy^2+1 */
+  fd_f25519_mul( u, u, v             );
+  return fd_f25519_is_square_var( u );
+}
+
 uchar *
 fd_ed25519_point_tobytes_batch8( uchar                      out[],  /* 32*n */
                                  fd_ed25519_point_t const * pt,     /* n */
@@ -206,6 +224,111 @@ fd_ed25519_double_scalar_mul_base( fd_ed25519_point_t *       r,
   return r;
 }
 
+
+/* split_odd_table fills tbl[0,n) with p,3p,..,(2n-1)p in precomputed
+   form. */
+
+static void
+split_odd_table( fd_ed25519_point_t *       tbl,
+                 fd_ed25519_point_t const * p,
+                 int                        n ) {
+  fd_ed25519_point_t p2[1];
+  fd_ed25519_point_set( &tbl[0], p );
+  fd_ed25519_point_dbln( p2, p, 1 );
+  for( int i=1; i<n; i++ ) fd_ed25519_point_add( &tbl[i], p2, &tbl[i-1] );
+  for( int i=0; i<n; i++ ) fd_curve25519_into_precomputed( &tbl[i] );
+}
+
+void
+fd_ed25519_split_table_a( fd_ed25519_point_t         tbl[ FD_ED25519_SPLIT_A_TBL_CNT ],
+                          fd_ed25519_point_t const * a ) {
+  fd_ed25519_point_t p[1];
+  fd_ed25519_point_set( p, a );
+  for( int j=0; j<FD_ED25519_SPLIT_SEG_CNT; j++ ) {
+    if( j ) fd_ed25519_point_dbln( p, p, FD_ED25519_SPLIT_SEG_BITS );
+    split_odd_table( tbl+FD_ED25519_SPLIT_A_SEG_CNT*j, p, FD_ED25519_SPLIT_A_SEG_CNT );
+  }
+}
+
+void
+fd_ed25519_split_table_b( fd_ed25519_point_t tbl[ FD_ED25519_SPLIT_B_TBL_CNT ] ) {
+  fd_ed25519_point_t p[1];
+  fd_ed25519_point_set( p, fd_ed25519_base_point );
+  for( int j=1; j<FD_ED25519_SPLIT_SEG_CNT; j++ ) {
+    fd_ed25519_point_dbln( p, p, FD_ED25519_SPLIT_SEG_BITS );
+    split_odd_table( tbl+128*(j-1), p, 128 );
+  }
+}
+
+/* double_scalar_mul_base_split also advances dec (if non-NULL) by
+   DEC_STEP chain ops after each point op (3 measured best). */
+
+#define DEC_STEP (3UL)
+
+static inline fd_ed25519_point_t *
+double_scalar_mul_base_split( fd_ed25519_point_t *        r,
+                              uchar const                 n1[ 32 ],
+                              fd_ed25519_point_t const *  a_tbl,
+                              uchar const                 n2[ 32 ],
+                              fd_ed25519_point_t const *  b_tbl,
+                              fd_ed25519_point_decode_t * dec ) {
+
+  /* Digit d at position b*j+i contributes [d 2^i][2^(b*j)]P, so the
+     segments of each wNAF share a single b doubling loop. */
+
+  short n1slide[256]; fd_curve25519_scalar_wnaf( n1slide, n1, FD_ED25519_SPLIT_A_BITS );
+  short n2slide[256]; fd_curve25519_scalar_wnaf( n2slide, n2, 8 );
+
+  fd_ed25519_point_t const * bt[ FD_ED25519_SPLIT_SEG_CNT ];
+  bt[0] = fd_ed25519_base_point_wnaf_table;
+  for( int j=1; j<FD_ED25519_SPLIT_SEG_CNT; j++ ) bt[j] = b_tbl + 128*(j-1);
+  fd_ed25519_point_t t[1];
+
+  fd_ed25519_point_set_zero( r );
+
+  int i;
+  for( i=FD_ED25519_SPLIT_SEG_BITS-1; i>=0; i-- ) {
+    short nz = 0;
+    for( int j=0; j<FD_ED25519_SPLIT_SEG_CNT; j++ ) nz |= n1slide[ FD_ED25519_SPLIT_SEG_BITS*j+i ] | n2slide[ FD_ED25519_SPLIT_SEG_BITS*j+i ];
+    if( nz ) break;
+  }
+  for( ; i>=0; i-- ) {
+    fd_ed25519_partial_dbl( t, r );
+    if( dec ) fd_ed25519_point_decode_step( dec, DEC_STEP );
+    for( int j=0; j<FD_ED25519_SPLIT_SEG_CNT; j++ ) {
+      short d1 = n1slide[ FD_ED25519_SPLIT_SEG_BITS*j+i ];
+      short d2 = n2slide[ FD_ED25519_SPLIT_SEG_BITS*j+i ];
+      if(      d1 > 0 ) { fd_ed25519_point_add_final_mul( r, t ); fd_ed25519_point_add_with_opts( t, r, &a_tbl[ FD_ED25519_SPLIT_A_SEG_CNT*j + d1/2    ], 0,    1, 1 ); if( dec ) fd_ed25519_point_decode_step( dec, DEC_STEP ); }
+      else if( d1 < 0 ) { fd_ed25519_point_add_final_mul( r, t ); fd_ed25519_point_sub_with_opts( t, r, &a_tbl[ FD_ED25519_SPLIT_A_SEG_CNT*j + (-d1)/2 ], 0,    1, 1 ); if( dec ) fd_ed25519_point_decode_step( dec, DEC_STEP ); }
+      if(      d2 > 0 ) { fd_ed25519_point_add_final_mul( r, t ); fd_ed25519_point_add_with_opts( t, r, &bt[j][ d2/2    ],                              j==0, 1, 1 ); if( dec ) fd_ed25519_point_decode_step( dec, DEC_STEP ); }
+      else if( d2 < 0 ) { fd_ed25519_point_add_final_mul( r, t ); fd_ed25519_point_sub_with_opts( t, r, &bt[j][ (-d2)/2 ],                              j==0, 1, 1 ); if( dec ) fd_ed25519_point_decode_step( dec, DEC_STEP ); }
+    }
+
+    /* ignore r->T because dbl doesn't need it, except in the last cycle */
+    if( i==0 ) fd_ed25519_point_add_final_mul( r, t );
+    else       fd_ed25519_point_add_final_mul_projective( r, t );
+  }
+  return r;
+}
+
+fd_ed25519_point_t *
+fd_ed25519_double_scalar_mul_base_split( fd_ed25519_point_t *       r,
+                                         uchar const                n1[ 32 ],
+                                         fd_ed25519_point_t const * a_tbl,
+                                         uchar const                n2[ 32 ],
+                                         fd_ed25519_point_t const * b_tbl ) {
+  return double_scalar_mul_base_split( r, n1, a_tbl, n2, b_tbl, NULL );
+}
+
+fd_ed25519_point_t *
+fd_ed25519_double_scalar_mul_base_split_decode( fd_ed25519_point_t *        r,
+                                                uchar const                 n1[ 32 ],
+                                                fd_ed25519_point_t const *  a_tbl,
+                                                uchar const                 n2[ 32 ],
+                                                fd_ed25519_point_t const *  b_tbl,
+                                                fd_ed25519_point_decode_t * dec ) {
+  return double_scalar_mul_base_split( r, n1, a_tbl, n2, b_tbl, dec );
+}
 
 FD_25519_INLINE fd_ed25519_point_t *
 fd_ed25519_multi_scalar_mul_with_opts( fd_ed25519_point_t *     r,

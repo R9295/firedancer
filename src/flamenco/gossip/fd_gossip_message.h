@@ -231,6 +231,30 @@ struct fd_gossip_contact_info {
 
 typedef struct fd_gossip_contact_info fd_gossip_contact_info_t;
 
+FD_FN_PURE static inline int
+fd_gossip_contact_info_eq( fd_gossip_contact_info_t const * ci1,
+                           fd_gossip_contact_info_t const * ci2 ) {
+  if( ci1->shred_version      !=ci2->shred_version       ||
+      ci1->outset             !=ci2->outset              ||
+      ci1->version.client     !=ci2->version.client      ||
+      ci1->version.major      !=ci2->version.major       ||
+      ci1->version.minor      !=ci2->version.minor       ||
+      ci1->version.patch      !=ci2->version.patch       ||
+      ci1->version.commit     !=ci2->version.commit      ||
+      ci1->version.feature_set!=ci2->version.feature_set ) return 0;
+
+  for( ulong j=0UL; j<FD_GOSSIP_CONTACT_INFO_SOCKET_CNT; j++ ) {
+    if( ci1->sockets[ j ].is_ipv6!=ci2->sockets[ j ].is_ipv6 ) return 0;
+    if( ci1->sockets[ j ].is_ipv6 ) {
+      if( memcmp( ci1->sockets[ j ].ip6, ci2->sockets[ j ].ip6, 16UL ) ) return 0;
+    } else {
+      if( ci1->sockets[ j ].ip4!=ci2->sockets[ j ].ip4 ) return 0;
+    }
+    if( ci1->sockets[ j ].port!=ci2->sockets[ j ].port ) return 0;
+  }
+  return 1;
+}
+
 struct fd_gossip_epoch_slots {
   uchar index;
 };
@@ -399,6 +423,19 @@ struct fd_gossip_message {
 };
 
 typedef struct fd_gossip_message fd_gossip_message_t;
+
+static inline ulong
+fd_gossip_message_used_sz( fd_gossip_message_t const * message ) {
+  switch( message->tag ) {
+  case FD_GOSSIP_MESSAGE_PULL_RESPONSE: return (ulong)((uchar const *)message->pull_response->values-(uchar const *)message)+message->pull_response->values_len*sizeof(fd_gossip_value_t);
+  case FD_GOSSIP_MESSAGE_PUSH:          return (ulong)((uchar const *)message->push->values         -(uchar const *)message)+message->push->values_len         *sizeof(fd_gossip_value_t);
+  case FD_GOSSIP_MESSAGE_PULL_REQUEST:  return (ulong)((uchar const *)(message->pull_request+1)-(uchar const *)message);
+  case FD_GOSSIP_MESSAGE_PRUNE:         return (ulong)((uchar const *)(message->prune+1)       -(uchar const *)message);
+  case FD_GOSSIP_MESSAGE_PING:          return (ulong)((uchar const *)(message->ping+1)        -(uchar const *)message);
+  case FD_GOSSIP_MESSAGE_PONG:          return (ulong)((uchar const *)(message->pong+1)        -(uchar const *)message);
+  default:                              return sizeof(fd_gossip_message_t);
+  }
+}
 
 int
 fd_gossip_message_deserialize( fd_gossip_message_t * message,

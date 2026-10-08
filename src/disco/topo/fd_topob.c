@@ -1,6 +1,7 @@
 #include "fd_topob.h"
 #include "../net/fd_net_tile.h"
 #include "../waker/fd_waker.h"
+#include "../sleep/fd_sleep.h"
 
 #include "../../util/pod/fd_pod_format.h"
 #include "../../util/tile/fd_tile_private.h" /* fd_tile_private_sibling_idx */
@@ -145,6 +146,15 @@ fd_topob_tile_uses( fd_topo_t *           topo,
                     int                   mode ) {
   (void)topo;
 
+  /* Links can share an object (e.g. net rx links share the UMEM
+     dcache), keep one entry with the strongest mode */
+  for( ulong i=0UL; i<tile->uses_obj_cnt; i++ ) {
+    if( FD_UNLIKELY( tile->uses_obj_id[ i ]==obj->id ) ) {
+      tile->uses_obj_mode[ i ] = fd_int_max( tile->uses_obj_mode[ i ], mode );
+      return;
+    }
+  }
+
   if( FD_UNLIKELY( tile->uses_obj_cnt>=FD_TOPO_MAX_TILE_OBJS ) ) FD_LOG_ERR(( "tile `%s` uses too many objects", tile->name ));
 
   tile->uses_obj_id[ tile->uses_obj_cnt ] = obj->id;
@@ -186,6 +196,7 @@ fd_topob_tile( fd_topo_t *    topo,
   tile->floats              = cpu_idx<ULONG_MAX && !!(cpu_idx & FD_TOPOB_CPU_SHARED);
   tile->waker_client_idx    = ULONG_MAX;
   tile->waker_fseq_obj_id   = ULONG_MAX;
+  tile->sleep_eventfd       = 0;
 
   fd_topo_obj_t * tile_obj = fd_topob_obj( topo, "tile", tile_wksp );
   tile->tile_obj_id = tile_obj->id;
@@ -235,6 +246,82 @@ fd_topob_waker( fd_topo_t * topo ) {
     client->waker_fseq_obj_id = fseq_obj->id;
   }
   FD_TEST( waker_client_cnt<=FD_WAKER_CLIENT_MAX );
+}
+
+void
+fd_topob_sleep( fd_topo_t *  topo,
+                char const * metrics_wksp,
+                ulong        mwaitx_cpu_idx ) {
+  fd_topob_wksp( topo, "mwaitx" );
+  fd_topob_wksp( topo, "sleep"  );
+  topo->sleep_obj_id = fd_topob_obj( topo, "sleep", "sleep" )->id;
+  fd_topob_tile( topo, "mwaitx", "mwaitx", metrics_wksp, mwaitx_cpu_idx, 0, 0, 0, 0 );
+}
+
+/* Tiles that must not share a physical core.  The layout leaves their
+   hyperthread sibling empty. */
+
+static char const * CRITICAL_TILES[] = {
+  "pack",
+  "poh",
+  "motor",
+  "pohh",
+  NULL
+};
+
+/* When the layout can't keep every hyperthread sibling free, these
+   still get a physical core to themselves while spare logical CPUs
+   last.  Execution on half a core slows replay of heavy blocks. */
+
+static char const * DEDICATED_TILES[] = {
+  "execrp",
+  NULL
+};
+
+/* Tiles that can saturate a core, in efficient mode the layout keeps
+   their hyperthread siblings free. */
+
+static char const * THROUGHPUT_TILES[] = {
+  "verify",
+  "execle",
+  "execrp",
+  "snapdc",
+  "snapin",
+  "replay",
+  "accdb",
+  "benchg",
+  "benchs",
+  NULL
+};
+
+void
+fd_topob_sleep_finish( fd_topo_t * topo ) {
+  if( FD_LIKELY( topo->sleep_obj_id==ULONG_MAX ) ) return;
+
+  for( ulong i=0UL; i<topo->tile_cnt; i++ ) {
+    fd_topo_tile_t * tile = &topo->tiles[ i ];
+    int pinned = !strcmp( tile->name, "mwaitx" ) || !strcmp( tile->name, "sock" )
+              || !strcmp( tile->name, "solcap" ) || !strcmp( tile->name, "snapsv" );
+    for( char const ** p = CRITICAL_TILES; *p; p++ ) pinned |= !strcmp( tile->name, *p );
+    for( char const ** p = THROUGHPUT_TILES; *p; p++ ) pinned |= !strcmp( tile->name, *p );
+    tile->floats = tile->cpu_idx!=ULONG_MAX && !pinned;
+  }
+
+  for( ulong i=0UL; i<topo->tile_cnt; i++ ) {
+    fd_topo_tile_t * tile = &topo->tiles[ i ];
+    if( FD_LIKELY( !tile->floats ) ) continue;
+    for( ulong j=0UL; j<topo->tile_cnt; j++ ) {
+      if( FD_UNLIKELY( topo->tiles[ j ].cpu_idx==tile->cpu_idx && !topo->tiles[ j ].floats ) ) {
+        tile->floats = 0;
+        break;
+      }
+    }
+  }
+
+  FD_TEST( topo->tile_cnt<=FD_SLEEP_TILE_MAX );
+  for( ulong i=0UL; i<topo->tile_cnt; i++ ) {
+    fd_topob_tile_uses( topo, &topo->tiles[ i ], &topo->objs[ topo->sleep_obj_id ], FD_SHMEM_JOIN_MODE_READ_WRITE );
+  }
 }
 
 void
@@ -494,17 +581,25 @@ static char const * ALWAYS[] = {
   "votor",  /* FIREDANCER only */
   "pktgen",
   "forkt",  /* FIREDANCER only */
+  "mwaitx", /* FIREDANCER only */
+  NULL
+};
+
+/* The pinned tiles that park and wake each other the most, in
+   placement priority.  A wake across an L3 domain costs more than one
+   inside it, so these are packed into as few domains as possible,
+   mwaitx first.  Floating tiles are not listed: their cpu_idx only
+   picks the NUMA node of the pool they run over, not an L3. */
+
+static char const * HOT_TILES[] = {
+  "mwaitx", /* FIREDANCER only */
+  "replay", /* FIREDANCER only */
+  "execrp", /* FIREDANCER only */
+  "mlx5",
   NULL
 };
 
 /* Tiles that should not have a SMT neighbor */
-static char const * CRITICAL_TILES[] = {
-  "pack",
-  "poh",
-  "motor",
-  "pohh",
-  NULL
-};
 
 static int
 tile_name_in( char const *         name,
@@ -687,7 +782,8 @@ auto_tile_cpu( fd_topo_tile_t * tile,
                ulong *          cpu_idx_p,
                cpu_bv_t         cpu_assigned[ static cpu_bv_word_cnt ],
                ushort const     cpu_ordering[ static FD_TILE_MAX     ],
-              _Bool             skip_ht_pairs ) {
+              _Bool             skip_ht_pairs,
+               ulong *          dedicated_budget ) {
   ulong cpu_idx = *cpu_idx_p;
 
   ulong cpu_cnt = cpus->cpu_cnt;
@@ -701,36 +797,84 @@ auto_tile_cpu( fd_topo_tile_t * tile,
   fd_topo_cpu_t const * cpu = &cpus->cpu[ cpu_ordering[ cpu_idx ] ];
 
   int is_ht_critical = 0;
+  int is_dedicated   = 0;
   if( FD_UNLIKELY( cpu->sibling!=ULONG_MAX ) ) {
-    for( char const ** p = CRITICAL_TILES; *p; p++ ) {
-      if( !strcmp( tile->name, *p ) ) {
-        is_ht_critical = 1;
-        break;
-      }
-    }
+    is_ht_critical = tile_name_in( tile->name, CRITICAL_TILES );
+    is_dedicated   = !is_ht_critical && *dedicated_budget && tile_name_in( tile->name, DEDICATED_TILES );
   }
 
-  if( FD_UNLIKELY( is_ht_critical || skip_ht_pairs ) ) {
-    ulong try_assign = cpu_idx;
-    while( cpu_bv_test( cpu_assigned, cpu_ordering[ try_assign ] ) ||
-           ( cpus->cpu[ cpu_ordering[ try_assign ] ].sibling!=ULONG_MAX &&
-             cpu_bv_test( cpu_assigned, cpus->cpu[ cpu_ordering[ try_assign ] ].sibling ) ) ) {
+  ulong try_assign = cpu_idx;
+  int   whole_core = is_ht_critical || is_dedicated || skip_ht_pairs;
+  if( FD_UNLIKELY( whole_core ) ) {
+    while( try_assign<cpu_cnt &&
+           ( cpu_bv_test( cpu_assigned, cpu_ordering[ try_assign ] ) ||
+             ( cpus->cpu[ cpu_ordering[ try_assign ] ].sibling!=ULONG_MAX &&
+               cpu_bv_test( cpu_assigned, cpus->cpu[ cpu_ordering[ try_assign ] ].sibling ) ) ) ) {
       try_assign++;
-      if( FD_UNLIKELY( try_assign>=cpus->cpu_cnt ) ) FD_LOG_ERR(( "auto layout cannot set affinity for tile `%s:%lu` because all the CPUs are already assigned or have a HT pair assigned", tile->name, tile->kind_id ));
     }
-
-    ulong sibling = cpus->cpu[ cpu_ordering[ try_assign ] ].sibling;
-    cpu_bv_insert( cpu_assigned, cpu_ordering[ try_assign ] );
-    if( sibling!=ULONG_MAX ) {
-      cpu_bv_insert( cpu_assigned, sibling );
+    if( FD_UNLIKELY( try_assign>=cpu_cnt ) ) {
+      if( FD_UNLIKELY( !is_dedicated ) ) FD_LOG_ERR(( "auto layout cannot set affinity for tile `%s:%lu` because all the CPUs are already assigned or have a HT pair assigned", tile->name, tile->kind_id ));
+      /* Spare logical CPUs can be half cores */
+      *dedicated_budget = 0UL;
+      whole_core        = 0;
+      try_assign        = cpu_idx;
+    } else if( is_dedicated ) {
+      (*dedicated_budget)--;
     }
-    tile->cpu_idx = cpu_ordering[ try_assign ];
-  } else {
-    cpu_bv_insert( cpu_assigned, cpu_ordering[ cpu_idx ] );
-    tile->cpu_idx = cpu_ordering[ cpu_idx ];
   }
+
+  ulong cpu_id = cpu_ordering[ try_assign ];
+  cpu_bv_insert( cpu_assigned, cpu_id );
+  if( whole_core && cpus->cpu[ cpu_id ].sibling!=ULONG_MAX ) cpu_bv_insert( cpu_assigned, cpus->cpu[ cpu_id ].sibling );
+  tile->cpu_idx = cpu_id;
 
   *cpu_idx_p = cpu_idx;
+}
+
+static ulong
+l3_free_core_cnt( fd_topo_cpus_t const * cpus,
+                  cpu_bv_t const         cpu_assigned[ static cpu_bv_word_cnt ],
+                  ulong                  l3_idx ) {
+  ulong cnt = 0UL;
+  for( ulong i=0UL; i<cpus->cpu_cnt; i++ ) {
+    fd_topo_cpu_t const * cpu = &cpus->cpu[ i ];
+    if( cpu->l3_idx!=l3_idx || cpu_bv_test( cpu_assigned, i ) ) continue;
+    if( cpu->sibling!=ULONG_MAX && ( cpu->sibling<i || cpu_bv_test( cpu_assigned, cpu->sibling ) ) ) continue;
+    cnt++;
+  }
+  return cnt;
+}
+
+/* Place a hot tile on the first free physical core of L3 domain
+   *hot_l3, sibling left empty.  When it is full, the domain with the
+   most free cores becomes the hot one. */
+
+static void
+auto_tile_cpu_l3( fd_topo_tile_t * tile,
+                  fd_topo_cpus_t * cpus,
+                  ulong *          hot_l3,
+                  cpu_bv_t         cpu_assigned[ static cpu_bv_word_cnt ],
+                  ushort const     cpu_ordering[ static FD_TILE_MAX     ] ) {
+  if( *hot_l3==ULONG_MAX || !l3_free_core_cnt( cpus, cpu_assigned, *hot_l3 ) ) {
+    ulong best_cnt = 0UL;
+    for( ulong l3=0UL; l3<cpus->l3_cnt; l3++ ) {
+      ulong cnt = l3_free_core_cnt( cpus, cpu_assigned, l3 );
+      if( cnt>best_cnt ) { best_cnt = cnt; *hot_l3 = l3; }
+    }
+    if( FD_UNLIKELY( !best_cnt ) ) FD_LOG_ERR(( "auto layout cannot set affinity for tile `%s:%lu` because all the CPUs are already assigned or have a HT pair assigned", tile->name, tile->kind_id ));
+  }
+
+  for( ulong i=0UL; i<cpus->cpu_cnt; i++ ) {
+    ulong cpu_idx = cpu_ordering[ i ];
+    fd_topo_cpu_t const * cpu = &cpus->cpu[ cpu_idx ];
+    if( cpu->l3_idx!=*hot_l3 || cpu_bv_test( cpu_assigned, cpu_idx ) ) continue;
+    if( cpu->sibling!=ULONG_MAX && cpu_bv_test( cpu_assigned, cpu->sibling ) ) continue;
+    cpu_bv_insert( cpu_assigned, cpu_idx );
+    if( cpu->sibling!=ULONG_MAX ) cpu_bv_insert( cpu_assigned, cpu->sibling );
+    tile->cpu_idx = cpu_idx;
+    return;
+  }
+  FD_LOG_ERR(( "auto layout found no free core in L3 %lu for tile `%s:%lu`", *hot_l3, tile->name, tile->kind_id ));
 }
 
 void
@@ -818,6 +962,26 @@ fd_topob_auto_layout_cpus( fd_topo_t *      topo,
   ulong tiles_to_assign = always_tiles_to_assign +
       fd_ulong_max( startup_tiles_to_assign, post_start_tiles_to_assign );
 
+  /* L3 packing gives the hot post-start tiles their own cores instead
+     of sharing with startup tiles, so it needs that many more.
+     Performance mode, single-L3 hosts, hosts with a partial cache
+     topology and hosts too small for it keep the sequential layout. */
+  ulong hot_post_start_tiles    = 0UL;
+  ulong pinned_startup_tiles    = 0UL;
+  ulong pinned_post_start_tiles = 0UL;
+  for( ulong j=0UL; j<topo->tile_cnt; j++ ) {
+    fd_topo_tile_t const * tile = &topo->tiles[ j ];
+    if( tile_is_floating( tile ) ) continue;
+    int post_start = tile_name_in( tile->name, POST_START );
+    hot_post_start_tiles    += (ulong)( post_start && tile_name_in( tile->name, HOT_TILES ) );
+    pinned_post_start_tiles += (ulong)post_start;
+    pinned_startup_tiles    += (ulong)tile_name_in( tile->name, STARTUP );
+  }
+  ulong l3_tiles_to_assign = always_tiles_to_assign + hot_post_start_tiles +
+      fd_ulong_max( pinned_startup_tiles, pinned_post_start_tiles-hot_post_start_tiles );
+  int l3_layout = topo->sleep_obj_id!=ULONG_MAX && !reserve_agave_cores && fd_topo_cpus_l3_complete( cpus ) &&
+                  available_physical>=l3_tiles_to_assign;
+
   /* If we have enough physical cores (excluding HT siblings) for all
      tiles that need assignment, exclude HT siblings so that no tile
      gets scheduled on a hyperthread pair.
@@ -826,14 +990,37 @@ fd_topob_auto_layout_cpus( fd_topo_t *      topo,
     ? (available_physical>=2*tiles_to_assign) /* Frankendancer */
     : (available_physical>=tiles_to_assign);  /* Firedancer */
 
+  /* Otherwise spend the spare logical CPUs on whole cores for the
+     dedicated tiles.  Each costs its sibling, like a critical tile.
+     The L3 layout already places them on whole cores. */
+  ulong dedicated_budget = 0UL;
+  if( !skip_ht_pairs && !l3_layout && !reserve_agave_cores ) {
+    ulong free_logical = 0UL;
+    for( ulong i=0UL; i<cpus->cpu_cnt; i++ ) free_logical += !cpu_bv_test( cpu_assigned, i );
+    ulong critical_cnt = 0UL;
+    for( ulong j=0UL; j<topo->tile_cnt; j++ ) critical_cnt += (ulong)tile_name_in( topo->tiles[ j ].name, CRITICAL_TILES );
+    dedicated_budget = fd_ulong_sat_sub( free_logical, tiles_to_assign+critical_cnt );
+  }
+
+  if( FD_UNLIKELY( l3_layout ) ) {
+    ulong hot_l3 = ULONG_MAX;
+    for( char const ** p = HOT_TILES; *p; p++ ) {
+      for( ulong j=0UL; j<topo->tile_cnt; j++ ) {
+        fd_topo_tile_t * tile = &topo->tiles[ j ];
+        if( tile_is_floating( tile ) || strcmp( tile->name, *p ) ) continue;
+        auto_tile_cpu_l3( tile, cpus, &hot_l3, cpu_assigned, cpu_ordering );
+      }
+    }
+  }
+
   /* First, assign always-on tiles */
   ulong cpu_idx = 0UL;
   for( char const ** p = ALWAYS; *p; p++ ) {
     for( ulong j=0UL; j<topo->tile_cnt; j++ ) {
       fd_topo_tile_t * tile = &topo->tiles[ j ];
-      if( tile_is_floating( tile ) ) continue;
+      if( tile_is_floating( tile ) || tile->cpu_idx!=ULONG_MAX ) continue;
       if( !strcmp( tile->name, *p ) ) {
-        auto_tile_cpu( tile, cpus, &cpu_idx, cpu_assigned, cpu_ordering, skip_ht_pairs );
+        auto_tile_cpu( tile, cpus, &cpu_idx, cpu_assigned, cpu_ordering, skip_ht_pairs, &dedicated_budget );
       }
     }
   }
@@ -846,15 +1033,16 @@ fd_topob_auto_layout_cpus( fd_topo_t *      topo,
     for( ulong j=0UL; j<topo->tile_cnt; j++ ) {
       fd_topo_tile_t * tile = &topo->tiles[ j ];
       if( !strcmp( tile->name, *p ) ) {
-        auto_tile_cpu( tile, cpus, &cpu_idx_startup, cpu_assigned_startup, cpu_ordering, skip_ht_pairs );
+        auto_tile_cpu( tile, cpus, &cpu_idx_startup, cpu_assigned_startup, cpu_ordering, skip_ht_pairs, &dedicated_budget );
       }
     }
   }
   for( char const ** p = POST_START; *p; p++ ) {
     for( ulong j=0UL; j<topo->tile_cnt; j++ ) {
       fd_topo_tile_t * tile = &topo->tiles[ j ];
+      if( tile->cpu_idx!=ULONG_MAX ) continue;
       if( !strcmp( tile->name, *p ) ) {
-        auto_tile_cpu( tile, cpus, &cpu_idx, cpu_assigned, cpu_ordering, skip_ht_pairs );
+        auto_tile_cpu( tile, cpus, &cpu_idx, cpu_assigned, cpu_ordering, skip_ht_pairs, &dedicated_budget );
       }
     }
   }
