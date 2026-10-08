@@ -11,7 +11,7 @@
    or knowingly skipped) before the constant is bumped.  String keys of
    the user's own file are separately forced through the classification
    lists below. */
-FD_STATIC_ASSERT( sizeof(fd_config_t)==26557688UL, update_fd_config_to_json_for_the_layout_change );
+FD_STATIC_ASSERT( sizeof(fd_config_t)==26557696UL, update_fd_config_to_json_for_the_layout_change );
 
 #define REDACTED "[redacted]"
 
@@ -466,9 +466,19 @@ fd_config_to_json( fd_config_t const * config,
     jw_obj_open( &w, "votor" );
       jw_ulong( &w, "quic_client_listen_port", f->development.votor.quic_client_listen_port );
       jw_ulong( &w, "quic_server_listen_port", f->development.votor.quic_server_listen_port );
+      jw_ulong( &w, "byzantine_vote_pct", f->development.votor.byzantine_vote_pct );
+    jw_obj_close( &w );
+    jw_obj_open( &w, "shred" );
+      jw_ulong( &w, "equivocate_pct", f->development.shred.equivocate_pct );
+      jw_ulong( &w, "equivocate_fec_mix_pct", f->development.shred.equivocate_fec_mix_pct );
+      jw_ulong( &w, "withhold_pct", f->development.shred.withhold_pct );
+    jw_obj_close( &w );
+    jw_obj_open( &w, "repair" );
+      jw_ulong( &w, "adversarial_response_pct", f->development.repair.adversarial_response_pct );
     jw_obj_close( &w );
     jw_obj_open( &w, "gossip" );
       jw_bool( &w, "allow_private_address", config->development.gossip.allow_private_address );
+      jw_bool( &w, "allow_duplicate_instance", config->development.gossip.allow_duplicate_instance );
     jw_obj_close( &w );
     jw_obj_open( &w, "genesis" );
       jw_ulong( &w, "hashes_per_tick",              config->development.genesis.hashes_per_tick );

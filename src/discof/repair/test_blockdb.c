@@ -185,8 +185,21 @@ main( int     argc,
   check_blk( db, 10UL, 1, 9UL,  9, 3U,             10 );
   check_blk( db, 10UL, 2, 8UL,  8, 5U,             20 );
   check_blk( db, 11UL, 3, 10UL, 1, FD_FEC_BLK_MAX, 30 );
+  FD_TEST( fd_blockdb_query_slot( db, 10UL ) );
+  FD_TEST( !fd_blockdb_query_slot( db, 99UL ) );
   FD_TEST( !has( db, 11UL, 1 ) ); /* same block id, other slot */
   FD_TEST( !has( db, 12UL, 3 ) );
+
+  /* Same-slot lookup finds a version with a different root at the
+     requested FEC leaf, and observes leaf bounds. */
+  uchar root_10[ FD_SHRED_MERKLE_NODE_SZ ]; memset( root_10, 10, sizeof(root_10) );
+  fd_blockdb_blk_t const * alt = fd_blockdb_query_alternate_root( db, 10UL, 0UL, root_10 );
+  fd_hash_t bid_2 = hash( 2 );
+  FD_TEST( alt && fd_hash_eq( &alt->key.block_id, &bid_2 ) );
+  uchar root_24[ FD_SHRED_MERKLE_NODE_SZ ]; memset( root_24, 24, sizeof(root_24) );
+  alt = fd_blockdb_query_alternate_root( db, 10UL, 4UL, root_24 );
+  FD_TEST( !alt );
+  FD_TEST( !fd_blockdb_query_alternate_root( db, 99UL, 0UL, root_10 ) );
 
   /* Re-insert updates in place without consuming a slot */
   fd_blockdb_blk_t * blk = insert( db, 10UL, 1, 7UL, 7, 4U, 40 );

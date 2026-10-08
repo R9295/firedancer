@@ -1,4 +1,5 @@
 #include "fd_shredder.h"
+#include "fd_shred_tile.h"
 #include "../../ballet/shred/fd_shred.h"
 #include "../../ballet/hex/fd_hex.h"
 
@@ -431,6 +432,92 @@ test_chained_merkle_shreds( void ) {
   FD_TEST( fd_memeq( chained_merkle_root, expected_final_chained_merkle_root, 32 ) );
 }
 
+/* test_equivocating_versions checks the two versions the shred tile
+   builds for an equivocated leader slot (equivocate_pct).  The
+   versions differ only in the reference tick, so every data shred
+   carries the same payload, but every FEC set has a different merkle
+   root, and each version is a valid chain of signed FEC sets. */
+
+static void
+test_equivocating_versions( void ) {
+  static fd_shredder_t _eqvoc_shredder[ 1 ];
+  static fd_fec_set_t  set_a[ 1 ];
+  static fd_fec_set_t  set_b[ 1 ];
+
+  for( ulong i=0UL; i<PERF_TEST_SZ; i++ ) perf_test_entry_batch[ i ] = (uchar)(i*7UL);
+
+  signer_ctx_t signer_ctx[ 1 ];
+  signer_ctx_init( signer_ctx, test_private_key );
+  fd_sha512_t _verify_sha[ 1 ];
+  fd_sha512_t * verify_sha = fd_sha512_join( fd_sha512_new( _verify_sha ) ); FD_TEST( verify_sha );
+  uchar const * public_key = test_private_key+32UL;
+  static uchar __attribute__((aligned(32UL))) bmtree_mem[ FD_BMTREE_COMMIT_FOOTPRINT( FD_SHRED_MERKLE_LAYER_CNT ) ];
+
+  fd_shredder_t * shredder_a = fd_shredder_join( fd_shredder_new( _shredder       ) ); FD_TEST( shredder_a );
+  fd_shredder_t * shredder_b = fd_shredder_join( fd_shredder_new( _eqvoc_shredder ) ); FD_TEST( shredder_b );
+  fd_shredder_set_shred_version( shredder_a, (ushort)6051 );
+  fd_shredder_set_shred_version( shredder_b, (ushort)6051 );
+
+  fd_entry_batch_meta_t meta_a[1];
+  fd_memset( meta_a, 0, sizeof(fd_entry_batch_meta_t) );
+  meta_a->parent_offset = 1UL;
+
+  /* Both versions chain from the same parent block id */
+  uchar root_a[ 32 ]; fd_hex_decode( root_a, "0102030405060708090a0b0c0d0e0f000102030405060708090a0b0c0d0e0f00", 32UL );
+  uchar root_b[ 32 ]; memcpy( root_b, root_a, 32UL );
+
+  /* Batches of 1, 2 and 3 FEC sets, the last one completing the block */
+  ulong batch_sz[ 3 ] = { 20000UL, 50000UL, 80000UL };
+  ulong set_cnt = 0UL;
+  for( ulong b=0UL; b<3UL; b++ ) {
+    meta_a->block_complete = b==2UL;
+    fd_entry_batch_meta_t meta_b[1];
+    *meta_b = *meta_a;
+    meta_b->reference_tick = ( meta_a->reference_tick+1UL ) & FD_SHRED_DATA_REF_TICK_MASK;
+
+    fd_shredder_init_batch( shredder_a, perf_test_entry_batch, batch_sz[ b ], 20UL, meta_a );
+    fd_shredder_init_batch( shredder_b, perf_test_entry_batch, batch_sz[ b ], 20UL, meta_b );
+    for( ulong k=0UL; k<fd_shredder_count_fec_sets( batch_sz[ b ], b==2UL ); k++ ) {
+      uchar prev_b[ 32 ]; memcpy( prev_b, root_b, 32UL );
+      FD_TEST( next_fec_set_signed( shredder_a, set_a, root_a, signer_ctx ) );
+      FD_TEST( next_fec_set_signed( shredder_b, set_b, root_b, signer_ctx ) );
+      FD_TEST( memcmp( root_a, root_b, 32UL ) );
+      set_cnt++;
+
+      for( ulong i=0UL; i<2UL*FD_FEC_SHRED_CNT; i++ ) {
+        int                is_data = i<FD_FEC_SHRED_CNT;
+        ulong              j       = i%FD_FEC_SHRED_CNT;
+        fd_shred_t const * a       = is_data ? set_a->data_shreds[ j ].s : set_a->parity_shreds[ j ].s;
+        fd_shred_t const * s       = is_data ? set_b->data_shreds[ j ].s : set_b->parity_shreds[ j ].s;
+
+        /* Same position in the block */
+        FD_TEST( a->variant==s->variant && a->slot==s->slot && a->idx==s->idx && a->fec_set_idx==s->fec_set_idx );
+
+        /* Same entries, different reference tick */
+        if( is_data ) {
+          FD_TEST( a->data.parent_off==s->data.parent_off );
+          FD_TEST( (a->data.flags & (uchar)~FD_SHRED_DATA_REF_TICK_MASK)==(s->data.flags & (uchar)~FD_SHRED_DATA_REF_TICK_MASK) );
+          FD_TEST( (s->data.flags & FD_SHRED_DATA_REF_TICK_MASK)==meta_b->reference_tick );
+          FD_TEST( fd_shred_payload_sz( a )==fd_shred_payload_sz( s ) );
+          FD_TEST( fd_memeq( fd_shred_data_payload( a ), fd_shred_data_payload( s ), fd_shred_payload_sz( a ) ) );
+        }
+
+        /* Version B is a valid chain of its own: each shred verifies
+           against its own root and chains from the previous B root */
+        FD_TEST( fd_shred_parse( (uchar const *)s, is_data ? FD_SHRED_MIN_SZ : FD_SHRED_MAX_SZ, FD_SHRED_BLK_MAX ) );
+        fd_bmtree_node_t root[ 1 ];
+        FD_TEST( fd_shred_merkle_root( s, bmtree_mem, root ) );
+        FD_TEST( fd_memeq( root->hash, root_b, 32UL ) );
+        FD_TEST( FD_ED25519_SUCCESS==fd_ed25519_verify( root->hash, 32UL, s->signature, public_key, verify_sha ) );
+        FD_TEST( fd_memeq( (uchar const *)s + fd_shred_chain_off( s->variant ), prev_b, 32UL ) );
+      }
+    }
+    fd_shredder_fini_batch( shredder_a );
+    fd_shredder_fini_batch( shredder_b );
+  }
+  FD_TEST( set_cnt==6UL );
+}
+
 static void
 perf_test( void ) {
   for( ulong i=0UL; i<PERF_TEST_SZ; i++ )  perf_test_entry_batch[ i ] = (uchar)i;
@@ -519,6 +606,12 @@ main( int     argc,
 
   FD_TEST( FD_FEC_SET_MAX_BMTREE_DEPTH == fd_bmtree_depth( FD_FEC_SHRED_CNT + FD_FEC_SHRED_CNT ) );
 
+  ulong base_mask = 0x15UL;
+  FD_TEST( fd_shred_tile_eqvoc_fec_dest_mask( base_mask, 6UL, 0, FD_FEC_SHRED_CNT )==base_mask );
+  FD_TEST( fd_shred_tile_eqvoc_fec_dest_mask( base_mask, 6UL, 1, 0UL                  )==base_mask );
+  FD_TEST( fd_shred_tile_eqvoc_fec_dest_mask( base_mask, 6UL, 1, FD_FEC_SHRED_CNT    )==(base_mask^0x3fUL) );
+  FD_TEST( fd_shred_tile_eqvoc_fec_dest_mask( base_mask, 6UL, 1, 2UL*FD_FEC_SHRED_CNT)==base_mask );
+
   if( sizeof(fd_shredder_t) != fd_shredder_footprint() )
     FD_LOG_WARNING(( "sizeof() %lu, footprint: %lu", sizeof(fd_shredder_t), fd_shredder_footprint() ));
   FD_TEST( sizeof(fd_shredder_t) == fd_shredder_footprint() );
@@ -527,6 +620,7 @@ main( int     argc,
   test_shredder_count();
   test_shredder_count_complete();
   test_chained_merkle_shreds();
+  test_equivocating_versions();
   if( bench ) {
     perf_test();
     perf_test2();

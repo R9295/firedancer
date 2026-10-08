@@ -521,7 +521,8 @@ fd_store_query( fd_store_map_t *  map,
 
 /* Removes merkle_root after active views and spill I/O finish.  Returns
    its payload and metadata before returning.  Returns 1 if found and 0
-   otherwise.  Not allowed under Alpenglow, use fd_store_publish. */
+   otherwise.  Under Alpenglow it only unmaps the FEC, and
+   fd_store_publish releases it once the root passes its slot. */
 
 int
 fd_store_remove( fd_store_t *      store,

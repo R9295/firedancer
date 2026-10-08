@@ -79,6 +79,48 @@ test_publish( fd_wksp_t * wksp ) {
   fd_wksp_free_laddr( fd_store_delete( fd_store_leave( store ) ) );
 }
 
+/* Under Alpenglow, fd_store_remove (the rotor drops stale and rejected
+   FECs) leaves the FEC in its slot_to_fecs partition, which only
+   fd_store_publish unlinks.  Publish must then release it without the
+   map entry, keep a newer FEC re-inserted under the same merkle root,
+   and the pool must not reuse the element before then. */
+
+void
+test_remove_then_publish( fd_wksp_t * wksp ) {
+  ulong  fec_max     = 4;
+  void * mem         = fd_wksp_alloc_laddr( wksp, fd_store_align(), fd_store_footprint( fec_max, 31840UL, 0UL, 0UL, 0UL, 1, 1UL ), 1UL );
+  fd_store_t * store = fd_store_join( fd_store_new( mem, fec_max, 31840UL, 0UL, 0UL, 0UL, FD_SHRED_BLK_MAX, 0UL, 1, 1UL ) );
+  FD_TEST( store );
+  fd_store_map_t map[1];
+  FD_TEST( fd_store_map_ljoin( store, map ) );
+
+  fd_hash_t        a = (fd_hash_t){ .ul = { 1UL } };
+  fd_hash_t        b = (fd_hash_t){ .ul = { 2UL } };
+  fd_store_fec_t * fa;
+  fd_store_fec_t * fb;
+  fd_store_fec_t * fa2;
+  FD_TEST( !fd_store_insert( store, map, &a, 10UL, 0UL, &fa ) && fa );
+  FD_TEST( !fd_store_insert( store, map, &b, 11UL, 1UL, &fb ) && fb );
+  FD_TEST( fd_store_remove( store, map, &a ) );                         /* rejected: unmapped, still indexed */
+  FD_TEST( !fd_store_query( map, &a ) );
+  FD_TEST( !fd_store_insert( store, map, &a, 12UL, 0UL, &fa2 ) && fa2 ); /* the same root again, as repair would */
+  FD_TEST( fa2!=fa );                                                   /* the indexed element is not reused */
+  FD_TEST( fd_store_publish( store, map, 11UL )==1UL );                 /* releases the stale slot 10 FEC */
+  FD_TEST( fd_store_query( map, &a )==fa2 );                            /* and keeps the newer one */
+  FD_TEST( fd_store_remove( store, map, &b ) );
+  FD_TEST( fd_store_publish( store, map, 13UL )==2UL );
+  FD_TEST( !fd_store_query( map, &a ) && !fd_store_query( map, &b ) );
+
+  /* Every element is back in the pool. */
+  fd_store_fec_t * fec;
+  for( ulong i=0UL; i<fec_max; i++ ) {
+    fd_hash_t mr = (fd_hash_t){ .ul = { 100UL+i } };
+    FD_TEST( !fd_store_insert( store, map, &mr, 20UL, 0UL, &fec ) && fec );
+  }
+
+  fd_wksp_free_laddr( fd_store_delete( fd_store_leave( store ) ) );
+}
+
 void
 test_api( fd_wksp_t * wksp ) {
   FD_TEST( sizeof(fd_store_fec_t)==128UL );
@@ -1205,6 +1247,7 @@ main( int argc, char ** argv ) {
 
   test_api         ( wksp );
   test_publish     ( wksp );
+  test_remove_then_publish( wksp );
   test_file_create ( wksp );
   test_pread_all   ();
   test_query_miss  ( wksp );

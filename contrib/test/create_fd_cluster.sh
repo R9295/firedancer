@@ -16,6 +16,45 @@ genesis=${SOLANA_GENESIS:-$FD/agave/target/release/solana-genesis}
   || fail 'C must not contain a newline, quote, or backslash.'
 [[ $node_count =~ ^[0-9]+$ ]] && (( node_count>=2 && node_count<=128 )) \
   || fail 'FD_CLUSTER_NODES must be in 2..128.'
+# FD_CLUSTER_TWIN_OF=K adds one more validator that reuses node K's
+# identity.  It produces K's leader slots too, so those slots get two
+# conflicting blocks.  Its authorized voter is a fresh unstaked key, so it
+# never votes.
+twin_of=${FD_CLUSTER_TWIN_OF:-}
+[[ -z $twin_of ]] || { [[ $twin_of =~ ^[0-9]+$ ]] && (( twin_of<node_count )); } \
+  || fail "FD_CLUSTER_TWIN_OF must be a node index in 0..$((node_count-1))."
+proc_count=$(( node_count + ( ${#twin_of} ? 1 : 0 ) ))
+# FD_CLUSTER_EQUIVOCATOR=K makes node K equivocate in
+# FD_CLUSTER_EQUIVOCATE_PCT percent (default: 25) of its leader slots:
+# it sends one version of the block to a random 1 to n-1 of the other
+# nodes, and a second version with the same entries to the rest.
+equivocator=${FD_CLUSTER_EQUIVOCATOR:-}
+equivocate_pct=${FD_CLUSTER_EQUIVOCATE_PCT:-25}
+[[ -z $equivocator ]] || { [[ $equivocator =~ ^[0-9]+$ ]] && (( equivocator<node_count )); } \
+  || fail "FD_CLUSTER_EQUIVOCATOR must be a node index in 0..$((node_count-1))."
+[[ $equivocate_pct =~ ^[0-9]+$ ]] && (( equivocate_pct>=1 && equivocate_pct<=100 )) \
+  || fail 'FD_CLUSTER_EQUIVOCATE_PCT must be in 1..100.'
+# FD_CLUSTER_EQUIVOCATE_FEC_MIX_PCT selects the share of equivocated
+# slots whose A/B destination assignment flips on alternating FEC sets.
+equivocate_fec_mix_pct=${FD_CLUSTER_EQUIVOCATE_FEC_MIX_PCT:-0}
+[[ $equivocate_fec_mix_pct =~ ^[0-9]+$ ]] && (( equivocate_fec_mix_pct<=100 )) \
+  || fail 'FD_CLUSTER_EQUIVOCATE_FEC_MIX_PCT must be in 0..100.'
+(( !equivocate_fec_mix_pct )) || [[ -n $equivocator ]] \
+  || fail 'FD_CLUSTER_EQUIVOCATE_FEC_MIX_PCT needs FD_CLUSTER_EQUIVOCATOR.'
+# FD_CLUSTER_ADVERSARIAL_REPAIR_NODE=K makes one repair server return a
+# different stored version of an eligible requested shred.
+adversarial_repair_node=${FD_CLUSTER_ADVERSARIAL_REPAIR_NODE:-}
+adversarial_repair_pct=${FD_CLUSTER_ADVERSARIAL_REPAIR_PCT:-100}
+[[ -z $adversarial_repair_node ]] || { [[ $adversarial_repair_node =~ ^[0-9]+$ ]] && (( adversarial_repair_node<node_count )); } \
+  || fail "FD_CLUSTER_ADVERSARIAL_REPAIR_NODE must be a node index in 0..$((node_count-1))."
+[[ $adversarial_repair_pct =~ ^[0-9]+$ ]] && (( adversarial_repair_pct>=1 && adversarial_repair_pct<=100 )) \
+  || fail 'FD_CLUSTER_ADVERSARIAL_REPAIR_PCT must be in 1..100.'
+# FD_CLUSTER_WITHHOLD_PCT=P makes every node withhold part of its block
+# in P percent (default: 0) of its leader slots, so the other nodes must
+# repair it.
+withhold_pct=${FD_CLUSTER_WITHHOLD_PCT:-0}
+[[ $withhold_pct =~ ^[0-9]+$ ]] && (( withhold_pct<=100 )) \
+  || fail 'FD_CLUSTER_WITHHOLD_PCT must be in 0..100.'
 [[ -n $keygen && -x $keygen ]] || fail 'solana-keygen is required (or set SOLANA_KEYGEN).'
 [[ -x $genesis ]] || fail "Missing $genesis; build solana-genesis or set SOLANA_GENESIS."
 [[ ! -e $C ]] || fail "$C already exists; choose a new C so existing keys and ledger are not overwritten."
@@ -54,14 +93,14 @@ plan_affinities() {
   (( ${#numa_paths[@]} )) || fail 'No NUMA CPU topology found in sysfs.'
   numa_count=${#numa_paths[@]}
 
-  for ((i=0; i<node_count; i++)); do
+  for ((i=0; i<proc_count; i++)); do
     node_cpu_lists[i]=''
     node_numa[i]=''
   done
 
   for ((slot=0; slot<numa_count; slot++)); do
     validators=()
-    for ((i=slot; i<node_count; i+=numa_count)); do validators+=("$i"); done
+    for ((i=slot; i<proc_count; i+=numa_count)); do validators+=("$i"); done
     (( ${#validators[@]} )) || continue
     validator_count=${#validators[@]}
     node_path=${numa_paths[slot]}
@@ -100,7 +139,7 @@ plan_affinities() {
       || fail "NUMA $node_numa_id needs at least $((validator_count+1)) physical cores for $validator_count validators and the host."
   done
 
-  for ((i=0; i<node_count; i++)); do
+  for ((i=0; i<proc_count; i++)); do
     read -r -a cpus <<<"${node_cpu_lists[i]}"
     (( ${#cpus[@]} )) || fail "No CPU was assigned to validator $i."
     affinity=
@@ -118,7 +157,7 @@ plan_affinities
 user=$(id -un)
 [[ $user =~ ^[A-Za-z0-9_.-]+$ ]] || fail 'The current user name is not valid in a Firedancer config.'
 install -d "$C/keys" "$C/ledger" "$C/logs"
-for ((i=0; i<node_count; i++)); do install -d "$C/node-$i"; done
+for ((i=0; i<proc_count; i++)); do install -d "$C/node-$i"; done
 
 printf 'Creating keys for %s equal-stake validators...\n' "$node_count"
 "$keygen" new --no-bip39-passphrase --silent --force --outfile "$C/keys/faucet.json"
@@ -136,6 +175,10 @@ for ((i=0; i<node_count; i++)); do
     --bootstrap-validator-bls-pubkey "$bls"
   )
 done
+
+if [[ -n $twin_of ]]; then
+  "$keygen" new --no-bip39-passphrase --silent --force --outfile "$C/keys/twin-voter.json"
+fi
 
 printf 'Creating the shared Alpenglow genesis...\n'
 if ! genesis_output=$("$genesis" \
@@ -155,8 +198,13 @@ printf '%s\n' "$genesis_output"
 genesis_hash=$(awk '/Genesis hash:/ { for (i=1; i<=NF; i++) if ($i=="hash:") { print $(i+1); exit } }' <<<"$genesis_output")
 [[ -n $genesis_hash ]] || fail 'Could not read the genesis hash.'
 
-for ((i=0; i<node_count; i++)); do
+for ((i=0; i<proc_count; i++)); do
   base=$((10000 + 100*i))
+  key=$i
+  (( i<node_count )) || key=$twin_of
+  # The twin and its original share an identity on purpose.
+  dup=false
+  [[ -n $twin_of ]] && (( key==twin_of )) && dup=true
   if (( i==0 )); then
     entrypoints='[]'
   else
@@ -164,6 +212,10 @@ for ((i=0; i<node_count; i++)); do
   fi
   config=$C/node-$i.toml
   {
+    (( i<node_count )) || printf '%s\n' \
+      "# Twin of node $twin_of: same identity, so it produces that node's leader" \
+      '# slots too (equivocation), but its authorized voter is unstaked, so it' \
+      '# never votes.'
     printf '%s\n' \
       "name = \"fd-cluster-$i\"" \
       "user = \"$user\"" \
@@ -171,8 +223,10 @@ for ((i=0; i<node_count; i++)); do
       '' \
       '[paths]' \
       "    base = \"$C/node-$i\"" \
-      "    identity_key = \"$C/keys/identity-$i.json\"" \
-      "    vote_account = \"$C/keys/vote-$i.json\"" \
+      "    identity_key = \"$C/keys/identity-$key.json\"" \
+      "    vote_account = \"$C/keys/vote-$key.json\""
+    (( i<node_count )) || printf '%s\n' "    authorized_voter_paths = [\"$C/keys/twin-voter.json\"]"
+    printf '%s\n' \
       "    genesis = \"$C/ledger/genesis.bin\"" \
       '' \
       '[log]' \
@@ -255,7 +309,7 @@ for ((i=0; i<node_count; i++)); do
       "    shred_listen_port = $((base+3))" \
       '    shred_cache_size_mib = 64' \
       '    additional_shred_destinations_leader = ['
-    for ((j=0; j<node_count; j++)); do
+    for ((j=0; j<proc_count; j++)); do
       if (( j!=i )); then printf '        "127.0.0.1:%s",\n' "$((10000 + 100*j + 3))"; fi
     done
     printf '%s\n' \
@@ -299,19 +353,35 @@ for ((i=0; i<node_count; i++)); do
       '' \
       '[development.gossip]' \
       '    allow_private_address = true' \
+      "    allow_duplicate_instance = $dup" \
       '' \
       '[development.genesis]' \
       '    validate_genesis_hash = false' \
       '' \
       '[development.accdb]' \
       '    partition_size_gib = 1'
+    if [[ $equivocator == "$i" ]] || (( withhold_pct )); then
+      printf '%s\n' '' '[development.shred]'
+      [[ $equivocator != "$i" ]] || printf '    equivocate_pct = %s\n' "$equivocate_pct"
+      [[ $equivocator != "$i" ]] || (( !equivocate_fec_mix_pct )) || printf '    equivocate_fec_mix_pct = %s\n' "$equivocate_fec_mix_pct"
+      (( !withhold_pct )) || printf '    withhold_pct = %s\n' "$withhold_pct"
+    fi
+    if [[ $adversarial_repair_node == "$i" ]]; then
+      printf '%s\n' '' '[development.repair]'
+      printf '    adversarial_response_pct = %s\n' "$adversarial_repair_pct"
+    fi
   } >"$config"
 done
 
 stake_percent=$(awk -v n="$node_count" 'BEGIN { printf "%.2f", 100/n }')
 printf 'Created %s validators at %s with equal stake (%s%% each).\n' \
   "$node_count" "$C" "$stake_percent"
-for ((i=0; i<node_count; i++)); do
-  printf '  node %s: NUMA %s, shared CPUs [%s]\n' "$i" "${node_numa[i]}" "${node_cpu_lists[i]}"
+(( !withhold_pct )) || printf 'Every node withholds part of its block in %s%% of its leader slots.\n' "$withhold_pct"
+for ((i=0; i<proc_count; i++)); do
+  label=
+  (( i<node_count )) || label=" (twin of node $twin_of, unstaked voter)"
+  [[ $equivocator != "$i" ]] || label="$label (equivocates in $equivocate_pct% of its leader slots; mixed FEC in $equivocate_fec_mix_pct% of those)"
+  [[ $adversarial_repair_node != "$i" ]] || label="$label (adversarial repair in $adversarial_repair_pct% of eligible responses)"
+  printf '  node %s%s: NUMA %s, shared CPUs [%s]\n' "$i" "$label" "${node_numa[i]}" "${node_cpu_lists[i]}"
 done
 printf 'Next: C=%q %q init\n' "$C" "$FD/contrib/test/run_fd_cluster.sh"

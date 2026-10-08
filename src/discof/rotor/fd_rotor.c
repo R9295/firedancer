@@ -2,6 +2,7 @@
 #include "../../disco/shred/fd_fec_set.h"
 #include "../../ballet/bmtree/fd_bmtree.h"
 #include "../../ballet/sha256/fd_sha256.h"
+#include "../../disco/fd_trace.h"
 
 #include <stdio.h>
 
@@ -91,6 +92,58 @@ block_iter_next( fd_rotor_t * rotor, ulong idx ) {
 static inline fd_rotor_blk_t *
 block_iter_ele( fd_rotor_t * rotor, ulong idx ) {
   return fd_block_pool_ele( rotor->block_pool, idx );
+}
+
+/* Trace helpers, see fd_trace.h.  A turbine version's block id is zero
+   until the version completes. */
+
+static char const *
+trace_src( int src ) {
+  switch( src ) {
+  case FD_ROTOR_SRC_TURBINE:   return "turbine";
+  case FD_ROTOR_SRC_REPAIR:    return "repair";
+  case FD_ROTOR_SRC_RECOVERED: return "recovered";
+  case FD_ROTOR_SRC_LEADER:    return "leader";
+  default:                     return "unknown";
+  }
+}
+
+static void
+trace_version( char const *           event,
+               fd_rotor_blk_t const * block,
+               char const *           why ) {
+  char b58[ FD_BASE58_ENCODED_32_SZ ];
+  FD_TRACE( "rotor %s slot=%lu block=%s turbine=%d why=%s", event, block->slot, fd_trace_hash( b58, block->block_id.uc ), (int)block->turbine, why );
+}
+
+static char const *
+abandon_reason_str( int reason ) {
+  switch( reason ) {
+  case ABANDON_REASON_MERKLE_ROOT_MISMATCH:  return "merkle_root_mismatch";
+  case ABANDON_REASON_VOTOR_BLOCK_ID_EVENT:  return "votor_version";
+  case ABANDON_REASON_VOTOR_BLOCK_ID_PARENT: return "parent_version";
+  case ABANDON_REASON_PARENT_OFF_MISMATCH:   return "parent_off_mismatch";
+  case ABANDON_REASON_INVALID_BLOCK_HEADER:  return "invalid_block_header";
+  default:                                   return "other";
+  }
+}
+
+/* block_abandon and block_connect set the flag and trace the change. */
+
+static void
+block_abandon( fd_rotor_blk_t * block,
+               char const *     why ) {
+  if( FD_UNLIKELY( block->abandoned ) ) return;
+  block->abandoned = 1;
+  trace_version( "abandon", block, why );
+}
+
+static void
+block_connect( fd_rotor_blk_t * block,
+               char const *     why ) {
+  if( FD_LIKELY( block->connected ) ) return;
+  block->connected = 1;
+  trace_version( "connect", block, why );
 }
 
 /* acquire_block allocates, initializes, and map-inserts a fresh
@@ -246,7 +299,7 @@ fd_rotor_shred_test( fd_rotor_t *           rotor,
 static void
 rotor_invalidate( fd_rotor_blk_t * block, long rx_ts, int reason ) {
   if( !fd_hash_check_zero( &block->block_id ) || block->abandoned ) return;
-  block->abandoned = 1;
+  block_abandon( block, abandon_reason_str( reason ) );
   block->metrics.abandoned_ts = rx_ts;
   block->metrics.abandoned_reason = reason;
 }
@@ -273,6 +326,7 @@ turbine_block_insert( fd_rotor_t * rotor, ulong slot ) {
   if( FD_LIKELY( block ) ) return block;
   block = acquire_block( rotor, slot );
   block->turbine = 1;
+  trace_version( "version_new", block, "turbine" );
   return block;
 }
 
@@ -347,14 +401,16 @@ fd_rotor_shred_insert( fd_rotor_t *      rotor,
 
   /* If we have a turbine version:
        - if it has no FEC for this position, use this one
-       - it it has a FEC, and it's the same mr, we're good
-       - it it has a FEC, and it's different, mark it abandoned */
+       - if it has a FEC, and it's the same mr, we're good
+       - if it has a FEC, and it's different, mark it abandoned unless
+         this node produced the turbine version as leader */
 
   if( FD_LIKELY( turbine ) ) {
     fd_rotor_fec_t * fect = block_fec( rotor, turbine, fec_set_idx );
     if     ( FD_UNLIKELY( !fect ) )                                 fec_join( rotor, slot, fec_set_idx, turbine, mr );
     else if( FD_UNLIKELY( !fd_hash_eq( &fect->merkle_root, mr ) &&
-                           fd_hash_check_zero( &turbine->block_id ) ) ) rotor_invalidate( turbine, rx_ts, ABANDON_REASON_MERKLE_ROOT_MISMATCH );
+                           fd_hash_check_zero( &turbine->block_id ) &&
+                           !turbine->is_leader ) ) rotor_invalidate( turbine, rx_ts, ABANDON_REASON_MERKLE_ROOT_MISMATCH );
   }
 
   fd_rotor_fec_t * fec = fd_fec_map_ele_query( rotor->fec_map, mr, NULL, rotor->fec_pool );
@@ -430,7 +486,7 @@ fd_rotor_shred_insert( fd_rotor_t *      rotor,
       block->parent_block_id   = *parent_block_id;
 
       fd_rotor_blk_t * parent = fd_rotor_slot_version_query( rotor, parent_slot, parent_block_id );
-      if( FD_LIKELY( parent && parent->connected ) ) block->connected = 1;
+      if( FD_LIKELY( parent && parent->connected ) ) block_connect( block, "parent_header" );
     }
   }
   return created;
@@ -521,7 +577,7 @@ rotor_advance( fd_rotor_t * rotor, fd_rotor_blk_t * root ) {
                                  it = fd_block_map_iter_next( it, block_map, block_pool ) ) {
           fd_rotor_blk_t * child = fd_block_map_iter_ele( it, block_map, block_pool );
           if( FD_UNLIKELY( fd_hash_eq( &child->parent_block_id, &block->block_id ) ) ) {
-            child->connected = 1;
+            block_connect( child, "parent_delivered" );
             bfs_push_tail( bfs, fd_block_pool_idx( block_pool, child ) );
           }
         }
@@ -529,6 +585,27 @@ rotor_advance( fd_rotor_t * rotor, fd_rotor_blk_t * root ) {
       }
     }
   }
+}
+
+/* trace_block_complete traces a version whose FEC sets are all
+   complete, with the first 4 bytes of each FEC set root in order. */
+
+static void
+trace_block_complete( fd_rotor_t *           rotor,
+                      fd_rotor_blk_t const * block ) {
+# define TRACE_ROOTS_MAX (16U)
+  char   roots[ TRACE_ROOTS_MAX*9U+16U ];
+  char * p       = fd_cstr_init( roots );
+  uint   fec_cnt = ( block->complete_idx+1U ) / FD_FEC_SHRED_CNT;
+  for( uint k=0U; k<fec_cnt && k<TRACE_ROOTS_MAX; k++ ) {
+    fd_rotor_fec_t const * fec = block_fec( rotor, block, k*FD_FEC_SHRED_CNT );
+    p = fd_cstr_append_printf( p, k ? ",%08x" : "%08x", fec ? fd_trace_root4( fec->merkle_root.uc ) : 0U );
+  }
+  if( FD_UNLIKELY( fec_cnt>TRACE_ROOTS_MAX ) ) p = fd_cstr_append_cstr( p, ",..." );
+  fd_cstr_fini( p );
+# undef TRACE_ROOTS_MAX
+  char b58[ FD_BASE58_ENCODED_32_SZ ], parent_b58[ FD_BASE58_ENCODED_32_SZ ];
+  FD_TRACE( "rotor block_complete slot=%lu block=%s turbine=%d abandoned=%d connected=%d parent_slot=%ld parent=%s fecs=%u roots=%s", block->slot, fd_trace_hash( b58, block->block_id.uc ), (int)block->turbine, (int)block->abandoned, (int)block->connected, block->parent_slot==AG_UNKNOWN_SLOT ? -1L : (long)block->parent_slot, fd_trace_hash( parent_b58, block->parent_block_id.uc ), fec_cnt, roots );
 }
 
 fd_rotor_blk_t *
@@ -563,12 +640,16 @@ fd_rotor_fec_complete( fd_rotor_t *      rotor,
   fd_rotor_fec_t * fec = fd_fec_map_ele_query( rotor->fec_map, mr, NULL, rotor->fec_pool );
   if( FD_UNLIKELY( !fec ) ) {
     if( opt_rejected ) *opt_rejected = 1;
+    fd_rotor_blk_t const * turbine = fd_rotor_turbine_block_query( rotor, slot );
+    fd_rotor_fec_t const * held    = turbine ? block_fec( rotor, turbine, fec_set_idx ) : NULL;
+    FD_TRACE( "rotor fec_reject slot=%lu fec=%u root=%08x held=%08x", slot, fec_set_idx, fd_trace_root4( mr->uc ), held ? fd_trace_root4( held->merkle_root.uc ) : 0U );
     return created;
   }
 
   if( FD_LIKELY( !fec->complete ) ) {
     fec->metrics.completed_ts = rx_ts;
     if( FD_UNLIKELY( is_leader ) ) fec_shred_received( fec, FD_ROTOR_SRC_LEADER, rx_ts );
+    FD_TRACE( "rotor fec_complete slot=%lu fec=%u root=%08x src=%s data=%d repair=%d parity=%d last=%d", slot, fec_set_idx, fd_trace_root4( mr->uc ), trace_src( fec->metrics.last_shred_src ), fd_uint_popcnt( fec->metrics.data_received ), fd_uint_popcnt( fec->metrics.repair_received ), fd_uint_popcnt( fec->metrics.parity_received ), !!slot_complete );
   }
 
   fec->complete = 1; /* set is now reconstructable -> deliverable */
@@ -604,6 +685,7 @@ fd_rotor_fec_complete( fd_rotor_t *      rotor,
                        turbine->buffered_fec_idx==turbine->complete_idx &&
                        fd_hash_check_zero( &turbine->block_id ) ) ) {
         if( FD_LIKELY( finalize_block_id( rotor, turbine ) ) ) {
+          trace_block_complete( rotor, turbine );
           if( opt_turbine_finalized ) *opt_turbine_finalized = turbine;
           if( FD_UNLIKELY( rotor->block_event_fn && !block->abandoned ) ) rotor->block_event_fn( rotor->block_event_ctx, block );
         } else {
@@ -611,8 +693,9 @@ fd_rotor_fec_complete( fd_rotor_t *      rotor,
         }
       }
     } else if( FD_UNLIKELY( !was_complete && block->complete_idx!=UINT_MAX &&
-                           block->buffered_fec_idx==block->complete_idx && rotor->block_event_fn ) ) {
-      rotor->block_event_fn( rotor->block_event_ctx, block );
+                           block->buffered_fec_idx==block->complete_idx ) ) {
+      trace_block_complete( rotor, block );
+      if( FD_LIKELY( rotor->block_event_fn ) ) rotor->block_event_fn( rotor->block_event_ctx, block );
     }
 
     rotor_advance( rotor, block );
@@ -683,6 +766,7 @@ fd_rotor_verified_parent_fec_count( fd_rotor_t * rotor,
     parent_block = acquire_block( rotor, parent_slot );
     parent_block->block_id = *parent_block_id;
 
+    trace_version( "version_new", parent_block, "parent" );
     for( ulong i=block_iter_init( rotor, parent_slot ); i!=ULONG_MAX; i=block_iter_next( rotor, i ) ) {
       fd_rotor_blk_t * block = block_iter_ele( rotor, i );
       if( FD_LIKELY( !block->turbine || block->abandoned ) ) continue;
@@ -691,7 +775,7 @@ fd_rotor_verified_parent_fec_count( fd_rotor_t * rotor,
   }
 
   /* parent now identified, connect this block if the parent is. */
-  if( FD_UNLIKELY( parent_block->connected ) ) block->connected = 1;
+  if( FD_UNLIKELY( parent_block->connected ) ) block_connect( block, "parent_meta" );
   return parent_block;
 }
 
@@ -750,6 +834,7 @@ fd_rotor_verified_block_insert( fd_rotor_t * rotor,
 
   fd_rotor_blk_t * block = acquire_block( rotor, slot );
   block->block_id = block_id;
+  trace_version( "version_new", block, "votor" );
 
   fd_rotor_blk_t * turbine = fd_rotor_turbine_block_query( rotor, slot );
   if( FD_UNLIKELY( turbine && fd_hash_check_zero( &turbine->block_id ) ) ) {
@@ -801,6 +886,8 @@ fd_rotor_publish( fd_rotor_t *      rotor,
   if( FD_UNLIKELY( !canonical ) ) {
     FD_LOG_DEBUG(( "rotor publish %lu: no version matches the rooted block_id; keeping all versions", new_root ));
   }
+  char b58[ FD_BASE58_ENCODED_32_SZ ];
+  FD_TRACE( "rotor root slot=%lu block=%s old_root=%lu canonical=%d", new_root, fd_trace_hash( b58, new_root_block_id ), root, !!canonical );
 
   /* Prune every version of every slot in [root, new_root]: release the
      FECs it owns, drop it from the worklists, and free it.  Only the
@@ -833,7 +920,13 @@ fd_rotor_publish( fd_rotor_t *      rotor,
       }
       fd_memset( fd_rotor_block_fecs( rotor, s ), 0xff, rotor->fec_blk_max*sizeof(uint) );
 
-      int survives = slot==new_root && ( !canonical || s==canonical );
+      /* Trace a pruned version that replay never got in full, or that
+         lost to the rooted version of its slot. */
+      int survives  = slot==new_root && ( !canonical || s==canonical );
+      int delivered = s->complete_idx!=UINT_MAX && s->delivered_idx==s->complete_idx;
+      if( FD_UNLIKELY( !survives && ( s->abandoned || !delivered || slot==new_root ) ) ) {
+        FD_TRACE( "rotor prune slot=%lu block=%s turbine=%d abandoned=%d connected=%d complete=%d delivered=%d", slot, fd_trace_hash( b58, s->block_id.uc ), (int)s->turbine, (int)s->abandoned, (int)s->connected, (int)( s->complete_idx!=UINT_MAX && s->buffered_fec_idx==s->complete_idx ), delivered );
+      }
       if( FD_LIKELY( !survives ) ) {
         fd_block_map_ele_remove_fast( block_map, s, block_pool );
         fd_block_pool_ele_release( block_pool, s );
@@ -867,7 +960,7 @@ fd_rotor_publish( fd_rotor_t *      rotor,
                              it = fd_block_map_iter_next( it, block_map, block_pool ) ) {
       fd_rotor_blk_t * child = fd_block_map_iter_ele( it, block_map, block_pool );
       if( FD_UNLIKELY( fd_hash_eq( &child->parent_block_id, &s->block_id ) ) ) {
-        child->connected = 1;
+        block_connect( child, "parent_rooted" );
         rotor_advance( rotor, child );
       }
     }

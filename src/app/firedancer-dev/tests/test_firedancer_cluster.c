@@ -268,19 +268,34 @@ test_firedancer_cluster( ulong validator_cnt ) {
     FD_LOG_NOTICE(( "%s pid %d", name, children[ child_cnt ].pid ));
     child_cnt++;
   }
+  ulong probe_cnt = 0UL;
   for( ulong i=0UL; i<validator_cnt; i++ ) {
+    /* A twin reuses an earlier config's identity: it produces that
+       validator's leader slots too, so its blocks equivocate, and it
+       may fall behind for the same reason.  Run it, but do not require
+       it to root. */
+    ulong twin_of = ULONG_MAX;
+    for( ulong j=0UL; j<i; j++ ) {
+      if( !strcmp( cluster_configs[ j ]->paths.identity_key, cluster_configs[ i ]->paths.identity_key ) ) { twin_of = j; break; }
+    }
+    if( FD_UNLIKELY( twin_of!=ULONG_MAX ) ) {
+      FD_LOG_NOTICE(( "%s is a twin of %s: running it without a root probe", cluster_configs[ i ]->name, cluster_configs[ twin_of ]->name ));
+      continue;
+    }
+
     char * name = cluster_child_name[ child_cnt ];
     FD_TEST( fd_cstr_printf_check( name, sizeof(cluster_child_name[ 0 ]), NULL, "probe %s", cluster_configs[ i ]->name ) );
     children    [ child_cnt ] = fork_child( name, cluster_configs[ i ], cluster_probe );
     is_validator[ child_cnt ] = 0;
     child_cnt++;
+    probe_cnt++;
   }
 
   /* Every probe must finish and no validator may.  wait_children closes
      the pipe of whichever child it reports, so drop that child from the
      set before waiting again. */
 
-  for( ulong done=0UL; done<validator_cnt; done++ ) {
+  for( ulong done=0UL; done<probe_cnt; done++ ) {
     ulong exited = wait_children( children, child_cnt, cluster_timeout_s+60UL );
     if( FD_UNLIKELY( is_validator[ exited ] ) )
       FD_LOG_ERR(( "%s exited before the cluster rooted slot %lu", children[ exited ].name, cluster_root_slot ));

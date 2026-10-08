@@ -265,6 +265,66 @@ test_timeouts_interleaved( void ) {
   teardown_votor( votor );
 }
 
+/* Standstill re-broadcasts start at 4s and back off to 10s. */
+
+static void
+test_standstill_backoff( void ) {
+  long delay = AG_DELTA_STANDSTILL_MIN_NS;
+  FD_TEST( delay==4000000000L );
+  delay = ag_standstill_next_delay( delay ); FD_TEST( delay== 8000000000L );
+  delay = ag_standstill_next_delay( delay ); FD_TEST( delay==AG_DELTA_STANDSTILL_NS );
+  delay = ag_standstill_next_delay( delay ); FD_TEST( delay==AG_DELTA_STANDSTILL_NS );
+  FD_TEST( AG_DELTA_STANDSTILL_MIN_NS > 2L*AG_SLOTS_PER_WINDOW*400000000L ); /* above two skipped windows */
+}
+
+/* A leader window's timeouts use the slot duration of the epoch that
+   holds the window.  The votor learns the next epoch's duration up to
+   an epoch early.  When it timed every window with the newest epoch's
+   shorter slots, the last slots of each window timed out before their
+   blocks arrived. */
+
+static void
+test_timeouts_use_window_epoch_slot_duration( void ) {
+  ag_votor_t * votor = setup_votor( 0L );
+  ag_votor_advance_epoch( votor, TEST_NS_PER_SLOT/2L, 0UL, 8UL*AG_SLOTS_PER_WINDOW, g_bls_selector[0] );
+
+  /* let the boot window time out */
+  handle_timeouts( votor, TEST_WINDOW_ELAPSED_NS );
+  for( ulong s=1UL; s<AG_SLOTS_PER_WINDOW; s++ ) FD_TEST( recv( votor ).kind==AG_VOTE_KIND_SKIP );
+  FD_TEST_NO_MSG( votor );
+
+  /* the second window becomes ready, and its first two blocks arrive
+     in time */
+  long          now    = TEST_WINDOW_ELAPSED_NS;
+  ulong         slot   = AG_SLOTS_PER_WINDOW;
+  ag_block_id_t parent = random_block_id( slot-1UL );
+  ag_pool_event_t parent_ready = { .kind = AG_POOL_EVENT_PARENT_READY };
+  parent_ready.parent_ready.slot   = slot;
+  parent_ready.parent_ready.parent = parent;
+  ag_votor_handle_pool_event( votor, &parent_ready, now );
+  ag_vote_t       parent_vote = ag_vote_construct_notar( sec_sign_fn, &g_sk[0], test_bls_public_key, parent.slot, parent.hash, 0, TEST_SHRED_VERSION );
+  ag_pool_event_t parent_cert = { .kind = AG_POOL_EVENT_CERT_CREATED, .cert_created = cert_build_notar_fallback( &parent_vote.notar, 1UL, NULL, 0UL, g_epoch_info ) };
+  ag_votor_handle_pool_event( votor, &parent_cert, now ); /* the votor tracks parent readiness over the certs */
+  ag_vote_t vote = send_block_and_expect_notar( votor, slot, &parent );
+  parent = ag_block_id( slot, vote.notar.block_hash );
+  send_block_and_expect_notar( votor, slot+1UL, &parent );
+
+  /* the third slot times out three of this epoch's slots after the
+     timeout delay, not three of the next epoch's */
+  long deadline = now + AG_DELTA_TIMEOUT_NS + 3L*TEST_NS_PER_SLOT;
+  handle_timeouts( votor, deadline-1L );
+  FD_TEST_NO_MSG( votor );
+  handle_timeouts( votor, deadline );
+  for( ulong s=slot+2UL; s<slot+AG_SLOTS_PER_WINDOW; s++ ) {
+    ag_vote_t msg = recv( votor );
+    FD_TEST( msg.kind==AG_VOTE_KIND_SKIP );
+    FD_TEST( ag_vote_slot( &msg )==s );
+  }
+  FD_TEST_NO_MSG( votor );
+
+  teardown_votor( votor );
+}
+
 /* Booting mid-window must not skip the slots below the boot slot */
 
 static void
@@ -748,6 +808,8 @@ main( int     argc,
 
   test_timeouts();
   test_timeouts_interleaved();
+  test_standstill_backoff();
+  test_timeouts_use_window_epoch_slot_duration();
   test_boot_mid_window();
   test_notar_and_final();
   test_notar_out_of_order();

@@ -961,6 +961,30 @@ test_reward_cert_signer_count( void ) {
   FD_LOG_NOTICE(( "pass: test_reward_cert_signer_count" ));
 }
 
+/* A leader grant can arrive after the root has passed its parent, when
+   a block footer's finality cert advanced the root first.  Leading
+   that slot would never end (rotor drops our FEC sets at or below its
+   root), so the grant must be dropped. */
+
+static void
+test_leader_grant_below_root_dropped( void ) {
+  static fd_replay_tile_t ctx[ 1 ];
+  fd_memset( ctx, 0, sizeof(fd_replay_tile_t) );
+  ctx->alpenglow                 = 1;
+  ctx->wfs_complete              = 1;
+  ctx->replay_out->idx           = 0UL;
+  ctx->consensus_root_slot       = 48UL;
+  ctx->votor_leader->slot        = 40UL;
+  ctx->votor_leader->parent_slot = 39UL;
+  ctx->next_leader_slot          = 40UL;
+
+  FD_TEST( !try_become_leader_ag( ctx, NULL ) );
+  FD_TEST( ctx->next_leader_slot==ULONG_MAX );
+  FD_TEST( !ctx->is_leader );
+
+  FD_LOG_NOTICE(( "pass: test_leader_grant_below_root_dropped" ));
+}
+
 static void
 test_snapshot_intervals_use_block_height( void ) {
   static fd_replay_tile_t ctx[ 1 ];
@@ -5067,6 +5091,7 @@ main( int     argc,
   test_leader_fec_payload_retained( wksp );          fd_wksp_reset( wksp, 42U );
   test_reception_metrics_sidecar( wksp );           fd_wksp_reset( wksp, 42U );
   test_reward_cert_signer_count();
+  test_leader_grant_below_root_dropped();
   test_snapshot_intervals_use_block_height();
   test_snapshot_found_deleted_state( wksp );        fd_wksp_reset( wksp, 42U );
   test_delinquent_classifier();

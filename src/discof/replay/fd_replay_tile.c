@@ -5,6 +5,7 @@
 
 #include "fd_replay_tile.h"
 #include "fd_replay_tile_private.h"
+#include "../../disco/fd_trace.h"
 #include "../../ballet/bls/fd_bls12_381.h"
 #include "fd_sched.h"
 #include "fd_execrp.h"
@@ -1072,9 +1073,19 @@ try_advance_root_ag( fd_replay_tile_t * ctx,
   if( FD_LIKELY( ancestor_block_id.slot==ctx->consensus_root_slot && !memcmp( ancestor_block_id.hash, ctx->consensus_root.uc, sizeof(fd_hash_t) ) ) ) {
     ctx->consensus_root_slot = finalized_block_id.slot;
     memcpy( ctx->consensus_root.uc, finalized_block_id.hash, sizeof(fd_hash_t) );
-    if( FD_UNLIKELY( ctx->next_leader_slot!=ULONG_MAX && finalized_block_id.slot>ctx->votor_leader->parent_slot ) ) ctx->next_leader_slot = ULONG_MAX;
+    char b58[ FD_BASE58_ENCODED_32_SZ ];
+    FD_TRACE( "replay root slot=%lu block=%s", finalized_block_id.slot, fd_trace_hash( b58, finalized_block_id.hash ) );
+    if( FD_UNLIKELY( ctx->next_leader_slot!=ULONG_MAX && finalized_block_id.slot>ctx->votor_leader->parent_slot ) ) {
+      FD_TRACE( "replay leader_drop slot=%lu parent_slot=%lu finalized=%lu", ctx->next_leader_slot, ctx->votor_leader->parent_slot, finalized_block_id.slot );
+      ctx->next_leader_slot = ULONG_MAX;
+    }
     return;
   }
+
+  /* The finalized block is not replayed yet, or not on our root. */
+
+  char b58[ FD_BASE58_ENCODED_32_SZ ];
+  FD_TRACE( "replay finalized_ahead slot=%lu block=%s root=%lu stop_slot=%lu", finalized_block_id.slot, fd_trace_hash( b58, finalized_block_id.hash ), ctx->consensus_root_slot, ancestor_block_id.slot );
 
     /* When a block id is finalized ahead of replay, we need to cache it
        and process it when replay catches up.  Certificates can arrive
@@ -1124,6 +1135,9 @@ publish_slot_completed( fd_replay_tile_t *        ctx,
   fd_hash_t const * bank_hash  = &bank->f.bank_hash;
   fd_hash_t const * block_hash = fd_blockhashes_peek_last_hash( &bank->f.block_hash_queue );
   FD_TEST( block_hash );
+
+  char b58[ FD_BASE58_ENCODED_32_SZ ], parent_b58[ FD_BASE58_ENCODED_32_SZ ];
+  FD_TRACE( "replay block_done slot=%lu block=%s parent_slot=%lu parent=%s bank=%lu leader=%d initial=%d", slot, fd_trace_hash( b58, block_id.uc ), bank->f.parent_slot, fd_trace_hash( parent_b58, parent_block_id.uc ), bank->idx, is_leader, is_initial );
 
   if( FD_LIKELY( !is_initial ) ) fd_txncache_finalize_fork( ctx->txncache, bank->txncache_fork_id, 0UL, block_hash->uc );
 
@@ -1582,6 +1596,25 @@ publish_leader_footer( fd_replay_tile_t *        ctx,
    1. no more PoH-hashing and 2. picking the reset bank is based on
    ParentReady rather than fork choice. */
 
+/* leader_wait_why returns why we cannot lead next_leader_slot yet, for
+   tracing. */
+
+static char const *
+leader_wait_why( fd_replay_tile_t * ctx ) {
+  fd_block_id_ele_t * ele  = fd_block_id_ele_query( ctx, &ctx->votor_leader->parent_block_id, ctx->votor_leader->parent_slot );
+  fd_bank_t *         bank = ele ? fd_banks_bank_query( ctx->banks, fd_block_id_ele_get_idx( ctx->block_id_arr, ele ) ) : NULL;
+  if( ctx->next_leader_slot==ULONG_MAX )                                             return "dropped";
+  if( ctx->is_leader )                                                                return "leading";
+  if( ctx->replay_out->idx==ULONG_MAX )                                               return "no_replay_out";
+  if( !ctx->wfs_complete )                                                            return "wfs_incomplete";
+  if( !ele )                                                                          return "parent_unknown";
+  if( !bank || bank->bank_seq!=ele->bank_seq || bank->state!=FD_BANK_STATE_FROZEN ) return "parent_not_frozen";
+  if( !fd_banks_can_start_bank( ctx->banks ) )                                        return "banks_full";
+  if( ctx->halt_replay )                                                              return "halt_replay";
+  if( !ctx->supports_leader )                                                         return "no_leader_support";
+  return "unknown";
+}
+
 static inline int
 try_become_leader_ag( fd_replay_tile_t *  ctx,
                       fd_stem_context_t * stem ) {
@@ -1598,6 +1631,18 @@ try_become_leader_ag( fd_replay_tile_t *  ctx,
 
   ulong             parent_slot     = ctx->votor_leader->parent_slot;
   fd_hash_t const * parent_block_id = &ctx->votor_leader->parent_block_id;
+
+  /* try_advance_root_ag drops a grant whose parent the root passes,
+     but the root can also pass the parent before the grant arrives
+     (e.g. from a block footer's finality cert).  Such a block can
+     never be finalized, and rotor drops FEC sets at or below its root,
+     our own included, so we would never see our block id and never
+     leave the leader state. */
+  if( FD_UNLIKELY( ctx->consensus_root_slot!=ULONG_MAX && parent_slot<ctx->consensus_root_slot ) ) {
+    FD_TRACE( "replay leader_drop slot=%lu parent_slot=%lu finalized=%lu", ctx->next_leader_slot, parent_slot, ctx->consensus_root_slot );
+    ctx->next_leader_slot = ULONG_MAX;
+    return 0;
+  }
 
   fd_block_id_ele_t * block_id_ele = fd_block_id_ele_query( ctx, parent_block_id, parent_slot );
   if( FD_UNLIKELY( !block_id_ele ) ) return 0;
@@ -1683,6 +1728,8 @@ try_become_leader_ag( fd_replay_tile_t *  ctx,
   FD_LOG_INFO(( "becoming leader for slot %lu, parent slot is %lu", ctx->next_leader_slot, ctx->reset_slot ));
 
   fd_bank_t * bank = prepare_leader_bank( ctx, reset_bank, ctx->next_leader_slot, now_nanos );
+  char b58[ FD_BASE58_ENCODED_32_SZ ];
+  FD_TRACE( "replay leader_start slot=%lu parent_slot=%lu parent=%s bank=%lu", ctx->next_leader_slot, parent_slot, fd_trace_hash( b58, parent_block_id->uc ), bank->idx );
 
   fd_bundle_crank_tip_payment_config_t config[1] = { 0 };
   fd_pubkey_t tip_receiver_owner = {0};
@@ -2911,6 +2958,9 @@ mark_bank_dead( fd_replay_tile_t *        ctx,
 
   fd_block_id_ele_t * block_id_ele = &ctx->block_id_arr[ bank_idx ];
   if( block_id_ele->block_id_seen ) publish_slot_dead( ctx, stem, block_id_ele->slot, ctx->alpenglow ? &block_id_ele->dmr : &block_id_ele->latest_mr, footer );
+  /* Reasons are FD_EVENT_BLOCK_COMPLETED_{DEAD,ABANDONED}_REASON_*. */
+  char b58[ FD_BASE58_ENCODED_32_SZ ];
+  FD_TRACE( "replay %s slot=%lu block=%s bank=%lu dead_reason=%d abandoned_reason=%d dead_banks=%lu", abandoned_reason!=FD_EVENT_BLOCK_COMPLETED_ABANDONED_REASON_NOT_ABANDONED ? "block_abandoned" : "block_dead", block_id_ele->slot, fd_trace_hash( b58, block_id_ele->block_id_seen ? block_id_ele->dmr.uc : NULL ), bank_idx, dead_reason, abandoned_reason, dead_idxs_cnt );
 
   /* Report each newly dead bank now (dead_idxs excludes already-dead,
      already-reported subtrees): the failing bank with its real reason and
@@ -2962,6 +3012,7 @@ try_replay( fd_replay_tile_t *  ctx,
 
   switch( task->task_type ) {
     case FD_SCHED_TT_BLOCK_START: {
+      FD_TRACE( "replay exec_start slot=%lu bank=%lu parent_bank=%lu", task->block_start->slot, task->block_start->bank_idx, task->block_start->parent_bank_idx );
       replay_block_start( ctx, task->block_start->bank_idx, task->block_start->parent_bank_idx, task->block_start->slot );
       fd_sched_task_done( ctx->sched, FD_SCHED_TT_BLOCK_START, ULONG_MAX, ULONG_MAX, NULL );
       break;
@@ -3141,7 +3192,10 @@ can_process_rotor_fec( fd_replay_tile_t      * ctx,
       ag_block_id_t self_key = { .slot = fec->slot };
       self = live_block_id_ele( ctx, fd_ag_block_id_map_ele_query( ctx->ag_block_id_map, &self_key, NULL, ctx->block_id_arr ) );
     }
-    if( FD_UNLIKELY( self && ( self->block_id_seen || self->latest_fec_idx>=fec->fec_set_idx ) ) ) return PROCESS_FEC_SKIP;
+    if( FD_UNLIKELY( self && ( self->block_id_seen || self->latest_fec_idx>=fec->fec_set_idx ) ) ) {
+      FD_TRACE( "replay fec_skip slot=%lu fec=%u why=replayed block_id_seen=%d latest_fec=%u", fec->slot, fec->fec_set_idx, (int)self->block_id_seen, self->latest_fec_idx );
+      return PROCESS_FEC_SKIP;
+    }
   }
 
   ulong               parent_bank_idx = UINT_MAX;
@@ -3158,6 +3212,7 @@ can_process_rotor_fec( fd_replay_tile_t      * ctx,
          past -- and the latter two are routine and recoverable, so do
          not emit events; they would be emitted in bulk during the
          redelivery that recovers them. */
+      FD_TRACE( "replay fec_drop slot=%lu fec=%u parent_slot=%lu parent=%s why=parent_unknown", fec->slot, fec->fec_set_idx, fec->parent_slot, parent_key_b58 );
       ctx->metrics.parent_unavailable++;
       return PROCESS_FEC_DROP;
     }
@@ -3170,6 +3225,7 @@ can_process_rotor_fec( fd_replay_tile_t      * ctx,
     if( FD_UNLIKELY( !parent ) ) {
       FD_BASE58_ENCODE_32_BYTES( fec->block_id.uc, block_id_b58 );
       FD_LOG_INFO(( "parent bank not found for slot %lu fec set idx %u slot_bid %s. parent slot %lu", fec->slot, fec->fec_set_idx, block_id_b58, fec->parent_slot ));
+      FD_TRACE( "replay fec_drop slot=%lu fec=%u block=%s why=block_unknown", fec->slot, fec->fec_set_idx, block_id_b58 );
       ctx->metrics.parent_unavailable++;
       return PROCESS_FEC_DROP; // either pruned or bank evicted
     }
@@ -3239,6 +3295,7 @@ can_process_rotor_fec( fd_replay_tile_t      * ctx,
   int invalid_parent = !parent_fec_bank || parent_fec_bank->bank_seq!=parent->bank_seq;
   if( FD_UNLIKELY( invalid_parent ) ) {
     FD_LOG_INFO(( "parent bank evicted for slot %lu fec set idx %u, parent slot %lu", fec->slot, fec->fec_set_idx, fec->parent_slot ));
+    FD_TRACE( "replay fec_drop slot=%lu fec=%u parent_slot=%lu why=parent_evicted", fec->slot, fec->fec_set_idx, fec->parent_slot );
     ctx->metrics.parent_unavailable++;
     return PROCESS_FEC_DROP;
   } else if( FD_UNLIKELY( fec->fec_set_idx!=0U && parent->latest_fec_idx!=fec->fec_set_idx - FD_FEC_SHRED_CNT ) ) {
@@ -3247,6 +3304,7 @@ can_process_rotor_fec( fd_replay_tile_t      * ctx,
        and then requested redelivery from rotor. Then we can skip
        replaying the first half of the slot. */
     FD_LOG_INFO(( "fec redelivered for slot %lu fec set idx %u, parent slot %lu. bank_idx %lu, latest_fec_idx %u", fec->slot, fec->fec_set_idx, fec->parent_slot, fd_block_id_ele_get_idx( ctx->block_id_arr, parent ), parent->latest_fec_idx ));
+    FD_TRACE( "replay fec_skip slot=%lu fec=%u why=not_next latest_fec=%u", fec->slot, fec->fec_set_idx, parent->latest_fec_idx );
     return PROCESS_FEC_SKIP; // context for slot exists, but this is an earlier or non-contiguous FEC. Safe to skip.
   }
 
@@ -4369,6 +4427,13 @@ process_rotor_fec( fd_replay_tile_t      * ctx,
     ctx->catch_up_tip_advance_cnt++;
   }
 
+  /* A leader FEC arriving after its slot was aborted (or after a later
+     leadership began) has no bank to bind to; drop it. */
+  if( FD_UNLIKELY( fec->is_leader && ( !ctx->leader_bank || ctx->leader_bank->f.slot!=fec->slot ) ) ) {
+    FD_TRACE( "replay fec_drop slot=%lu fec=%u why=leader_slot_over", fec->slot, fec->fec_set_idx );
+    return;
+  }
+
   ulong parent_bank_idx = ULONG_MAX;
   if( FD_UNLIKELY( fec->fec_set_idx==0 ) ) {
     ag_block_id_t parent_key = ag_block_id( fec->parent_slot, fec->parent_block_id.uc );
@@ -4398,6 +4463,7 @@ process_rotor_fec( fd_replay_tile_t      * ctx,
 
   if( FD_UNLIKELY( parent_bank->state==FD_BANK_STATE_DEAD ) ) {
     FD_LOG_WARNING(( "parent bank is dead for slot %lu, fec set idx %u, parent slot %lu, dropping", fec->slot, fec->fec_set_idx, fec->parent_slot ));
+    FD_TRACE( "replay fec_drop slot=%lu fec=%u parent_slot=%lu why=parent_dead", fec->slot, fec->fec_set_idx, fec->parent_slot );
     return;
   }
 
@@ -4420,6 +4486,7 @@ process_rotor_fec( fd_replay_tile_t      * ctx,
     ctx->metrics.store_query_missing_mr = fec->mr.ul[0];
     FD_BASE58_ENCODE_32_BYTES( fec->mr.key, key_b58 );
     FD_LOG_INFO(( "store fec for slot: %lu unavailable (pruned by publish); abandoning slice. root: %lu. merkle: %s", fec->slot, ctx->consensus_root_slot, key_b58 ));
+    FD_TRACE( "replay fec_drop slot=%lu fec=%u root=%08x why=not_in_store", fec->slot, fec->fec_set_idx, fd_trace_root4( fec->mr.uc ) );
     return;
   }
 
@@ -4459,6 +4526,12 @@ process_rotor_fec( fd_replay_tile_t      * ctx,
   }
 
   block_id_ele->latest_mr = fec->mr;
+
+  char b58[ FD_BASE58_ENCODED_32_SZ ];
+  if( FD_UNLIKELY( fec->fec_set_idx==0U ) ) {
+    FD_TRACE( "replay block_start slot=%lu bank=%lu parent_slot=%lu parent=%s parent_bank=%lu known_id=%d leader=%d", fec->slot, bank->idx, fec->parent_slot, fd_trace_hash( b58, fec->parent_block_id.uc ), parent_bank_idx, (int)fec->known_id, (int)fec->is_leader );
+  }
+  FD_TRACE( "replay fec slot=%lu fec=%u root=%08x bank=%lu last=%d block=%s", fec->slot, fec->fec_set_idx, fd_trace_root4( fec->mr.uc ), bank->idx, (int)fec->slot_complete, fd_trace_hash( b58, fec->slot_complete || fec->known_id ? fec->block_id.uc : NULL ) );
 
   if( FD_UNLIKELY( ctx->report_runtime_diffs && block_id_ele->fec_cnt<FD_FEC_BLK_MAX ) ) {
     ctx->fec_chain[ bank->idx*FD_FEC_BLK_MAX + block_id_ele->fec_cnt ] = fec->mr;
@@ -5077,7 +5150,9 @@ returnable_frag( fd_replay_tile_t *  ctx,
         fd_votor_leader_t const * leader = fd_chunk_to_laddr( ctx->in[ in_idx ].mem, chunk );
         *ctx->votor_leader    = *leader;
         ctx->next_leader_slot = leader->slot;
-        try_become_leader_ag( ctx, stem );
+        int started = try_become_leader_ag( ctx, stem );
+        char b58[ FD_BASE58_ENCODED_32_SZ ];
+        FD_TRACE( "replay leader_grant slot=%lu parent_slot=%lu parent=%s now=%s", leader->slot, leader->parent_slot, fd_trace_hash( b58, leader->parent_block_id.uc ), started ? "started" : leader_wait_why( ctx ) );
       } else if( FD_LIKELY( sig==FD_VOTOR_SIG_CERTED ) ) {
         fd_votor_certed_t const * certed = fd_chunk_to_laddr( ctx->in[ in_idx ].mem, chunk );
         fd_votor_certed_t *       fin    = ctx->votor_final;
@@ -5129,9 +5204,13 @@ returnable_frag( fd_replay_tile_t *  ctx,
          and wedge recovery. */
       if( FD_UNLIKELY( ctx->drain_rotor_fecs ) ) {
         if( FD_LIKELY( res==PROCESS_FEC_OK ) ) {
+          FD_TRACE( "replay drain_exit slot=%lu fec=%u", fec->slot, fec->fec_set_idx );
           ctx->drain_rotor_fecs = 0; /* chain re-established, resume */
         }
-        else if( res!=PROCESS_FEC_WAIT ) return 0; /* swallow DROPs/SKIPs, do evict_banks if needed */
+        else if( res!=PROCESS_FEC_WAIT ) {
+          FD_TRACE( "replay drain_swallow slot=%lu fec=%u parent_slot=%lu result=%s", fec->slot, fec->fec_set_idx, fec->parent_slot, res==PROCESS_FEC_DROP ? "drop" : "skip" );
+          return 0; /* swallow DROPs/SKIPs, do evict_banks if needed */
+        }
       }
 
       switch( res ) {
@@ -5141,6 +5220,7 @@ returnable_frag( fd_replay_tile_t *  ctx,
         }
         case PROCESS_FEC_DROP: {
           /* enter drain state */
+          FD_TRACE( "replay drain_enter slot=%lu fec=%u parent_slot=%lu", fec->slot, fec->fec_set_idx, fec->parent_slot );
           ctx->drain_rotor_fecs = 1;
           publish_replay_out( ctx, stem, REPLAY_SIG_MISSING_FEC, 0 );
           return 0;
@@ -5156,6 +5236,9 @@ returnable_frag( fd_replay_tile_t *  ctx,
             }
 
             FD_LOG_WARNING(( "banks full, evicting bank (idx=%lu)", evictable_bank_idx ));
+            fd_block_id_ele_t const * evicted = &ctx->block_id_arr[ evictable_bank_idx ];
+            char b58[ FD_BASE58_ENCODED_32_SZ ];
+            FD_TRACE( "replay evict slot=%lu block=%s bank=%lu for_slot=%lu", evicted->slot, fd_trace_hash( b58, evicted->block_id_seen ? evicted->dmr.uc : NULL ), evictable_bank_idx, fec->slot );
 
             timing_slot_release( ctx, evictable_bank_idx );
 

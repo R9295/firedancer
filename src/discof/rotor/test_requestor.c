@@ -264,6 +264,66 @@ test_ancestry( fd_wksp_t * wksp ) {
   FD_LOG_NOTICE(( "pass: ancestry rungs" ));
 }
 
+/* Missing parent version: a verified block whose parent version is
+   absent asks ParentAndFecSetCount instead of Orphan once the rotor
+   holds another version of the parent slot.  Orphan's positional
+   answers for that slot conflict with the version held and are
+   dropped, so the block never connected and the chain behind it
+   stalled.  The verified answer creates the missing version, which is
+   then repaired by block id.  With no version of the parent slot held,
+   Orphan still comes first. */
+
+static void
+test_parent_version( fd_wksp_t * wksp ) {
+  fd_rotor_t       * rotor = rotor_setup( wksp );
+  fd_requestor_t   * r     = requestor_setup();
+  fd_rotor_request_t reqs[ REQ_MAX ]; ulong cnt;
+
+  fd_hash_t bid0 = mkhash( 100UL );
+  fd_rotor_init( rotor, 10UL, &bid0, NULL, NULL );
+  drain_rotor( rotor );
+
+  /* the rotor holds version x of slot 15 */
+  fd_hash_t r15x = mkhash( 1500UL );
+  shred( rotor, 15UL, 0U, 0, &r15x, 10UL, &bid0 );
+
+  /* slot 16 completes through turbine and names version a of 15 */
+  fd_hash_t bid15a = mkhash( 1510UL ), r16 = mkhash( 1600UL );
+  shred( rotor, 16UL, 0U, 0, &r16, 15UL, &bid15a );
+  fd_rotor_blk_t * s16 = fec_complete( rotor, 16UL, 0U, 1, &r16 );
+  FD_TEST( s16 && !fd_hash_check_zero( &s16->block_id ) );
+  fd_hash_t bid16 = s16->block_id;
+
+  /* its walk asks for the parent by block id */
+  FD_TEST( run_walk( r, rotor, 16UL, &bid16, reqs, &cnt )==FD_REQUESTOR_ADVANCE_REQUESTED_PARENT );
+  FD_TEST( cnt==1UL ); expect_req( &reqs[ 0 ], AG_REPAIR_KIND_PARENT_FEC_COUNT, 0U, &bid16, NULL );
+
+  /* the answer creates version a, which is then repaired by block id */
+  fd_rotor_blk_t * a = fd_rotor_verified_parent_fec_count( rotor, 16UL, &bid16, 1U, 15UL, &bid15a, 0L );
+  drain_rotor( rotor );
+  FD_TEST( a && a->slot==15UL && fd_hash_eq( &a->block_id, &bid15a ) );
+  FD_TEST( run_walk( r, rotor, 16UL, &bid16, reqs, &cnt )==FD_REQUESTOR_ADVANCE_DONE );
+  FD_TEST( run_walk( r, rotor, 15UL, &bid15a, reqs, &cnt )==FD_REQUESTOR_ADVANCE_REQUESTED_PARENT );
+  FD_TEST( cnt==1UL ); expect_req( &reqs[ 0 ], AG_REPAIR_KIND_PARENT_FEC_COUNT, 0U, &bid15a, NULL );
+
+  /* slot 18 names version b of 17, and no version of 17 is held */
+  fd_hash_t bid17b = mkhash( 1710UL ), r18 = mkhash( 1800UL );
+  shred( rotor, 18UL, 0U, 0, &r18, 17UL, &bid17b );
+  fd_rotor_blk_t * s18 = fec_complete( rotor, 18UL, 0U, 1, &r18 );
+  FD_TEST( s18 && !fd_hash_check_zero( &s18->block_id ) );
+  fd_hash_t bid18 = s18->block_id;
+  FD_TEST( run_walk( r, rotor, 18UL, &bid18, reqs, &cnt )==FD_REQUESTOR_ADVANCE_REQUESTED_PARENT );
+  FD_TEST( cnt==1UL ); expect_req( &reqs[ 0 ], FD_REPAIR_KIND_ORPHAN, 0U, NULL, NULL );
+
+  /* block_id_only asks every verified block's parent by block id */
+  fd_requestor_set_block_id_only( r, 1 );
+  FD_TEST( run_walk( r, rotor, 18UL, &bid18, reqs, &cnt )==FD_REQUESTOR_ADVANCE_REQUESTED_PARENT );
+  FD_TEST( cnt==1UL ); expect_req( &reqs[ 0 ], AG_REPAIR_KIND_PARENT_FEC_COUNT, 0U, &bid18, NULL );
+  fd_requestor_set_block_id_only( r, 0 );
+
+  FD_LOG_NOTICE(( "pass: missing parent version" ));
+}
+
 /* Verified block: ParentAndFecSetCount until parent and count are
    known, FecSetRoot for every set without an entry, then
    ShredForBlockId for every missing shred of sets whose sentinel has
@@ -385,10 +445,11 @@ main( int argc, char ** argv ) {
   fd_wksp_t * wksp      = fd_wksp_new_anonymous( fd_cstr_to_shmem_page_sz( _page_sz ), page_cnt, fd_shmem_cpu_idx( numa_idx ), "wksp", 0UL );
   FD_TEST( wksp );
 
-  test_turbine ( wksp );
-  test_ancestry( wksp );
-  test_verified( wksp );
-  test_moving  ( wksp );
+  test_turbine       ( wksp );
+  test_ancestry      ( wksp );
+  test_parent_version( wksp );
+  test_verified      ( wksp );
+  test_moving        ( wksp );
 
   FD_LOG_NOTICE(( "pass" ));
   fd_halt();

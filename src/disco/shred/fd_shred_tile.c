@@ -24,6 +24,7 @@
 #include "../keyguard/fd_keyguard.h"
 #include "../keyguard/fd_keyswitch.h"
 #include "../fd_disco.h"
+#include "../fd_trace.h"
 #include "../net/fd_net_tile.h"
 #include "fd_shred_dest_resolver.h"
 #include "../../flamenco/leaders/fd_leaders.h"
@@ -151,15 +152,56 @@ typedef union {
   fd_net_rx_bounds_t net_rx;
 } fd_shred_in_ctx_t;
 
+/* [development.shred.equivocate_pct] makes this validator equivocate
+   in some of its leader slots, for test clusters.  In such a slot the
+   shred tile builds every FEC set twice from the same entries.  It
+   keeps version A, which goes to the store and to replay like any
+   leader FEC set.  Version B differs only in the reference tick of its
+   data shreds, which replay does not read, so both versions replay to
+   the same result but have different merkle roots and block ids.
+   Version B is only signed and sent.  Each version goes to its share
+   of the additional leader destinations, see eqvoc_b_mask. */
+
+/* [development.shred.withhold_pct] makes this validator withhold part
+   of its block in some of its leader slots, for test clusters, see
+   withhold_mask.  The choice depends only on the slot and FEC set, so
+   a run with the same leader schedule withholds the same shreds. */
+
+#define WITHHOLD_SALT (0x5717d5a2c0ffee11UL)
+#define EQVOC_FEC_MIX_SALT (0x6d69786564666563UL)
+
+#define EQVOC_NONE (0)
+#define EQVOC_A    (1)
+#define EQVOC_B    (2)
+
+/* Version B FEC sets live in their own ring.  When equivocation is
+   enabled, before_frag takes a microblock only after every pending
+   sign request is answered, so this many sets are never in flight. */
+
+#define EQVOC_FEC_SET_CNT FD_SHRED_SIGN_PEND_MAX
+
+/* In a staggered equivocated slot the leader sends the majority version
+   of every FEC set first and holds the minority version, up to
+   EQVOC_HOLD_MAX FEC sets, until the slot's last FEC set is out.  The
+   majority then completes its version before any shred of the other
+   version reaches it, so the majority version can be certified and the
+   minority must repair it.  Sets past EQVOC_HOLD_MAX go out in step. */
+
+#define EQVOC_HOLD_MAX     (8UL)
+#define EQVOC_STAGGER_SALT (0x57a66e2ed5eed123UL)
+
+FD_STATIC_ASSERT( FD_TOPO_ADTL_DESTS_MAX<=64UL, eqvoc_b_mask );
+
 /* A leader FEC set whose sign request went out on shred_sign and has
    not been answered. */
 
 typedef struct {
-  ulong            fec_set_idx;
+  ulong            fec_set_idx;  /* in fec_sets, or in eqvoc_fec_sets for EQVOC_B */
   ulong            tsorig;
   ulong            txn_cnt;
   void const *     leader_bank;
   fd_bmtree_node_t merkle_root;
+  int              eqvoc;        /* EQVOC_{NONE,A,B} */
 } fd_shred_sign_pend_t;
 
 typedef struct {
@@ -339,6 +381,28 @@ typedef struct {
   /* Bank object that we receive from the PoH tile and pass on to
      the store tile for setting the block_id of a slot. */
   void const * leader_bank;
+
+  /* Equivocation state, see EQVOC_A.  Only tile 0 uses it.  eqvoc_slot
+     is the leader slot being equivocated, or ULONG_MAX.  The
+     eqvoc_send_* and eqvoc_out_* arrays mirror send_fec_set_idx and
+     out_merkle_roots for version B.  eqvoc_a_fec_set_idx is the signed
+     version A set that waits for its version B set, or ULONG_MAX. */
+  uint             eqvoc_pct;
+  uint             eqvoc_fec_mix_pct;
+  uint             withhold_pct;
+  ulong            withhold_slot; /* leader slot that withholds, or ULONG_MAX */
+  ulong            eqvoc_seed;
+  ulong            eqvoc_slot;
+  fd_shredder_t *  eqvoc_shredder;
+  fd_fec_set_t *   eqvoc_fec_sets;
+  ulong            eqvoc_fec_set_idx;
+  ulong            eqvoc_a_fec_set_idx;
+  ulong            eqvoc_send_fec_set_idx[ FD_SHRED_BATCH_FEC_SETS_MAX ];
+  ulong            eqvoc_send_fec_set_cnt;
+  fd_bmtree_node_t eqvoc_out_merkle_roots[ FD_SHRED_BATCH_FEC_SETS_MAX ];
+  uchar            eqvoc_chained_merkle_root[ FD_SHRED_MERKLE_ROOT_SZ ];
+  uchar *          eqvoc_hold;      /* EQVOC_HOLD_MAX*2*FD_FEC_SHRED_CNT shreds of FD_SHRED_MAX_SZ */
+  ulong            eqvoc_hold_cnt;  /* held minority FEC sets of eqvoc_slot */
 } fd_shred_ctx_t;
 
 /* shred features are generally considered active at the epoch *following*
@@ -385,6 +449,11 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
   l = FD_LAYOUT_APPEND( l, fd_stake_ci_align(),              fd_stake_ci_footprint()                 );
   l = FD_LAYOUT_APPEND( l, fd_fec_resolver_align(),          fec_resolver_footprint                  );
   l = FD_LAYOUT_APPEND( l, fd_shredder_align(),              fd_shredder_footprint()                 );
+  if( FD_UNLIKELY( tile->shred.equivocate_pct ) ) {
+    l = FD_LAYOUT_APPEND( l, fd_shredder_align(),            fd_shredder_footprint()                 );
+    l = FD_LAYOUT_APPEND( l, alignof(fd_fec_set_t),          EQVOC_FEC_SET_CNT*sizeof(fd_fec_set_t)  );
+    l = FD_LAYOUT_APPEND( l, 64UL,                           EQVOC_HOLD_MAX*2UL*FD_FEC_SHRED_CNT*FD_SHRED_MAX_SZ );
+  }
   return FD_LAYOUT_FINI( l, scratch_align() );
 }
 
@@ -478,14 +547,18 @@ before_frag( fd_shred_ctx_t * ctx,
     FD_TEST( sig!=0UL && sig<=USHORT_MAX );
     fd_shredder_set_shred_version    ( ctx->shredder, (ushort)sig );
     fd_fec_resolver_set_shred_version( ctx->resolver, (ushort)sig );
+    if( FD_UNLIKELY( ctx->eqvoc_shredder ) ) fd_shredder_set_shred_version( ctx->eqvoc_shredder, (ushort)sig );
     return 1;
   }
 
   if( FD_UNLIKELY( !ctx->shredder->shred_version ) ) return -1;
 
   if( FD_LIKELY( ctx->in_kind[ in_idx ]==IN_KIND_POH ) ) {
+    /* A microblock can complete a batch and need a sign request for
+       each of its FEC sets, and for each version B set too. */
+    ulong sign_reserve = FD_SHRED_BATCH_FEC_SETS_MAX << !!ctx->eqvoc_pct;
     if( FD_UNLIKELY( (fd_disco_poh_sig_pkt_type( sig )==POH_PKT_TYPE_MICROBLOCK) &
-                     (ctx->sign_pend_cnt+FD_SHRED_BATCH_FEC_SETS_MAX>FD_SHRED_SIGN_PEND_MAX) ) ) return -1;
+                     (ctx->sign_pend_cnt+sign_reserve>FD_SHRED_SIGN_PEND_MAX) ) ) return -1;
     ctx->poh_in_expect_seq = seq+1UL;
     return (int)(fd_disco_poh_sig_pkt_type( sig )!=POH_PKT_TYPE_MICROBLOCK) &
            (int)(fd_disco_poh_sig_pkt_type( sig )!=POH_PKT_TYPE_SHRED_EPOCH_MSG) &
@@ -508,6 +581,125 @@ before_frag( fd_shred_ctx_t * ctx,
     return sig!=REPLAY_SIG_ROOT_ADVANCED; /* only care about root_advanced messages */
   }
   return 0;
+}
+
+/* eqvoc_b_mask returns the additional leader destinations, one bit per
+   index, that get version B of equivocated slot slot.  Their count is
+   random in 1..n-1 and, like the set, changes from slot to slot.  An
+   even split leaves neither version enough notarize votes; an uneven
+   one lets the larger version be certified, so the smaller side must
+   repair a version it does not hold. */
+
+static ulong
+eqvoc_b_mask( fd_shred_ctx_t const * ctx,
+              ulong                  slot ) {
+  ulong n = ctx->adtl_dests_leader_cnt;
+  uchar idx[ FD_TOPO_ADTL_DESTS_MAX ];
+  for( ulong i=0UL; i<n; i++ ) idx[ i ] = (uchar)i;
+  ulong r    = ctx->eqvoc_seed ^ slot;
+  ulong cnt  = n>1UL ? 1UL + fd_ulong_hash( r^0x5bd1e995UL )%(n-1UL) : n;
+  ulong mask = 0UL;
+  for( ulong i=0UL; i<cnt; i++ ) { /* partial Fisher-Yates */
+    r = fd_ulong_hash( r+0x9e3779b97f4a7c15UL );
+    ulong j = i + r%(n-i);
+    uchar t = idx[ i ]; idx[ i ] = idx[ j ]; idx[ j ] = t;
+    mask |= 1UL<<idx[ i ];
+  }
+  return mask;
+}
+
+static int
+eqvoc_fec_mixed( fd_shred_ctx_t const * ctx,
+                 ulong                  slot ) {
+  return fd_ulong_hash( ctx->eqvoc_seed^slot^EQVOC_FEC_MIX_SALT )%100UL<(ulong)ctx->eqvoc_fec_mix_pct;
+}
+
+/* eqvoc_minority_mask returns the additional leader destinations of
+   the minority version of equivocated slot slot when the slot is
+   staggered (see EQVOC_HOLD_MAX), and 0 otherwise.  Half of the slots
+   that do not mix FEC sets and do not split evenly are staggered.
+   Version A also counts this validator. */
+
+static ulong
+eqvoc_minority_mask( fd_shred_ctx_t const * ctx,
+                     ulong                  slot,
+                     ulong                  b_mask ) {
+  if( eqvoc_fec_mixed( ctx, slot ) || fd_ulong_hash( ctx->eqvoc_seed^slot^EQVOC_STAGGER_SALT )&1UL ) return 0UL;
+  ulong n     = ctx->adtl_dests_leader_cnt;
+  ulong b_cnt = (ulong)fd_ulong_popcnt( b_mask );
+  ulong a_cnt = n - b_cnt + 1UL;
+  if( a_cnt==b_cnt ) return 0UL;
+  return b_cnt<a_cnt ? b_mask : ( fd_ulong_mask_lsb( (int)n ) & ~b_mask );
+}
+
+/* withhold_begin_slot decides whether the leader slot that starts
+   withholds part of its block.  An equivocated slot never does. */
+
+static void
+withhold_begin_slot( fd_shred_ctx_t * ctx,
+                     ulong            slot ) {
+  ctx->withhold_slot = ULONG_MAX;
+  if( FD_LIKELY( fd_ulong_hash( slot^WITHHOLD_SALT )%100UL>=(ulong)ctx->withhold_pct ) ) return;
+  if( FD_UNLIKELY( ctx->eqvoc_slot==slot ) ) return;
+  ctx->withhold_slot = slot;
+  FD_LOG_NOTICE(( "withholding part of leader slot %lu", slot ));
+  FD_TRACE( "shred withhold_slot slot=%lu", slot );
+}
+
+/* withhold_mask returns the shreds of FEC set fec_set_idx in slot that
+   the leader does not send, one bit per shred: bits 0..31 for the data
+   shreds and 32..63 for the parity shreds.  Half of the FEC sets of a
+   withholding slot lose 33 to 40 of their 64 shreds, more than erasure
+   coding can recover; the rest lose none. */
+
+static ulong
+withhold_mask( ulong slot,
+               ulong fec_set_idx ) {
+  ulong r = fd_ulong_hash( slot^WITHHOLD_SALT^( (fec_set_idx+1UL)<<32 ) );
+  if( r&1UL ) return 0UL;
+  FD_STATIC_ASSERT( 2UL*FD_FEC_SHRED_CNT==64UL, withhold_mask );
+  ulong cnt  = 33UL + (r>>1)%8UL;
+  ulong mask = 0UL;
+  for( ulong i=0UL; i<cnt; i++ ) { /* pick cnt distinct bits */
+    r = fd_ulong_hash( r+0x9e3779b97f4a7c15UL );
+    ulong b = r%64UL;
+    while( fd_ulong_extract_bit( mask, (int)b ) ) b = (b+1UL)%64UL;
+    mask |= 1UL<<b;
+  }
+  return mask;
+}
+
+/* eqvoc_begin_slot decides whether to equivocate in the leader slot
+   that starts.  It must run after chained_merkle_root holds the parent
+   block id, because version B chains from the same parent. */
+
+static void
+eqvoc_begin_slot( fd_shred_ctx_t * ctx,
+                  ulong            slot ) {
+  ctx->eqvoc_slot     = ULONG_MAX;
+  ctx->eqvoc_hold_cnt = 0UL; /* a held set of an earlier slot that never ended is dropped */
+  if( FD_LIKELY( fd_ulong_hash( ctx->eqvoc_seed^slot )%100UL>=(ulong)ctx->eqvoc_pct ) ) return;
+  ctx->eqvoc_slot = slot;
+  memcpy( ctx->eqvoc_chained_merkle_root, ctx->chained_merkle_root, FD_SHRED_MERKLE_ROOT_SZ );
+
+  ulong b_mask = eqvoc_b_mask( ctx, slot );
+  int   mixed  = eqvoc_fec_mixed( ctx, slot );
+  char  ports      [ 8UL*FD_TOPO_ADTL_DESTS_MAX+1UL ];
+  char  trace_ports[ 8UL*FD_TOPO_ADTL_DESTS_MAX+2UL ];
+  char * p = fd_cstr_init( ports       );
+  char * q = fd_cstr_init( trace_ports );
+  for( ulong j=0UL; j<ctx->adtl_dests_leader_cnt; j++ ) {
+    if( fd_ulong_extract_bit( b_mask, (int)j ) ) {
+      p = fd_cstr_append_printf( p, " %u", (uint)ctx->adtl_dests_leader[ j ].port );
+      q = fd_cstr_append_printf( q, q==trace_ports ? "%u" : ",%u", (uint)ctx->adtl_dests_leader[ j ].port );
+    }
+  }
+  if( FD_UNLIKELY( q==trace_ports ) ) q = fd_cstr_append_char( q, '-' );
+  fd_cstr_fini( p );
+  fd_cstr_fini( q );
+  FD_LOG_NOTICE(( "equivocating in leader slot %lu: FEC 0 version B goes to %d of %lu additional leader destinations, ports%s; mixed_fec=%d",
+                  slot, fd_ulong_popcnt( b_mask ), ctx->adtl_dests_leader_cnt, ports, mixed ));
+  FD_TRACE( "shred eqvoc_slot slot=%lu b_dests=%d dests=%lu b_ports=%s mixed_fec=%d staggered=%d", slot, fd_ulong_popcnt( b_mask ), ctx->adtl_dests_leader_cnt, trace_ports, mixed, !!eqvoc_minority_mask( ctx, slot, b_mask ) );
 }
 
 static void
@@ -646,7 +838,8 @@ during_frag( fd_shred_ctx_t * ctx,
   }
 
   if( FD_UNLIKELY( ctx->in_kind[ in_idx ]==IN_KIND_POH ) ) {
-    ctx->send_fec_set_cnt = 0UL;
+    ctx->send_fec_set_cnt       = 0UL;
+    ctx->eqvoc_send_fec_set_cnt = 0UL;
 
     if( FD_UNLIKELY( fd_disco_poh_sig_pkt_type( sig )==POH_PKT_TYPE_LEADER_BANK ) ) {
       /* Only one tile needs to act on this. Other tiles see the frag but
@@ -781,6 +974,9 @@ during_frag( fd_shred_ctx_t * ctx,
               memset( ctx->chained_merkle_root, 0, FD_SHRED_MERKLE_ROOT_SZ );
             }
           }
+          FD_TRACE( "shred leader_slot slot=%lu parent_slot=%lu chained_root=%08x", target_slot, target_slot-entry_meta->parent_offset, fd_trace_root4( ctx->chained_merkle_root ) );
+          if( FD_UNLIKELY( ctx->eqvoc_pct    ) ) eqvoc_begin_slot   ( ctx, target_slot );
+          if( FD_UNLIKELY( ctx->withhold_pct ) ) withhold_begin_slot( ctx, target_slot );
         }
       }
 
@@ -843,9 +1039,17 @@ alpenglow_marker:
           fd_memset( ctx->pending_batch.payload + ctx->pending_batch.pos, 0, padding_sz );
 
           if( FD_UNLIKELY( !writing_marker ) ) ctx->send_fec_set_cnt = 0UL; /* verbose */
+          if( FD_UNLIKELY( !writing_marker ) ) ctx->eqvoc_send_fec_set_cnt = 0UL;
           ctx->shredded_txn_cnt = ctx->pending_batch.txn_cnt;
 
           fd_shredder_init_batch( ctx->shredder, ctx->pending_batch.raw, batch_sz_padded, target_slot, entry_meta );
+
+          int eqvoc = ctx->eqvoc_slot==target_slot;
+          if( FD_UNLIKELY( eqvoc ) ) {
+            fd_entry_batch_meta_t eqvoc_meta = *entry_meta;
+            eqvoc_meta.reference_tick = ( entry_meta->reference_tick+1UL ) & FD_SHRED_DATA_REF_TICK_MASK;
+            fd_shredder_init_batch( ctx->eqvoc_shredder, ctx->pending_batch.raw, batch_sz_padded, target_slot, &eqvoc_meta );
+          }
 
           ulong pend_sz  = batch_sz_padded;
           ulong pend_idx = ctx->send_fec_set_cnt;
@@ -856,6 +1060,15 @@ alpenglow_marker:
             FD_TEST( fd_shredder_next_fec_set( ctx->shredder, out, chained_merkle_root ) );
             FD_TEST( pend_idx<FD_SHRED_BATCH_FEC_SETS_MAX );
             memcpy( ctx->out_merkle_roots[pend_idx].hash, chained_merkle_root, 32UL );
+
+            if( FD_UNLIKELY( eqvoc ) ) {
+              fd_fec_set_t * eqvoc_out = ctx->eqvoc_fec_sets + ctx->eqvoc_fec_set_idx;
+              FD_TEST( fd_shredder_next_fec_set( ctx->eqvoc_shredder, eqvoc_out, ctx->eqvoc_chained_merkle_root ) );
+              FD_TEST( ctx->eqvoc_send_fec_set_cnt==pend_idx );
+              memcpy( ctx->eqvoc_out_merkle_roots[ pend_idx ].hash, ctx->eqvoc_chained_merkle_root, 32UL );
+              ctx->eqvoc_send_fec_set_idx[ ctx->eqvoc_send_fec_set_cnt++ ] = ctx->eqvoc_fec_set_idx;
+              ctx->eqvoc_fec_set_idx = (ctx->eqvoc_fec_set_idx+1UL)%EQVOC_FEC_SET_CNT;
+            }
 
             out->data_shred_rcvd     = 0U;
             out->parity_shred_rcvd   = 0U;
@@ -872,6 +1085,7 @@ alpenglow_marker:
           }
 
           fd_shredder_fini_batch( ctx->shredder );
+          if( FD_UNLIKELY( eqvoc ) ) fd_shredder_fini_batch( ctx->eqvoc_shredder );
           shredding_timing += fd_tickcount();
 
           /* Update metrics */
@@ -1004,6 +1218,90 @@ send_shred( fd_shred_ctx_t                 * ctx,
   ctx->net_out_chunk = fd_dcache_compact_next( chunk, pkt_sz, ctx->net_out_chunk0, ctx->net_out_wmark );
 }
 
+/* eqvoc_send sends both versions of a FEC set of an equivocated leader
+   slot, each to the additional leader destinations of that version and
+   not through turbine.  The first shred of a FEC set that a validator
+   receives decides which version it keeps, so no validator may see a
+   shred of the other version first:
+
+   - It skips the turbine root of each shred.  With a fanout above the
+     cluster size, the root is the only validator that relays a shred
+     it receives, so it would relay its version to everyone at once.
+
+   - A root still recovers the shreds it was not sent and relays them,
+     which takes at least half of the FEC set.  Sending the two versions
+     shred by shred, in step, means every destination holds its own
+     version by then, and takes the relayed shreds as equivocation. */
+
+static void
+eqvoc_send( fd_shred_ctx_t *     ctx,
+            fd_stem_context_t *  stem,
+            fd_fec_set_t const * set_a,
+            fd_fec_set_t const * set_b,
+            ulong                tsorig ) {
+  fd_shred_t const * shreds[ 2 ][ 2UL*FD_FEC_SHRED_CNT ];
+  for( ulong i=0UL; i<FD_FEC_SHRED_CNT; i++ ) {
+    shreds[ 0 ][ i                  ] = set_a->data_shreds  [ i ].s;
+    shreds[ 0 ][ i+FD_FEC_SHRED_CNT ] = set_a->parity_shreds[ i ].s;
+    shreds[ 1 ][ i                  ] = set_b->data_shreds  [ i ].s;
+    shreds[ 1 ][ i+FD_FEC_SHRED_CNT ] = set_b->parity_shreds[ i ].s;
+  }
+
+  /* Both versions put the same shred indices in the same slot, so they
+     share turbine roots. */
+  ulong                 slot  = shreds[ 0 ][ 0 ]->slot;
+  fd_shred_dest_t *     sdest = fd_stake_ci_get_sdest_for_slot( ctx->stake_ci, slot );
+  fd_shred_dest_idx_t * roots = sdest ? fd_shred_dest_compute_first( sdest, shreds[ 0 ], 2UL*FD_FEC_SHRED_CNT, ctx->scratchpad_dests ) : NULL;
+
+  ulong fec_set_idx = shreds[ 0 ][ 0 ]->fec_set_idx;
+  ulong b_mask = fd_shred_tile_eqvoc_fec_dest_mask( eqvoc_b_mask( ctx, slot ),
+                                                    ctx->adtl_dests_leader_cnt,
+                                                    eqvoc_fec_mixed( ctx, slot ),
+                                                    fec_set_idx );
+  FD_TRACE( "shred eqvoc_fec slot=%lu fec=%lu b_dests=%d mixed_fec=%d", slot, fec_set_idx,
+            fd_ulong_popcnt( b_mask ), eqvoc_fec_mixed( ctx, slot ) );
+  /* A staggered slot holds the minority version while there is room. */
+  ulong minority = eqvoc_minority_mask( ctx, slot, b_mask );
+  ulong hold     = minority && ctx->eqvoc_hold_cnt<EQVOC_HOLD_MAX ? minority : 0UL;
+  if( FD_UNLIKELY( hold ) ) {
+    int     v   = !!( minority & b_mask ); /* 1 if version B is the minority */
+    uchar * dst = ctx->eqvoc_hold + ctx->eqvoc_hold_cnt*2UL*FD_FEC_SHRED_CNT*FD_SHRED_MAX_SZ;
+    for( ulong i=0UL; i<2UL*FD_FEC_SHRED_CNT; i++ ) fd_memcpy( dst+i*FD_SHRED_MAX_SZ, shreds[ v ][ i ], fd_shred_sz( shreds[ v ][ i ] ) );
+    ctx->eqvoc_hold_cnt++;
+  }
+  for( ulong i=0UL; i<2UL*FD_FEC_SHRED_CNT; i++ ) {
+    fd_shred_dest_weighted_t const * root = roots ? fd_shred_dest_idx_to_dest( sdest, roots[ i ] ) : NULL;
+    for( ulong j=0UL; j<ctx->adtl_dests_leader_cnt; j++ ) {
+      fd_shred_dest_weighted_t const * dest = ctx->adtl_dests_leader+j;
+      if( root && root->ip4==dest->ip4 && root->port==dest->port ) continue;
+      if( fd_ulong_extract_bit( hold, (int)j ) ) continue;
+      send_shred( ctx, stem, shreds[ fd_ulong_extract_bit( b_mask, (int)j ) ][ i ], dest, tsorig );
+    }
+  }
+
+  /* After the slot's last FEC set, release the held minority sets. */
+  int last = !!( shreds[ 0 ][ FD_FEC_SHRED_CNT-1UL ]->data.flags & FD_SHRED_DATA_FLAG_SLOT_COMPLETE );
+  if( FD_UNLIKELY( last && ctx->eqvoc_hold_cnt ) ) {
+    FD_TRACE( "shred eqvoc_release slot=%lu fecs=%lu dests=%d", slot, ctx->eqvoc_hold_cnt, fd_ulong_popcnt( minority ) );
+    for( ulong k=0UL; k<ctx->eqvoc_hold_cnt; k++ ) {
+      fd_shred_t const * held[ 2UL*FD_FEC_SHRED_CNT ];
+      uchar const *      src = ctx->eqvoc_hold + k*2UL*FD_FEC_SHRED_CNT*FD_SHRED_MAX_SZ;
+      for( ulong i=0UL; i<2UL*FD_FEC_SHRED_CNT; i++ ) held[ i ] = (fd_shred_t const *)fd_type_pun_const( src+i*FD_SHRED_MAX_SZ );
+      fd_shred_dest_idx_t * hroots = sdest ? fd_shred_dest_compute_first( sdest, held, 2UL*FD_FEC_SHRED_CNT, ctx->scratchpad_dests ) : NULL;
+      for( ulong i=0UL; i<2UL*FD_FEC_SHRED_CNT; i++ ) {
+        fd_shred_dest_weighted_t const * root = hroots ? fd_shred_dest_idx_to_dest( sdest, hroots[ i ] ) : NULL;
+        for( ulong j=0UL; j<ctx->adtl_dests_leader_cnt; j++ ) {
+          fd_shred_dest_weighted_t const * dest = ctx->adtl_dests_leader+j;
+          if( !fd_ulong_extract_bit( minority, (int)j ) ) continue;
+          if( root && root->ip4==dest->ip4 && root->port==dest->port ) continue;
+          send_shred( ctx, stem, held[ i ], dest, tsorig );
+        }
+      }
+    }
+    ctx->eqvoc_hold_cnt = 0UL;
+  }
+}
+
 /* Send the set's received (or, if received is 0, its produced and
    recovered) shreds to their turbine destinations: the leader's first
    hop, or our children. */
@@ -1017,11 +1315,14 @@ fan_out( fd_shred_ctx_t *     ctx,
          ulong                tsorig ) {
   ulong fanout = 200UL; /* Default Agave's DATA_PLANE_FANOUT = 200UL */
   fd_shred_t const * shreds[ FD_REEDSOL_DATA_SHREDS_MAX+FD_REEDSOL_PARITY_SHREDS_MAX ];
+  fd_shred_t const * first = set->data_shreds[ 0 ].s;
+  ulong withheld = is_leader && first->slot==ctx->withhold_slot ? withhold_mask( first->slot, first->fec_set_idx ) : 0UL;
+  if( FD_UNLIKELY( withheld ) ) FD_TRACE( "shred withhold_fec slot=%lu fec=%u withheld=%d", first->slot, first->fec_set_idx, fd_ulong_popcnt( withheld ) );
   ulong k=0UL;
   for( ulong i=0UL; i<FD_FEC_SHRED_CNT; i++ )
-    if( !!(set->data_shred_rcvd   & (1U<<i))==!!received ) shreds[ k++ ] = set->data_shreds  [ i ].s;
+    if( !!(set->data_shred_rcvd   & (1U<<i))==!!received && !fd_ulong_extract_bit( withheld, (int)i                  ) ) shreds[ k++ ] = set->data_shreds  [ i ].s;
   for( ulong i=0UL; i<FD_FEC_SHRED_CNT; i++ )
-    if( !!(set->parity_shred_rcvd & (1U<<i))==!!received ) shreds[ k++ ] = set->parity_shreds[ i ].s;
+    if( !!(set->parity_shred_rcvd & (1U<<i))==!!received && !fd_ulong_extract_bit( withheld, (int)(i+FD_FEC_SHRED_CNT) ) ) shreds[ k++ ] = set->parity_shreds[ i ].s;
 
   if( FD_UNLIKELY( !k ) ) return;
   fd_shred_dest_t * sdest = fd_stake_ci_get_sdest_for_slot( ctx->stake_ci, shreds[ 0 ]->slot );
@@ -1052,7 +1353,9 @@ fan_out( fd_shred_ctx_t *     ctx,
 }
 
 /* Finish a complete FEC set: fan it out to the network, copy it into
-   the store and tell repair and replay. */
+   the store and tell repair and replay.  eqvoc is EQVOC_A for version
+   A of an equivocated leader slot, which is not sent here but with its
+   version B set, see eqvoc_send, and EQVOC_NONE otherwise. */
 
 static void
 complete_fec_set( fd_shred_ctx_t *         ctx,
@@ -1060,6 +1363,7 @@ complete_fec_set( fd_shred_ctx_t *         ctx,
                   ulong                    fec_set_idx,
                   fd_bmtree_node_t const * merkle_root,
                   int                      is_leader,
+                  int                      eqvoc,
                   ulong                    tsorig,
                   ulong                    txn_cnt,
                   void const *             leader_bank ) {
@@ -1069,7 +1373,7 @@ complete_fec_set( fd_shred_ctx_t *         ctx,
 
   /* Broadcast locally produced and recovered shreds before any disk
      work. */
-  fan_out( ctx, stem, set, is_leader, 0, tsorig );
+  if( FD_LIKELY( eqvoc!=EQVOC_A ) ) fan_out( ctx, stem, set, is_leader, 0, tsorig );
 
   /* Compute merkle root and chained merkle root. */
 
@@ -1278,27 +1582,47 @@ after_frag( fd_shred_ctx_t *    ctx,
     ctx->sign_pend_head = (ctx->sign_pend_head+1UL)%FD_SHRED_SIGN_PEND_MAX;
     ctx->sign_pend_cnt--;
 
-    fd_fec_set_t * set = ctx->fec_sets + pend->fec_set_idx;
+    int            eqvoc = pend->eqvoc;
+    fd_fec_set_t * set   = eqvoc==EQVOC_B ? ctx->eqvoc_fec_sets + pend->fec_set_idx : ctx->fec_sets + pend->fec_set_idx;
     for( ulong i=0UL; i<FD_FEC_SHRED_CNT; i++ ) fd_memcpy( set->data_shreds  [ i ].s->signature, ctx->signature, FD_ED25519_SIG_SZ );
     for( ulong i=0UL; i<FD_FEC_SHRED_CNT; i++ ) fd_memcpy( set->parity_shreds[ i ].s->signature, ctx->signature, FD_ED25519_SIG_SZ );
-    complete_fec_set( ctx, stem, pend->fec_set_idx, &pend->merkle_root, 1, pend->tsorig, pend->txn_cnt, pend->leader_bank );
+    /* A version B set is signed right after its version A set, which
+       waits for it to be sent with it. */
+    fd_shred_t const * first = set->data_shreds[ 0 ].s;
+    FD_TRACE( "shred leader_fec slot=%lu fec=%u root=%08x version=%s last=%d", first->slot, first->fec_set_idx, fd_trace_root4( pend->merkle_root.hash ), eqvoc==EQVOC_A ? "A" : eqvoc==EQVOC_B ? "B" : "-", !!( set->data_shreds[ FD_FEC_SHRED_CNT-1 ].s->data.flags & FD_SHRED_DATA_FLAG_SLOT_COMPLETE ) );
+    if( FD_UNLIKELY( eqvoc==EQVOC_B ) ) {
+      FD_TEST( ctx->eqvoc_a_fec_set_idx!=ULONG_MAX );
+      eqvoc_send( ctx, stem, ctx->fec_sets + ctx->eqvoc_a_fec_set_idx, set, pend->tsorig );
+      ctx->eqvoc_a_fec_set_idx = ULONG_MAX;
+      return;
+    }
+    if( FD_UNLIKELY( eqvoc==EQVOC_A ) ) ctx->eqvoc_a_fec_set_idx = pend->fec_set_idx;
+    complete_fec_set( ctx, stem, pend->fec_set_idx, &pend->merkle_root, 1, eqvoc, pend->tsorig, pend->txn_cnt, pend->leader_bank );
     return;
   }
 
   if( FD_UNLIKELY( ctx->in_kind[ in_idx ]==IN_KIND_POH ) ) {
-    FD_TEST( ctx->sign_pend_cnt+ctx->send_fec_set_cnt<=FD_SHRED_SIGN_PEND_MAX );
+    /* Version B sets, if any, pair up with the version A sets.  Each B
+       set is signed right after its A set. */
+    FD_TEST( ctx->sign_pend_cnt+ctx->send_fec_set_cnt+ctx->eqvoc_send_fec_set_cnt<=FD_SHRED_SIGN_PEND_MAX );
+    FD_TEST( !ctx->eqvoc_send_fec_set_cnt || ctx->eqvoc_send_fec_set_cnt==ctx->send_fec_set_cnt );
     ulong txn_per_set = ctx->send_fec_set_cnt ? ctx->shredded_txn_cnt/ctx->send_fec_set_cnt : 0UL;
     for( ulong k=0UL; k<ctx->send_fec_set_cnt; k++ ) {
-      fd_shred_sign_pend_t * pend = ctx->sign_pend + (ctx->sign_pend_head+ctx->sign_pend_cnt++)%FD_SHRED_SIGN_PEND_MAX;
-      pend->fec_set_idx = ctx->send_fec_set_idx[ k ];
-      pend->tsorig      = ctx->tsorig;
-      pend->txn_cnt     = k+1UL<ctx->send_fec_set_cnt ? txn_per_set : ctx->shredded_txn_cnt-txn_per_set*(ctx->send_fec_set_cnt-1UL);
-      pend->leader_bank = ctx->leader_bank;
-      pend->merkle_root = ctx->out_merkle_roots[ k ];
+      for( int eqvoc_b=0; eqvoc_b<=!!ctx->eqvoc_send_fec_set_cnt; eqvoc_b++ ) {
+        fd_bmtree_node_t const * merkle_root = eqvoc_b ? ctx->eqvoc_out_merkle_roots+k : ctx->out_merkle_roots+k;
 
-      memcpy( fd_chunk_to_laddr( ctx->sign_out_mem, ctx->sign_out_chunk ), ctx->out_merkle_roots[ k ].hash, 32UL );
-      fd_stem_publish( stem, SIGN_OUT_IDX, FD_KEYGUARD_SIGN_TYPE_ED25519, ctx->sign_out_chunk, 32UL, 0UL, ctx->tsorig, fd_frag_meta_ts_comp( fd_tickcount() ) );
-      ctx->sign_out_chunk = fd_dcache_compact_next( ctx->sign_out_chunk, 32UL, ctx->sign_out_chunk0, ctx->sign_out_wmark );
+        fd_shred_sign_pend_t * pend = ctx->sign_pend + (ctx->sign_pend_head+ctx->sign_pend_cnt++)%FD_SHRED_SIGN_PEND_MAX;
+        pend->fec_set_idx = eqvoc_b ? ctx->eqvoc_send_fec_set_idx[ k ] : ctx->send_fec_set_idx[ k ];
+        pend->tsorig      = ctx->tsorig;
+        pend->txn_cnt     = k+1UL<ctx->send_fec_set_cnt ? txn_per_set : ctx->shredded_txn_cnt-txn_per_set*(ctx->send_fec_set_cnt-1UL);
+        pend->leader_bank = ctx->leader_bank;
+        pend->merkle_root = *merkle_root;
+        pend->eqvoc       = eqvoc_b ? EQVOC_B : fd_int_if( !!ctx->eqvoc_send_fec_set_cnt, EQVOC_A, EQVOC_NONE );
+
+        memcpy( fd_chunk_to_laddr( ctx->sign_out_mem, ctx->sign_out_chunk ), merkle_root->hash, 32UL );
+        fd_stem_publish( stem, SIGN_OUT_IDX, FD_KEYGUARD_SIGN_TYPE_ED25519, ctx->sign_out_chunk, 32UL, 0UL, ctx->tsorig, fd_frag_meta_ts_comp( fd_tickcount() ) );
+        ctx->sign_out_chunk = fd_dcache_compact_next( ctx->sign_out_chunk, 32UL, ctx->sign_out_chunk0, ctx->sign_out_wmark );
+      }
     }
     return;
   }
@@ -1354,6 +1678,15 @@ after_frag( fd_shred_ctx_t *    ctx,
     add_shred_timing      +=  fd_tickcount();
 
     fd_histf_sample( ctx->metrics->add_shred_timing, (ulong)add_shred_timing );
+    if( FD_UNLIKELY( shred->slot==ctx->eqvoc_slot ) ) {
+      uint src_ip4 = fd_disco_netmux_sig_ip( sig );
+      FD_TRACE( "shred eqvoc_net slot=%lu fec=%u idx=%u root=%08x src=" FD_IP4_ADDR_FMT "/%s result=%d",
+                shred->slot, shred->fec_set_idx, shred->idx, fd_trace_root4( ctx->out_merkle_roots[0].hash ),
+                FD_IP4_ADDR_FMT_ARGS( src_ip4 ), shred_source==FD_FEC_RESOLVER_SHRED_SRC_TURBINE ? "turbine" : "repair", rv );
+    }
+    if( FD_UNLIKELY( rv==FD_FEC_RESOLVER_SHRED_EQUIVOC ) ) {
+      FD_TRACE( "shred eqvoc_rx slot=%lu fec=%u idx=%u root=%08x src=%s", shred->slot, shred->fec_set_idx, shred->idx, fd_trace_root4( ctx->out_merkle_roots[0].hash ), shred_source==FD_FEC_RESOLVER_SHRED_SRC_TURBINE ? "turbine" : "repair" );
+    }
     ctx->metrics->shred_processing_result[ rv + FD_FEC_RESOLVER_ADD_SHRED_RETVAL_OFF+FD_SHRED_ADD_SHRED_EXTRA_RETVAL_CNT ]++;
 
     if( FD_UNLIKELY( ctx->shred_out_idx!=ULONG_MAX &&  /* Only send to repair in full Firedancer */
@@ -1420,7 +1753,7 @@ after_frag( fd_shred_ctx_t *    ctx,
     if( FD_LIKELY( rv!=FD_FEC_RESOLVER_SHRED_COMPLETES ) ) return;
 
     FD_TEST( ctx->fec_sets <= *out_fec_set );
-    complete_fec_set( ctx, stem, (ulong)(*out_fec_set - ctx->fec_sets), &ctx->out_merkle_roots[0], 0, ctx->tsorig, 0UL, NULL );
+    complete_fec_set( ctx, stem, (ulong)(*out_fec_set - ctx->fec_sets), &ctx->out_merkle_roots[0], 0, EQVOC_NONE, ctx->tsorig, 0UL, NULL );
   }
 }
 
@@ -1453,6 +1786,9 @@ privileged_init( fd_topo_t const *      topo,
     FD_LOG_CRIT(( "fd_rng_secure failed" ));
   }
   if( FD_UNLIKELY( !fd_rng_secure( &(ctx->shred_dest_seed), sizeof(ulong) ) ) ) {
+    FD_LOG_CRIT(( "fd_rng_secure failed" ));
+  }
+  if( FD_UNLIKELY( !fd_rng_secure( &(ctx->eqvoc_seed), sizeof(ulong) ) ) ) {
     FD_LOG_CRIT(( "fd_rng_secure failed" ));
   }
   /* This is only needed in frankendancer, but we'll overwrite it with
@@ -1581,6 +1917,14 @@ unprivileged_init( fd_topo_t const *      topo,
   void * _stake_ci = FD_SCRATCH_ALLOC_APPEND( l, fd_stake_ci_align(),              fd_stake_ci_footprint()            );
   void * _resolver = FD_SCRATCH_ALLOC_APPEND( l, fd_fec_resolver_align(),          fec_resolver_footprint             );
   void * _shredder = FD_SCRATCH_ALLOC_APPEND( l, fd_shredder_align(),              fd_shredder_footprint()            );
+  void * _eqvoc_shredder = NULL;
+  void * _eqvoc_fec_sets = NULL;
+  void * _eqvoc_hold     = NULL;
+  if( FD_UNLIKELY( tile->shred.equivocate_pct ) ) {
+    _eqvoc_shredder = FD_SCRATCH_ALLOC_APPEND( l, fd_shredder_align(),     fd_shredder_footprint()                );
+    _eqvoc_fec_sets = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_fec_set_t),   EQVOC_FEC_SET_CNT*sizeof(fd_fec_set_t) );
+    _eqvoc_hold     = FD_SCRATCH_ALLOC_APPEND( l, 64UL,                    EQVOC_HOLD_MAX*2UL*FD_FEC_SHRED_CNT*FD_SHRED_MAX_SZ );
+  }
 
   fd_fec_set_t * fec_sets  = (fd_fec_set_t *)fec_sets_shmem;
 
@@ -1641,6 +1985,32 @@ unprivileged_init( fd_topo_t const *      topo,
 
   fd_ip4_udp_hdr_init( ctx->data_shred_net_hdr,   FD_SHRED_MIN_SZ, 0, tile->shred.shred_listen_port );
   fd_ip4_udp_hdr_init( ctx->parity_shred_net_hdr, FD_SHRED_MAX_SZ, 0, tile->shred.shred_listen_port );
+
+  ctx->eqvoc_pct              = tile->shred.equivocate_pct;
+  ctx->eqvoc_fec_mix_pct      = tile->shred.equivocate_fec_mix_pct;
+  ctx->eqvoc_slot             = ULONG_MAX;
+  ctx->withhold_pct           = tile->shred.withhold_pct;
+  ctx->withhold_slot          = ULONG_MAX;
+  if( FD_UNLIKELY( ctx->withhold_pct && !ctx->round_robin_id ) )
+    FD_LOG_WARNING(( "development.shred.withhold_pct is %u: this validator withholds part of its block in that share of its leader slots", ctx->withhold_pct ));
+  ctx->eqvoc_shredder         = NULL;
+  ctx->eqvoc_fec_sets         = NULL;
+  ctx->eqvoc_hold             = _eqvoc_hold;
+  ctx->eqvoc_hold_cnt         = 0UL;
+  ctx->eqvoc_fec_set_idx      = 0UL;
+  ctx->eqvoc_a_fec_set_idx    = ULONG_MAX;
+  ctx->eqvoc_send_fec_set_cnt = 0UL;
+  if( FD_UNLIKELY( ctx->eqvoc_pct ) ) {
+    if( FD_UNLIKELY( !ctx->adtl_dests_leader_cnt ) )
+      FD_LOG_ERR(( "development.shred.equivocate_pct needs tiles.shred.additional_shred_destinations_leader to list the other validators" ));
+    ctx->eqvoc_shredder = NONNULL( fd_shredder_join( fd_shredder_new( _eqvoc_shredder ) ) );
+    if( FD_LIKELY( !!expected_shred_version ) ) fd_shredder_set_shred_version( ctx->eqvoc_shredder, expected_shred_version );
+    ctx->eqvoc_fec_sets = (fd_fec_set_t *)_eqvoc_fec_sets;
+    if( FD_LIKELY( !ctx->round_robin_id ) )
+      FD_LOG_WARNING(( "development.shred.equivocate_pct is %u: this validator equivocates in that share of its leader slots", ctx->eqvoc_pct ));
+    if( FD_UNLIKELY( ctx->eqvoc_fec_mix_pct && !ctx->round_robin_id ) )
+      FD_LOG_WARNING(( "development.shred.equivocate_fec_mix_pct is %u: this validator mixes versions across FEC sets in that share of equivocated slots", ctx->eqvoc_fec_mix_pct ));
+  }
 
   uchar has_contact_info_in = 0;
   for( ulong i=0UL; i<tile->in_cnt; i++ ) {

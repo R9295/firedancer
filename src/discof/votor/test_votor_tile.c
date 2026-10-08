@@ -1382,7 +1382,7 @@ test_park( void ) {
   after_credit( ctx, NULL, NULL, &charge_busy );
   FD_TEST( !charge_busy );
   /* The pass restarted the standstill clock, the only deadline left. */
-  FD_TEST( next_deadline( ctx )==fd_clock_tile_wallclock_to_tickcount( ctx->clock, ctx->standstill.ts+AG_DELTA_STANDSTILL_NS+1L ) );
+  FD_TEST( next_deadline( ctx )==fd_clock_tile_wallclock_to_tickcount( ctx->clock, ctx->standstill.ts+ctx->standstill.delay+1L ) );
   FD_TEST( rv->slot==5UL );
 
   reconn_prq_delete( reconn_prq_leave( ctx->reconn_prq ) );

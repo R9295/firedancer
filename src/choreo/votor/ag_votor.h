@@ -65,7 +65,9 @@ ag_votor_metrics( ag_votor_t const * self );
 /* ag_votor_advance_epoch is called at boot and the epoch boundary and
    updates the rank and BLS key that is used for voting.  A NULL bls
    pubkey will disable voting for the epoch corresponding to the
-   epoch_slot. */
+   epoch_slot.  ns_per_slot is that epoch's slot duration, which times
+   the skip timeouts of its leader windows.  ag_votor_init's
+   ns_per_slot only times windows in no known epoch. */
 
 void
 ag_votor_advance_epoch( ag_votor_t *       self,

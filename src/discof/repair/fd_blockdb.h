@@ -36,6 +36,8 @@ struct fd_blockdb_blk {
   uint             fec_set_cnt;
   uint             next; /* map chain */
   uint             prev; /* map chain */
+  uint             slot_next; /* same-slot multimap chain */
+  uint             slot_prev; /* same-slot multimap chain */
   uchar            merkle_roots[ FD_FEC_BLK_MAX ][ FD_SHRED_MERKLE_NODE_SZ ];
 };
 typedef struct fd_blockdb_blk fd_blockdb_blk_t;
@@ -45,6 +47,7 @@ struct fd_blockdb {
   ulong              seq;     /* total inserts, next slot is seq%ele_max */
   fd_blockdb_blk_t * ele;
   void *             map;
+  void *             slot_map;
   void *             tree;    /* scratch for building proofs */
 };
 typedef struct fd_blockdb fd_blockdb_t;
@@ -97,6 +100,23 @@ fd_blockdb_blk_t const *
 fd_blockdb_query( fd_blockdb_t const * blockdb,
                   ulong                slot,
                   fd_hash_t const *    block_id );
+
+/* fd_blockdb_query_slot returns any completed version of slot, or NULL. */
+
+fd_blockdb_blk_t const *
+fd_blockdb_query_slot( fd_blockdb_t const * blockdb,
+                       ulong                slot );
+
+/* fd_blockdb_query_alternate_root returns another completed version of
+   slot whose FEC root at leaf_idx differs from root.  Returns NULL when
+   no such version is known.  The pointer is invalidated by the next
+   insert. */
+
+fd_blockdb_blk_t const *
+fd_blockdb_query_alternate_root( fd_blockdb_t const * blockdb,
+                                 ulong                slot,
+                                 ulong                leaf_idx,
+                                 uchar const          root[ FD_SHRED_MERKLE_NODE_SZ ] );
 
 /* fd_blockdb_proof writes blk's double-merkle inclusion proof for leaf
    leaf_idx to proof, as 20B nodes from leaf to root.  Leaves are the FEC

@@ -1,5 +1,5 @@
 use fd_netctl::typesafe;
-use fd_netctl::{Policy, QUEUE, QUEUE_LEN};
+use fd_netctl::{Policy, MAX_COMMAND, QUEUE, QUEUE_LEN};
 use nfq::Queue;
 mod delivery;
 use delivery::{Deliveries, COPY_RANGE};
@@ -29,6 +29,7 @@ const HELP: &str = "Usage:
   sudo fd-netctl ctl SOCKET allow FROM TO
   sudo fd-netctl ctl SOCKET delay FROM TO MS
   sudo fd-netctl ctl SOCKET duplicate FROM TO 0|1
+  sudo fd-netctl ctl SOCKET loss FROM TO PCT
   sudo --preserve-env=TYPESAFE_API_KEY,TYPESAFE_MODEL fd-netctl ctl SOCKET typesafe [SECONDS]
   sudo fd-netctl ctl SOCKET heal
   sudo fd-netctl ctl SOCKET stop
@@ -37,7 +38,8 @@ Node IDs are config-list indices, starting at zero. block/allow are directed.
 run creates the network setup, launches PROGRAM inside it, and stops with it.
 Ctrl-C or ctl stop ends the managed run. serve instead waits for manual launches.
 Only configured loopback UDP port pairs enter the controller.
-Delay is 0..5000ms; duplicate=1 sends one extra copy. heal resets all faults.
+Delay is 0..5000ms; duplicate=1 sends one extra copy; loss drops PCT% of
+new packets at random. heal resets all faults.
 typesafe selects one single-node network partition every SECONDS (default 1).
 Requires 2..128 nodes and TYPESAFE_API_KEY. Ctrl-C or heal stops injection.
 No payload editing, TLS termination, or validator restarts are performed.";
@@ -325,9 +327,10 @@ fn serve(socket: &str, configs: &[String], command: Option<&[String]>) -> Result
                 stream.set_read_timeout(Some(Duration::from_millis(100)))?;
                 stream.set_write_timeout(Some(Duration::from_millis(100)))?;
                 let mut line = String::new();
-                let read = BufReader::new((&stream).take(257)).read_line(&mut line);
+                let read =
+                    BufReader::new((&stream).take(MAX_COMMAND as u64 + 1)).read_line(&mut line);
                 let response = match read {
-                    Ok(_) if line.len() <= 256 && line.ends_with('\n') => {
+                    Ok(_) if line.len() <= MAX_COMMAND && line.ends_with('\n') => {
                         if line.trim() == "stop" {
                             stop.store(true, Ordering::Relaxed);
                             "OK stopping\n".to_owned()
@@ -339,6 +342,7 @@ fn serve(socket: &str, configs: &[String], command: Option<&[String]>) -> Result
                                         action,
                                         "heal"
                                             | "block"
+                                            | "apply"
                                             | "typesafe-start"
                                             | "typesafe-end"
                                             | "typesafe-partition"
@@ -362,7 +366,7 @@ fn serve(socket: &str, configs: &[String], command: Option<&[String]>) -> Result
                             }
                         }
                     }
-                    _ => "ERR expected one newline-terminated command, at most 256 bytes\n".into(),
+                    _ => format!("ERR expected one newline-terminated command, at most {MAX_COMMAND} bytes\n"),
                 };
                 // A disconnected control client must not stop packet handling.
                 let _ = stream.write_all(response.as_bytes());

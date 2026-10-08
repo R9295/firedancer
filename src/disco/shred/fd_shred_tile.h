@@ -18,6 +18,20 @@ fd_shred_tile_fec_set_cnt( ulong fec_exposure,
   return 2UL*fec_exposure + fec_resolver_depth + FD_SHRED_SIGN_PEND_MAX + 2UL;
 }
 
+/* fd_shred_tile_eqvoc_fec_dest_mask returns the version-B destination
+   mask for one FEC set.  In mixed mode, every destination switches
+   versions on each successive FEC set. */
+
+FD_FN_CONST static inline ulong
+fd_shred_tile_eqvoc_fec_dest_mask( ulong base_b_mask,
+                                   ulong dest_cnt,
+                                   int   mixed,
+                                   ulong fec_set_idx ) {
+  if( FD_LIKELY( !mixed || !((fec_set_idx/FD_FEC_SHRED_CNT)&1UL) ) ) return base_b_mask;
+  ulong all_dests = dest_cnt==8UL*sizeof(ulong) ? ULONG_MAX : (1UL<<dest_cnt)-1UL;
+  return base_b_mask ^ all_dests;
+}
+
 /* Forward declarations */
 typedef struct fd_fec_resolver fd_fec_resolver_t;
 typedef struct fd_keyswitch_private fd_keyswitch_t;

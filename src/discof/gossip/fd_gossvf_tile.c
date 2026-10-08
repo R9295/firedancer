@@ -133,6 +133,7 @@ struct fd_gossvf_tile_ctx {
   ushort shred_version;
 
   int allow_private_address;
+  int allow_duplicate_instance;
 
   fd_ip4_port_t gossip_addr;
   fd_ip4_port_t src_addr;
@@ -611,6 +612,9 @@ check_duplicate_instance( fd_gossvf_tile_ctx_t *      ctx,
     default:
       FD_LOG_CRIT(( "unexpected message tag %u", view->tag ));
   }
+
+  /* A test cluster may run two instances of one identity on purpose. */
+  if( FD_UNLIKELY( ctx->allow_duplicate_instance ) ) return;
 
   for( ulong i=0UL; i<values_len; i++ ) {
     fd_gossip_value_t const * value = &values[ i ];
@@ -1113,6 +1117,8 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->round_robin_idx = tile->kind_id;
 
   ctx->allow_private_address = tile->gossvf.allow_private_address;
+  ctx->allow_duplicate_instance = tile->gossvf.allow_duplicate_instance;
+  if( FD_UNLIKELY( ctx->allow_duplicate_instance ) ) FD_LOG_WARNING(( "development.gossip.allow_duplicate_instance is set: not exiting on another running instance of this identity" ));
   ctx->src_addr              = tile->gossvf.src_addr;
 
   ctx->keyswitch = fd_keyswitch_join( fd_topo_obj_laddr( topo, tile->id_keyswitch_obj_id ) );

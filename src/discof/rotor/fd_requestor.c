@@ -145,8 +145,8 @@ parent_next( fd_requestor_t const * self,
 
 /* metadata_next emits the single metadata request the block still
    needs once its fill pass is over and returns 1, or returns 0 if its
-   metadata is settled: Orphan while the parent is absent, else the
-   highest window while the tip is unknown. */
+   metadata is settled: the parent while it is absent, else the highest
+   window while the tip is unknown. */
 
 static int
 metadata_next( fd_requestor_t const * self,
@@ -156,8 +156,15 @@ metadata_next( fd_requestor_t const * self,
   int verified = !fd_hash_check_zero( &block->block_id );
 
   if( parent_orphaned( rotor, block ) ) {
-    if( !self->block_id_only ) { emit( self, request, FD_REPAIR_KIND_ORPHAN,           0U, NULL,             NULL ); return 1; }
-    else if( verified )        { emit( self, request, AG_REPAIR_KIND_PARENT_FEC_COUNT, 0U, &block->block_id, NULL ); return 1; }
+    /* Orphan asks for the parent slot by position.  If the rotor holds
+       another version of that slot, it drops every answer whose FEC set
+       root conflicts with the version it holds, so the block would never
+       connect.  A verified block asks for its parent by block id
+       instead: the verified answer creates the missing version, which
+       block id repair then fills. */
+    int other_version = block->parent_slot!=AG_UNKNOWN_SLOT && !!fd_rotor_slot_query( rotor, block->parent_slot );
+    if( verified && ( self->block_id_only || other_version ) ) { emit( self, request, AG_REPAIR_KIND_PARENT_FEC_COUNT, 0U, &block->block_id, NULL ); return 1; }
+    if( !self->block_id_only )                                  { emit( self, request, FD_REPAIR_KIND_ORPHAN,           0U, NULL,             NULL ); return 1; }
   }
 
   if( block->complete_idx==UINT_MAX ) {

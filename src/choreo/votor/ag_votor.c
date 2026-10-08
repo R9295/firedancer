@@ -1,4 +1,5 @@
 #include "ag_votor.h"
+#include "../../disco/fd_trace.h"
 
 struct vote_event {
   uchar     reason;
@@ -74,6 +75,7 @@ typedef struct slot_states slot_states_t;
 struct epoch_bls_key {
   ulong start_slot;
   ulong rank;
+  long  ns_per_slot; /* slot duration in this epoch */
   uchar bls_key[ FD_BLS_PUB_COMPRESSED_SZ ];
   int   has_bls_key;
 };
@@ -84,7 +86,7 @@ struct __attribute__((aligned(128UL))) ag_votor {
   long           now;
   ulong          root;
   ushort         shred_version;
-  long           ns_per_slot;
+  long           ns_per_slot; /* slot duration of slots in no known epoch */
   fd_bls_sign_fn bls_sign_fn;
   void *         bls_sign_ctx;
 
@@ -155,6 +157,26 @@ set_timeout( ag_votor_t *       self,
   else                                                            timeout_dlist_ele_push_head   ( list, ele, pool );
 }
 
+FD_FN_PURE static epoch_bls_key_t const *
+own_epoch( ag_votor_t const * self,
+           ulong              slot ) {
+  if( FD_UNLIKELY( slot>=self->next_epoch.start_slot ) ) return &self->next_epoch;
+  if( FD_LIKELY( slot>=self->curr_epoch.start_slot ) ) return &self->curr_epoch;
+  return &self->prev_epoch;
+}
+
+/* slot_ns returns the slot duration of the epoch holding slot.  The
+   votor learns an epoch's duration up to an epoch before the epoch
+   starts, so the newest duration can belong to a later epoch.  Slots
+   in no known epoch use the duration given at init. */
+
+FD_FN_PURE static long
+slot_ns( ag_votor_t const * self,
+         ulong              slot ) {
+  epoch_bls_key_t const * epoch = own_epoch( self, slot );
+  return slot>=epoch->start_slot ? epoch->ns_per_slot : self->ns_per_slot;
+}
+
 /* No crashed-leader timeout.  Agave tracks one, but with
    delta_first_fec_set = delta_block its deadline lands on the first
    slot's timeout, so it never skips a window earlier. */
@@ -164,10 +186,11 @@ set_timeouts( ag_votor_t * self,
               ulong        slot ) {
   FD_TEST( ag_is_start_of_window( slot ) );
 
-  long deadline = self->now + AG_DELTA_TIMEOUT_NS + self->ns_per_slot;
+  long ns_per_slot = slot_ns( self, slot );
+  long deadline    = self->now + AG_DELTA_TIMEOUT_NS + ns_per_slot;
 
   for( ulong s=slot; s<slot+AG_SLOTS_PER_WINDOW; s++ ) {
-    deadline += fd_long_if( ag_is_start_of_window( s ), 0L, self->ns_per_slot );
+    deadline += fd_long_if( ag_is_start_of_window( s ), 0L, ns_per_slot );
     set_timeout( self, state_mut( self, s ), deadline );
   }
 }
@@ -378,14 +401,6 @@ ag_votor_metrics( ag_votor_t const * self ) {
   };
 }
 
-FD_FN_PURE static epoch_bls_key_t const *
-own_epoch( ag_votor_t const * self,
-           ulong              slot ) {
-  if( FD_UNLIKELY( slot>=self->next_epoch.start_slot ) ) return &self->next_epoch;
-  if( FD_LIKELY( slot>=self->curr_epoch.start_slot ) ) return &self->curr_epoch;
-  return &self->prev_epoch;
-}
-
 FD_FN_PURE static int
 is_retired( ag_votor_t const * self,
             ulong              slot ) {
@@ -447,26 +462,30 @@ try_final( ag_votor_t *          self,
   }
 }
 
+/* try_notar votes to notarize the block if its parent allows it, and
+   returns 1 if it voted.  Otherwise it sets *why to the reason. */
+
 static int
 try_notar( ag_votor_t *            self,
            ulong                   slot,
            ag_block_info_t const * block_info,
-           uchar                   reason ) {
+           uchar                   reason,
+           char const **           why ) {
   FD_TEST( slot>=first_unpruned_slot( self ) );
   epoch_bls_key_t const * epoch = own_epoch( self, slot );
-  if( FD_UNLIKELY( has_voted( self, slot ) ) ) return 0;
+  if( FD_UNLIKELY( has_voted( self, slot ) ) ) { *why = "voted"; return 0; }
 
   ag_block_hash_t hash;
   memcpy( hash, block_info->hash, sizeof(ag_block_hash_t) );
   ag_block_id_t parent = block_info->parent;
 
   if( FD_UNLIKELY( ag_is_start_of_window( slot ) ) ) {
-    if( FD_UNLIKELY( !ag_parent_ready_tracker_is_parent_ready( self->parent_ready_tracker, slot, &parent ) ) ) return 0;
+    if( FD_UNLIKELY( !ag_parent_ready_tracker_is_parent_ready( self->parent_ready_tracker, slot, &parent ) ) ) { *why = "parent_not_ready"; return 0; }
   } else {
-    if( FD_UNLIKELY( parent.slot!=slot-1UL ) ) return 0;
+    if( FD_UNLIKELY( parent.slot!=slot-1UL ) ) { *why = "parent_not_previous_slot"; return 0; }
     slot_state_ele_t const * parent_state = slot_state_map_ele_query_const( self->slot_states->map, &parent.slot, NULL, self->slot_states->pool );
-    if( FD_UNLIKELY( !parent_state || !parent_state->voted_notar                                      ) ) return 0;
-    if( FD_UNLIKELY( memcmp( parent_state->voted_notar_hash, parent.hash, sizeof(ag_block_hash_t) )!=0 ) ) return 0;
+    if( FD_UNLIKELY( !parent_state || !parent_state->voted_notar                                      ) ) { *why = "parent_not_voted";         return 0; }
+    if( FD_UNLIKELY( memcmp( parent_state->voted_notar_hash, parent.hash, sizeof(ag_block_hash_t) )!=0 ) ) { *why = "parent_voted_other_block"; return 0; }
   }
 
   if( FD_LIKELY( epoch->has_bls_key && slot>=self->wait_to_vote_slot ) ) {
@@ -527,7 +546,8 @@ check_pending_blocks( ag_votor_t * self,
 
   for( ulong i=0UL; i<cnt; i++ ) {
     slot_state_ele_t const * ele = slot_state_map_ele_query_const( map, &slots[i], NULL, pool );
-    if( FD_LIKELY( ele && ele->pending_block ) ) try_notar( self, slots[i], &ele->pending_block_info, reason );
+    char const * why = "-";
+    if( FD_LIKELY( ele && ele->pending_block ) ) try_notar( self, slots[i], &ele->pending_block_info, reason, &why );
   }
 }
 
@@ -590,7 +610,7 @@ ag_votor_advance_epoch( ag_votor_t *       self,
                         ulong              epoch_rank,
                         ulong              epoch_slot,
                         ag_bls_key_t const bls_key ) {
-  epoch_bls_key_t epoch = { .start_slot = epoch_slot, .rank = epoch_rank, .has_bls_key = !!bls_key };
+  epoch_bls_key_t epoch = { .start_slot = epoch_slot, .rank = epoch_rank, .ns_per_slot = ns_per_slot, .has_bls_key = !!bls_key };
   if( FD_LIKELY( bls_key ) ) memcpy( epoch.bls_key, bls_key, FD_BLS_PUB_COMPRESSED_SZ );
 
   if( FD_UNLIKELY( self->curr_epoch.start_slot==ULONG_MAX ) ) {
@@ -602,7 +622,6 @@ ag_votor_advance_epoch( ag_votor_t *       self,
     self->curr_epoch = self->next_epoch;
     self->next_epoch = epoch;
   }
-  self->ns_per_slot = ns_per_slot;
 }
 
 static epoch_bls_key_t *
@@ -640,6 +659,7 @@ ag_votor_wait_to_vote( ag_votor_t * self ) {
     slot_state_ele_t const * state = slot_state_map_iter_ele_const( iter, map, pool );
     if( state->voted ) self->wait_to_vote_slot = fd_ulong_max( self->wait_to_vote_slot, ag_first_slot_in_window( state->slot )+AG_SLOTS_PER_WINDOW );
   }
+  FD_TRACE( "votor wait_to_vote slot=%lu", self->wait_to_vote_slot );
 }
 
 void
@@ -737,13 +757,16 @@ ag_votor_process_replay( ag_votor_t *            self,
     FD_LOG_WARNING(( "not voting for block in slot %lu, already voted", slot ));
     return;
   }
-  if( FD_LIKELY( try_notar( self, slot, block_info, AG_VOTOR_REASON_BLOCK_REPLAYED ) ) ) {
+  char const * why = "-";
+  if( FD_LIKELY( try_notar( self, slot, block_info, AG_VOTOR_REASON_BLOCK_REPLAYED, &why ) ) ) {
     check_pending_blocks( self, AG_VOTOR_REASON_BLOCK_REPLAYED );
   } else {
     slot_state_ele_t * state  = state_mut( self, slot );
     if( FD_LIKELY( !state->pending_block ) ) pending_dlist_ele_push_tail( self->pending_dlist, state, self->slot_states->pool );
     state->pending_block      = 1;
     state->pending_block_info = *block_info;
+    char b58[ FD_BASE58_ENCODED_32_SZ ], parent_b58[ FD_BASE58_ENCODED_32_SZ ];
+    FD_TRACE( "votor notar_pending slot=%lu block=%s parent_slot=%lu parent=%s why=%s", slot, fd_trace_hash( b58, block_info->hash ), block_info->parent.slot, fd_trace_hash( parent_b58, block_info->parent.hash ), why );
   }
 }
 

@@ -10,9 +10,15 @@ pub const QUEUE: u16 = 0;
 // Absorb short validator bursts without making packet buffering unbounded.
 // At the 2048-byte copy range, this is at most roughly 16 MiB of packet data.
 pub const QUEUE_LEN: u32 = 8192;
+// Delayed originals wait in the kernel queue. Hold at most half of it, so
+// new traffic always has room.
+pub const MAX_PENDING: usize = QUEUE_LEN as usize / 2;
 // Controller-generated copies must not be queued (and duplicated) again.
 pub const COPY_MARK: u32 = 0xfd01;
 pub const MAX_DELAY_MS: u64 = 5000;
+// One control command line, which an apply rule set can make long.
+pub const MAX_COMMAND: usize = 64 * 1024;
+const USAGE: &str = "expected: status | block FROM TO | allow FROM TO | delay FROM TO MS | duplicate FROM TO 0|1 | loss FROM TO PCT | apply [RULE, ...] | heal | stop";
 const MAX_NODES: usize = 128;
 const PORT_FIELDS: &[(&str, Option<Protocol>)] = &[
     ("gossip.port", Some(Protocol::Gossip)),
@@ -92,6 +98,8 @@ pub struct Link {
     pub blocked: bool,
     pub delay_ms: u64,
     pub duplicate: bool,
+    /// Percent of new packets dropped at random, 0..100.
+    pub loss_pct: u8,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -117,6 +125,9 @@ pub struct Policy {
     pub delayed: u64,
     pub pending: usize,
     pub overruns: u64,
+    pub lost: u64,
+    // xorshift64 state for random loss; never zero.
+    rng: u64,
 }
 
 impl Policy {
@@ -170,6 +181,12 @@ impl Policy {
             delayed: 0,
             pending: 0,
             overruns: 0,
+            lost: 0,
+            rng: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_nanos() as u64
+                | 1,
         })
     }
 
@@ -210,7 +227,19 @@ impl Policy {
             self.dropped += 1;
             return None;
         }
+        if link.loss_pct != 0 && self.next_random() % 100 < u64::from(link.loss_pct) {
+            self.dropped += 1;
+            self.lost += 1;
+            return None;
+        }
         Some(delivery)
+    }
+
+    fn next_random(&mut self) -> u64 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        self.rng
     }
 
     pub fn is_blocked(&self, delivery: Delivery) -> bool {
@@ -257,7 +286,7 @@ impl Policy {
         if self.typesafe_session.is_some()
             && matches!(
                 words.first(),
-                Some(&("block" | "allow" | "delay" | "duplicate"))
+                Some(&("block" | "allow" | "delay" | "duplicate" | "loss" | "apply"))
             )
         {
             return Err(
@@ -300,11 +329,39 @@ impl Policy {
                 self.heal();
                 Ok(format!("OK generation={}\n", self.generation))
             }
-            [action @ ("block" | "allow"), from, to] => {
-                let index = self.link_index(from, to)?;
-                self.links[index].blocked = *action == "block";
+            ["block" | "allow" | "delay" | "duplicate" | "loss", ..] => {
+                let mut links = self.links.clone();
+                self.set_rule(&mut links, &words)?;
+                self.links = links;
                 self.generation += 1;
                 Ok(format!("OK generation={}\n", self.generation))
+            }
+            ["apply", ..] => {
+                // The rules are everything after the command word.
+                let rules = &command.trim_start()["apply".len()..];
+                let mut links = vec![Link::default(); self.links.len()];
+                if !rules.trim().is_empty() {
+                    for rule in rules.split(',') {
+                        let words: Vec<_> = rule.split_whitespace().collect();
+                        self.set_rule(&mut links, &words)
+                            .map_err(|e| format!("rule `{}`: {e}", rule.trim()))?;
+                    }
+                }
+                self.links = links;
+                self.active_partition = None;
+                self.generation += 1;
+                Ok(format!("OK generation={}\n", self.generation))
+            }
+            _ => Err(USAGE.into()),
+        }
+    }
+
+    /// Sets one directed link rule in links (one entry per ordered node
+    /// pair), or returns why the rule is invalid.
+    fn set_rule(&self, links: &mut [Link], words: &[&str]) -> Result<(), String> {
+        match words {
+            [action @ ("block" | "allow"), from, to] => {
+                links[self.link_index(from, to)?].blocked = *action == "block";
             }
             ["delay", from, to, millis] => {
                 let index = self.link_index(from, to)?;
@@ -312,18 +369,21 @@ impl Policy {
                 if millis > MAX_DELAY_MS {
                     return Err(format!("delay must be in 0..{MAX_DELAY_MS} milliseconds"));
                 }
-                self.links[index].delay_ms = millis;
-                self.generation += 1;
-                Ok(format!("OK generation={}\n", self.generation))
+                links[index].delay_ms = millis;
             }
             ["duplicate", from, to, copies @ ("0" | "1")] => {
-                let index = self.link_index(from, to)?;
-                self.links[index].duplicate = *copies == "1";
-                self.generation += 1;
-                Ok(format!("OK generation={}\n", self.generation))
+                links[self.link_index(from, to)?].duplicate = *copies == "1";
             }
-            _ => Err("expected: status | block FROM TO | allow FROM TO | delay FROM TO MS | duplicate FROM TO 0|1 | heal | stop".into()),
+            ["loss", from, to, pct] => {
+                let index = self.link_index(from, to)?;
+                links[index].loss_pct = match pct.parse::<u8>() {
+                    Ok(pct) if pct <= 100 => pct,
+                    _ => return Err("loss must be a percent in 0..100".into()),
+                };
+            }
+            _ => return Err(USAGE.into()),
         }
+        Ok(())
     }
 
     fn heal(&mut self) {
@@ -378,11 +438,12 @@ impl Policy {
 
     pub fn status(&self) -> String {
         let mut out = format!(
-            "OK pid={} generation={} accepted={} dropped={} unclassified={} duplicated={} delayed={} pending={} overruns={}\n",
+            "OK pid={} generation={} accepted={} dropped={} lost={} unclassified={} duplicated={} delayed={} pending={} overruns={}\n",
             std::process::id(),
             self.generation,
             self.accepted,
             self.dropped,
+            self.lost,
             self.unclassified,
             self.duplicated,
             self.delayed,
@@ -415,6 +476,9 @@ impl Policy {
                 }
                 if link.duplicate {
                     writeln!(out, "duplicate {src} -> {dst} 1 extra copy").unwrap();
+                }
+                if link.loss_pct != 0 {
+                    writeln!(out, "loss {src} -> {dst} {}%", link.loss_pct).unwrap();
                 }
             }
         }
@@ -489,6 +553,20 @@ mod tests {
         }
     }
     #[test]
+    fn loss_drops_about_its_share_of_one_directed_link() {
+        let mut p = policy(2);
+        p.command("loss 0 1 30").unwrap();
+        let kept = (0..10_000).filter(|_| p.accept(&packet(8000, 8001))).count();
+        assert!((6_500..7_500).contains(&kept), "kept {kept} of 10000 at 30% loss");
+        assert_eq!(p.lost, 10_000 - kept as u64);
+        assert!((0..1_000).all(|_| p.accept(&packet(8001, 8000))));
+        p.command("apply loss 0 1 100").unwrap();
+        assert!(!p.accept(&packet(8000, 8001)));
+        assert!(p.command("loss 0 1 101").is_err());
+        p.command("heal").unwrap();
+        assert!(p.accept(&packet(8000, 8001)));
+    }
+    #[test]
     fn single_node_baseline() {
         let mut p = policy(1);
         assert!(p.accept(&packet(8000, 8000)));
@@ -541,6 +619,54 @@ mod tests {
             p.delivery(&packet(8000, 8006)).unwrap().link,
             Link::default()
         );
+    }
+    #[test]
+    fn apply_replaces_the_whole_policy_at_once() {
+        let mut p = policy(4);
+        p.command("block 0 1").unwrap();
+        p.command("delay 1 2 100").unwrap();
+        let generation = p.generation;
+        p.command("apply block 2 3, block 3 2,delay 0 3 50 , duplicate 3 0 1\n")
+            .unwrap();
+        assert_eq!(p.generation, generation + 1);
+        // The rules it does not list are gone.
+        assert!(p.accept(&packet(8000, 8001)));
+        assert_eq!(
+            p.delivery(&packet(8001, 8002)).unwrap().link,
+            Link::default()
+        );
+        assert!(!p.accept(&packet(8002, 8003)));
+        assert!(!p.accept(&packet(8003, 8002)));
+        assert_eq!(p.delivery(&packet(8000, 8003)).unwrap().link.delay_ms, 50);
+        assert!(p.delivery(&packet(8003, 8000)).unwrap().link.duplicate);
+
+        // One invalid rule anywhere changes nothing.
+        for bad in [
+            "apply block 0 1, delay 1 2 5001",
+            "apply block 0 1,, block 1 0",
+            "apply block 0 1,",
+            "apply block 0 4",
+            "apply block 0 1 delay 1 2 3",
+            "apply heal",
+            "apply wat 0 1",
+            "applyblock 0 1",
+        ] {
+            assert!(p.command(bad).is_err(), "accepted {bad}");
+        }
+        assert_eq!(p.generation, generation + 1);
+        assert!(!p.accept(&packet(8002, 8003)));
+
+        // No rules heals every link.
+        p.command("apply").unwrap();
+        for (src, dst) in [(8002, 8003), (8003, 8002), (8000, 8003), (8003, 8000)] {
+            assert_eq!(p.delivery(&packet(src, dst)).unwrap().link, Link::default());
+        }
+
+        // TypeSafe owns the policy until heal.
+        p.command("typesafe-start").unwrap();
+        assert!(p.command("apply block 0 1").is_err());
+        p.command("heal").unwrap();
+        p.command("apply block 0 1").unwrap();
     }
     #[test]
     fn header_parsing() {

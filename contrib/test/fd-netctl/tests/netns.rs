@@ -313,7 +313,10 @@ fn delay_buffer_limit_smoke() {
         .read_to_string(&mut errors)
         .unwrap();
     assert!(
-        errors.contains("delay buffer full (512 packets; test invalid)"),
+        errors.contains(&format!(
+            "delay buffer full ({} packets; test invalid)",
+            fd_netctl::MAX_PENDING
+        )),
         "{errors}"
     );
     assert!(!session.socket.exists());
@@ -329,9 +332,14 @@ fn fill_delay_helper() {
     let src = UdpSocket::bind("127.0.0.1:20001").unwrap();
     let dst = UdpSocket::bind("127.0.0.1:20201").unwrap();
     assert!(ctl(socket, "delay 0 2 5000").unwrap().starts_with("OK "));
-    for n in 1..=512 {
+    // Fill in bursts well under the kernel queue length, so a netlink burst
+    // overflow cannot mask our limit, and fast enough that no packet reaches
+    // its 5 s release first.
+    for n in 1..=fd_netctl::MAX_PENDING {
         send(&src, &dst);
-        wait_pending(socket, n); // Avoid netlink burst overflow masking our limit.
+        if n % 256 == 0 || n == fd_netctl::MAX_PENDING {
+            wait_pending(socket, n);
+        }
     }
     send(&src, &dst); // This must abort the run and kill this managed helper.
     std::thread::sleep(Duration::from_secs(30));

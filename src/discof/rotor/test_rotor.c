@@ -1609,6 +1609,17 @@ test_fec_reception( fd_wksp_t * wksp ) {
   FD_TEST( !lv->metrics.turbine_cnt && !lv->metrics.repair_cnt && !lv->metrics.recovered_cnt );
   FD_TEST( !fd_rotor_verify( rotor ) );
 
+  /* Repair may return a conflicting shred for our own slot while we are
+     still producing it.  It must not abandon the locally produced
+     turbine version.  With no explicit version interested in the
+     conflicting root, the shred is dropped. */
+  fd_hash_t conflicting_mr = mkhash( 904UL );
+  fd_rotor_shred_insert( rotor, 12UL, 0U, 0, FD_ROTOR_SRC_REPAIR, 410L, &conflicting_mr, 1, AG_UNKNOWN_SLOT, NULL );
+  FD_TEST( !lv->abandoned );
+  FD_TEST( fd_rotor_fec_query( rotor, 12UL, 0U, &lv->block_id )==leader );
+  FD_TEST( !fd_fec_map_ele_query( rotor->fec_map, &conflicting_mr, NULL, rotor->fec_pool ) );
+  FD_TEST( !fd_rotor_verify( rotor ) );
+
   struct fec_reception_prune_ctx prune_ctx = { .rotor = rotor };
   rotor->block_event_fn  = check_fec_reception_prune;
   rotor->block_event_ctx = &prune_ctx;
@@ -1617,7 +1628,7 @@ test_fec_reception( fd_wksp_t * wksp ) {
   FD_TEST( !fd_rotor_verify( rotor ) );
 
   /* Reusing a freed FEC pool entry must not leak reception state. */
-  fd_hash_t reused_mr = mkhash( 904UL );
+  fd_hash_t reused_mr = mkhash( 905UL );
   fd_rotor_shred_insert( rotor, 13UL, 0U, 0, FD_ROTOR_SRC_TURBINE, 500L, &reused_mr, 1, AG_UNKNOWN_SLOT, NULL );
   fd_rotor_code_shred_insert( rotor, 13UL, 0U, 5U, 500L, &reused_mr );
   fd_rotor_fec_t * reused = fec_at( rotor, 13UL, 0U, 0UL );

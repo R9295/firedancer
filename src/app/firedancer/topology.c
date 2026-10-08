@@ -1556,6 +1556,7 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     tile->gossvf.tcache_depth          = 1<<22UL; /* TODO: user defined option */
     tile->gossvf.shred_version         = 0U;
     tile->gossvf.allow_private_address = config->development.gossip.allow_private_address;
+    tile->gossvf.allow_duplicate_instance = config->development.gossip.allow_duplicate_instance;
     tile->gossvf.boot_timestamp_nanos   = config->boot_timestamp_nanos;
 
     tile->gossvf.entrypoints_cnt = config->gossip.entrypoints_cnt;
@@ -1684,6 +1685,9 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     tile->rserve.max_shreds_per_block = config->limits.max_shreds_per_block;
     tile->rserve.ping_cache_entries = 1UL<<16; /* TODO: Configure this from some global metric? */
     tile->rserve.blockdb_max = config->firedancer.development.alpenglow ? 1UL<<15 : 0UL; /* ~20.6 KiB each. TODO: make configurable */
+    if( FD_UNLIKELY( config->firedancer.development.repair.adversarial_response_pct>100U ) )
+      FD_LOG_ERR(( "development.repair.adversarial_response_pct is %u, it must be at most 100", config->firedancer.development.repair.adversarial_response_pct ));
+    tile->rserve.adversarial_response_pct = config->firedancer.development.repair.adversarial_response_pct;
     fd_cstr_ncpy( tile->rserve.identity_key_path, config->paths.identity_key, sizeof(tile->rserve.identity_key_path) );
 
   } else if( FD_UNLIKELY( !strcmp( tile->name, "replay" ) )) {
@@ -1767,6 +1771,9 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
   } else if( FD_UNLIKELY( !strcmp( tile->name, "votor" ) ) ) {
     tile->votor.quic_client_listen_port = config->firedancer.development.votor.quic_client_listen_port;
     tile->votor.quic_server_listen_port = config->firedancer.development.votor.quic_server_listen_port;
+    if( FD_UNLIKELY( config->firedancer.development.votor.byzantine_vote_pct>100U ) )
+      FD_LOG_ERR(( "development.votor.byzantine_vote_pct is %u, it must be at most 100", config->firedancer.development.votor.byzantine_vote_pct ));
+    tile->votor.byzantine_vote_pct      = config->firedancer.development.votor.byzantine_vote_pct;
     tile->votor.ip_addr                 = config->net.ip_addr;
     tile->votor.max_live_slots          = config->firedancer.runtime.max_live_slots;
     fd_cstr_ncpy( tile->votor.identity_key_path, config->paths.identity_key, sizeof(tile->votor.identity_key_path) );
@@ -1911,6 +1918,15 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
                tile->shred.adtl_dests_retransmit_cnt*sizeof(tile->shred.adtl_dests_retransmit[ 0 ]) );
     fd_memcpy( tile->shred.adtl_dests_leader, config->tiles.shred.additional_shred_destinations_leader,
                tile->shred.adtl_dests_leader_cnt*sizeof(tile->shred.adtl_dests_leader[ 0 ]) );
+    if( FD_UNLIKELY( config->firedancer.development.shred.equivocate_pct>100U ) )
+      FD_LOG_ERR(( "development.shred.equivocate_pct is %u, it must be at most 100", config->firedancer.development.shred.equivocate_pct ));
+    tile->shred.equivocate_pct = config->firedancer.development.shred.equivocate_pct;
+    if( FD_UNLIKELY( config->firedancer.development.shred.equivocate_fec_mix_pct>100U ) )
+      FD_LOG_ERR(( "development.shred.equivocate_fec_mix_pct is %u, it must be at most 100", config->firedancer.development.shred.equivocate_fec_mix_pct ));
+    tile->shred.equivocate_fec_mix_pct = config->firedancer.development.shred.equivocate_fec_mix_pct;
+    if( FD_UNLIKELY( config->firedancer.development.shred.withhold_pct>100U ) )
+      FD_LOG_ERR(( "development.shred.withhold_pct is %u, it must be at most 100", config->firedancer.development.shred.withhold_pct ));
+    tile->shred.withhold_pct = config->firedancer.development.shred.withhold_pct;
 
   } else if( FD_UNLIKELY( !strcmp( tile->name, "sign" ) ) ) {
 

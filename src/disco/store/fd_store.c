@@ -906,7 +906,11 @@ fd_store_remove( fd_store_t *      store,
   fd_rwlock_write( &store->fec_lock );
   fd_store_map_query_t query[1];
   int err = fd_store_map_remove( map, merkle_root, NULL, query, FD_MAP_FLAG_BLOCKING );
-  if( FD_LIKELY( !err ) ) fd_store_fec_release( store, fd_store_map_query_ele( query ) );
+  /* Under Alpenglow the FEC stays linked in its slot_to_fecs partition,
+     which only fd_store_publish may unlink, so it releases the FEC once
+     the root passes its slot.  Unmapping it now still lets the same
+     merkle root be inserted again meanwhile. */
+  if( FD_LIKELY( !err ) ) { if( FD_LIKELY( !store->alpenglow ) ) fd_store_fec_release( store, fd_store_map_query_ele( query ) ); }
   else FD_TEST( err==FD_MAP_ERR_KEY );
   fd_rwlock_unwrite( &store->fec_lock );
   return !err;
@@ -927,9 +931,14 @@ fd_store_publish( fd_store_t *     store,
       for( ulong idx = fd_store_slot_to_fecs_idx_remove( slot_to_fecs, &key, ULONG_MAX, fec0 );
                  idx!=ULONG_MAX;
                  idx = fd_store_slot_to_fecs_idx_remove( slot_to_fecs, &key, ULONG_MAX, fec0 ) ) {
+        /* Unmap it unless fd_store_remove already did: then the key is
+           absent, or maps to a newer FEC inserted under the same merkle
+           root, which must stay. */
         fd_store_map_query_t query[1];
-        FD_TEST( !fd_store_map_remove( map, &fec0[ idx ].key, NULL, query, FD_MAP_FLAG_BLOCKING ) );
-        fd_store_fec_release( store, fd_store_map_query_ele( query ) );
+        if( FD_LIKELY( !fd_store_map_query_try( map, &fec0[ idx ].key, NULL, query, 0 ) && fd_store_map_query_ele( query )==fec0+idx ) ) {
+          FD_TEST( !fd_store_map_remove( map, &fec0[ idx ].key, NULL, query, FD_MAP_FLAG_BLOCKING ) );
+        }
+        fd_store_fec_release( store, fec0+idx );
         cnt++;
       }
     }

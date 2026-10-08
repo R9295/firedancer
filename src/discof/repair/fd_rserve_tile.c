@@ -9,6 +9,7 @@
 #include "fd_blockdb.h"
 #include "../rotor/fd_rotor_tile.h"
 #include "../../disco/fd_disco_base.h"
+#include "../../disco/fd_trace.h"
 #include "../../disco/keyguard/fd_keyguard_client.h"
 #include "../../disco/keyguard/fd_keyguard.h"
 #include "../../disco/keyguard/fd_keyload.h"
@@ -92,6 +93,7 @@ typedef struct ctx {
   fd_store_t *    store;
   int             disk_fd;
   ulong           max_shreds_per_block;
+  uint            adversarial_response_pct;
 
   /* Used for verifying incoming requests, and signing outgoing responses. */
   fd_sha512_t sha512[1];
@@ -195,6 +197,90 @@ send_packet( ctx_t               * ctx,
   ulong chunk     = ctx->net_out_chunk;
   fd_stem_publish( stem, ctx->net_out_idx, sig, chunk, packet_sz, 0UL, tsorig, tspub );
   ctx->net_out_chunk = fd_dcache_compact_next( chunk, packet_sz, ctx->net_out_chunk0, ctx->net_out_wmark );
+}
+
+/* maybe_adversarial_shred replaces a successful shred lookup with the
+   same shred index from another completed version of the slot.  The
+   returned shred is valid and signed, but can conflict with the block
+   version the requester is repairing.  Without such a version, it
+   corrupts the first payload byte instead, so the shred no longer
+   matches its merkle root and signature. */
+
+static int
+adversarial_response_selected( ctx_t const * ctx,
+                               uint          request_kind,
+                               uint          nonce,
+                               ulong         slot,
+                               uint          shred_idx ) {
+  if( FD_LIKELY( !ctx->adversarial_response_pct ) ) return 0;
+  ulong entropy = ctx->seed ^ slot ^ ((ulong)shred_idx<<32) ^ ((ulong)request_kind<<56) ^ (ulong)nonce;
+  return fd_ulong_hash( entropy )%100UL<(ulong)ctx->adversarial_response_pct;
+}
+
+/* adversarial_alternate_shred copies the requested shred index from
+   another completed version of the slot over payload.  Returns its byte
+   count, or -1 if no other version is stored. */
+
+static int
+adversarial_alternate_shred( ctx_t *       ctx,
+                             uint          request_kind,
+                             uchar const * known_root,
+                             uchar         payload[ FD_SHRED_MAX_SZ ] ) {
+  if( FD_UNLIKELY( !ctx->blockdb ) ) return -1;
+  fd_shred_t const * shred = (fd_shred_t const *)fd_type_pun_const( payload );
+  ulong shred_type = fd_shred_type( shred->variant );
+
+  uchar bmtree_mem[ FD_BMTREE_COMMIT_FOOTPRINT( FD_SHRED_MERKLE_LAYER_CNT ) ] __attribute__((aligned(FD_BMTREE_COMMIT_ALIGN)));
+  fd_bmtree_node_t root[1];
+  fd_memset( root, 0, sizeof(root) );
+  if( FD_LIKELY( known_root ) ) memcpy( root->hash, known_root, FD_SHRED_MERKLE_NODE_SZ );
+  else {
+    if( FD_UNLIKELY( shred_type==FD_SHRED_TYPE_LEGACY_DATA || shred_type==FD_SHRED_TYPE_LEGACY_CODE ) ) return -1;
+    if( FD_UNLIKELY( !fd_shred_merkle_root( shred, bmtree_mem, root ) ) ) return -1;
+  }
+
+  ulong slot        = shred->slot;
+  uint  fec_set_idx = shred->fec_set_idx;
+  uint  shred_idx   = shred->idx;
+  ulong leaf_idx    = (ulong)fec_set_idx/FD_FEC_SHRED_CNT;
+  fd_blockdb_blk_t const * alt = fd_blockdb_query_alternate_root( ctx->blockdb, slot, leaf_idx, root->hash );
+  if( FD_LIKELY( !alt ) ) return -1;
+
+  uchar const * alt_root = alt->merkle_roots[ leaf_idx ];
+  uchar alt_payload[ FD_SHRED_MAX_SZ ];
+  int alt_len;
+  for( ulong retry=0UL;; retry++ ) {
+    alt_len = fd_store_disk_query_root( ctx->store, ctx->disk_fd, alt_root, shred_idx, alt_payload );
+    if( FD_LIKELY( alt_len!=FD_STORE_DISK_QUERY_BUSY || retry==7UL ) ) break;
+    for( ulong pause=0UL; pause<(1UL<<retry); pause++ ) FD_SPIN_PAUSE();
+  }
+  if( FD_UNLIKELY( alt_len<0 ) ) return -1;
+  fd_memcpy( payload, alt_payload, (ulong)alt_len );
+
+  FD_TRACE( "rserve adversarial_response kind=%u slot=%lu fec=%u idx=%u requested_root=%08x response_root=%08x",
+            request_kind, slot, fec_set_idx, shred_idx,
+            FD_LOAD( uint, root->hash ), FD_LOAD( uint, alt_root ) );
+  return alt_len;
+}
+
+static int
+maybe_adversarial_shred( ctx_t * ctx,
+                         uint    request_kind,
+                         uint    nonce,
+                         uchar const * known_root,
+                         uchar   payload[ FD_SHRED_MAX_SZ ],
+                         int     len ) {
+  fd_shred_t const * shred = (fd_shred_t const *)fd_type_pun_const( payload );
+  if( FD_LIKELY( !adversarial_response_selected( ctx, request_kind, nonce, shred->slot, shred->idx ) ) ) return len;
+
+  int alt_len = adversarial_alternate_shred( ctx, request_kind, known_root, payload );
+  if( FD_LIKELY( alt_len>0 ) ) return alt_len;
+
+  if( FD_UNLIKELY( (ulong)len<=FD_SHRED_DATA_HEADER_SZ ) ) return len;
+  payload[ FD_SHRED_DATA_HEADER_SZ ] ^= (uchar)0xFF;
+  FD_TRACE( "rserve adversarial_corrupt kind=%u slot=%lu fec=%u idx=%u",
+            request_kind, shred->slot, shred->fec_set_idx, shred->idx );
+  return len;
 }
 
 static inline void
@@ -388,6 +474,7 @@ handle_net_request( ctx_t             * ctx,
           ctx->metrics->missed_pkt_types[ response_metric_index[tag] ]++;
           return;
         }
+        len = maybe_adversarial_shred( ctx, tag, header->nonce, NULL, payload, len );
         ctx->metrics->disk_read_success++;
         ctx->metrics->disk_read_bytes += (ulong)len;
 
@@ -421,6 +508,7 @@ handle_net_request( ctx_t             * ctx,
             ctx->metrics->missed_pkt_types[ FD_METRICS_ENUM_RSERVE_SENT_RESPONSE_TYPES_V_ORPHAN_IDX ]++;
             return;
           }
+          len = maybe_adversarial_shred( ctx, tag, header->nonce, NULL, payload, len );
           ctx->metrics->disk_read_success++;
           ctx->metrics->disk_read_bytes += (ulong)len;
           fd_shred_t const * shred = (fd_shred_t const *)fd_type_pun_const( payload );
@@ -495,6 +583,8 @@ handle_net_request( ctx_t             * ctx,
         memcpy( msg, payload+4UL, sizeof(ag_repair_shred_block_id_req_t) );
 
         fd_blockdb_blk_t const * blk = fd_blockdb_query( ctx->blockdb, msg->slot, &msg->block_id );
+        if( FD_UNLIKELY( !blk && adversarial_response_selected( ctx, tag, header->nonce, msg->slot, msg->shred_idx ) ) )
+          blk = fd_blockdb_query_slot( ctx->blockdb, msg->slot );
         if( FD_UNLIKELY( !blk ) ) {
           ctx->metrics->missed_pkt_types[ response_metric_index[tag] ]++;
           return;
@@ -518,6 +608,7 @@ handle_net_request( ctx_t             * ctx,
           ctx->metrics->missed_pkt_types[ response_metric_index[tag] ]++;
           return;
         }
+        len = maybe_adversarial_shred( ctx, tag, header->nonce, root, payload, len );
         ctx->metrics->disk_read_success++;
         ctx->metrics->disk_read_bytes += (ulong)len;
 
@@ -815,6 +906,9 @@ unprivileged_init( fd_topo_t      const * topo,
   }
 
   ctx->max_shreds_per_block = tile->rserve.max_shreds_per_block;
+  ctx->adversarial_response_pct = tile->rserve.adversarial_response_pct;
+  if( FD_UNLIKELY( ctx->adversarial_response_pct ) )
+    FD_LOG_WARNING(( "development.repair.adversarial_response_pct is %u: this validator can answer shred repair from another stored block version or with a corrupted shred", ctx->adversarial_response_pct ));
   ctx->rserve    = fd_rserve_join   ( fd_rserve_new( ctx->rserve, ping_cache_entries, ctx->seed, ctx->rserve_secret ) );
   ctx->keyswitch = fd_keyswitch_join( fd_topo_obj_laddr( topo, tile->id_keyswitch_obj_id ) );
   FD_TEST( ctx->keyswitch );

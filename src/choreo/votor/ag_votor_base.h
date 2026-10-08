@@ -13,6 +13,20 @@
 #define AG_DELTA_TIMEOUT_NS    (400000000L)   /* skip timeout */
 #define AG_DELTA_STANDSTILL_NS (10000000000L) /* 10s since last finalize */
 
+/* Standstill re-broadcasts start AG_DELTA_STANDSTILL_MIN_NS after the
+   last finalize and back off to AG_DELTA_STANDSTILL_NS while the
+   standstill lasts.  Votes and certs are sent once, so a short fault
+   that drops them otherwise costs the full 10s.  4s stays above two
+   skipped leader windows (3.2s at 400ms slots), so normal skips do not
+   trigger it.  The timing is local and does not change the protocol. */
+
+#define AG_DELTA_STANDSTILL_MIN_NS (4000000000L)
+
+FD_FN_CONST static inline long
+ag_standstill_next_delay( long delay ) {
+  return fd_long_min( 2L*delay, AG_DELTA_STANDSTILL_NS );
+}
+
 #define AG_WEAKEST_QUORUM_THRESHOLD_NUMER (1UL) /* 20%, safe-to-notar + 40% skip */
 #define AG_WEAK_QUORUM_THRESHOLD_NUMER    (2UL) /* 40%, safe-to-notar / safe-to-skip */
 #define AG_QUORUM_THRESHOLD_NUMER         (3UL) /* 60%, notarize, finalize and skip */

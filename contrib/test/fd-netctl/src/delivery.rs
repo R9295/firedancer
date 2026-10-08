@@ -1,5 +1,5 @@
 //! Bounded delayed verdicts and loopback-only copies. Payloads stay encrypted.
-use fd_netctl::{Delivery, Policy, COPY_MARK};
+use fd_netctl::{Delivery, Policy, COPY_MARK, MAX_PENDING};
 use nfq::{Message, Queue, Verdict};
 use std::collections::BTreeMap;
 use std::io;
@@ -9,10 +9,8 @@ use std::time::{Duration, Instant};
 use crate::Result;
 
 // Matches the socket tile's FD_NET_MTU. Larger packets can pass or wait, but
-// cannot be duplicated from a truncated copy. Leave room in the kernel queue
-// (1024) for new traffic while holding at most this many delayed originals.
+// cannot be duplicated from a truncated copy.
 pub const COPY_RANGE: u16 = 2048;
-const MAX_PENDING: usize = 512;
 
 struct Held {
     message: Message,
@@ -46,7 +44,7 @@ impl Deliveries {
             return self.deliver(held, queue, policy);
         }
         if self.pending.len() >= MAX_PENDING {
-            return Err("delay buffer full (512 packets; test invalid)".into());
+            return Err(format!("delay buffer full ({MAX_PENDING} packets; test invalid)").into());
         }
         let deadline = Instant::now() + Duration::from_millis(delivery.link.delay_ms);
         self.pending.insert((deadline, self.sequence), held);

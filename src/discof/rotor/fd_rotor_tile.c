@@ -3,6 +3,7 @@
 #include "../genesis/fd_genesi_tile.h"
 #include "../../disco/topo/fd_topo.h"
 #include "../../disco/fd_clock_tile.h"
+#include "../../disco/fd_trace.h"
 #include <linux/futex.h>
 #include "generated/fd_rotor_tile_seccomp.h"
 #include "../../disco/keyguard/fd_keyload.h"
@@ -376,10 +377,13 @@ handle_meta_response( ctx_t *       ctx,
       if( FD_UNLIKELY( kind!=AG_REPAIR_KIND_PARENT_FEC_COUNT ) ) return; /* wrong kind for this nonce */
 
       ag_parent_fec_count_res_t * res = &response->parent_fec_set_res;
+      char b58[ FD_BASE58_ENCODED_32_SZ ], parent_b58[ FD_BASE58_ENCODED_32_SZ ];
       if( FD_UNLIKELY( ag_repair_parent_fec_count_verify( res, &block_id ) ) ) {
+        FD_TRACE( "rotor repair_parent slot=%lu block=%s result=bad_proof", slot, fd_trace_hash( b58, block_id.uc ) );
         ctx->metrics->failed_parent_fec_count++;
         return;
       }
+      FD_TRACE( "rotor repair_parent slot=%lu block=%s fecs=%u parent_slot=%lu parent=%s result=%s", slot, fd_trace_hash( b58, block_id.uc ), res->fec_set_count, res->parent_slot, fd_trace_hash( parent_b58, res->parent_block_id.uc ), res->parent_slot<ctx->rotor->root ? "dead_fork" : "ok" );
       fd_rotor_blk_t * block = fd_rotor_slot_version_query( ctx->rotor, slot, &block_id );
       fd_rotor_repair_tally( block, FD_ROTOR_RESP_PARENT, rx_ts );
       if( FD_UNLIKELY( res->parent_slot < ctx->rotor->root ) ) {
@@ -401,10 +405,13 @@ handle_meta_response( ctx_t *       ctx,
       fd_rotor_blk_t * v = fd_rotor_slot_version_query( ctx->rotor, slot, &block_id );
       if( FD_UNLIKELY( !v ) ) return;
       uint fec_set_count = ( v->complete_idx+1U ) / FD_FEC_SHRED_CNT;
+      char b58[ FD_BASE58_ENCODED_32_SZ ];
       if( FD_UNLIKELY( ag_repair_fec_set_root_verify( res, &block_id, fec_set_idx, fec_set_count ) ) ) {
+        FD_TRACE( "rotor repair_root slot=%lu block=%s fec=%u result=bad_proof", slot, fd_trace_hash( b58, block_id.uc ), fec_set_idx );
         ctx->metrics->failed_fec_root++;
         return;
       }
+      FD_TRACE( "rotor repair_root slot=%lu block=%s fec=%u root=%08x result=ok", slot, fd_trace_hash( b58, block_id.uc ), fec_set_idx, fd_trace_root4( res->root ) );
       fd_rotor_repair_tally( v, FD_ROTOR_RESP_FEC_ROOT, rx_ts );
       fd_rotor_blk_t * created = fd_rotor_verified_hash_insert( ctx->rotor, slot, &block_id, fec_set_idx, res->root, rx_ts );
       if( FD_UNLIKELY( created ) ) fd_schedulor_block_insert( ctx->schedulor, created->slot, &created->block_id, now );
@@ -572,6 +579,7 @@ handle_replay( ctx_t *       ctx,
                ulong         sig,
                uchar const * chunk ) {
   if( FD_UNLIKELY( sig==REPLAY_SIG_MISSING_FEC ) ) {
+    FD_TRACE( "rotor missing_fec pending=%d redeliver=%lu out=%lu root=%lu replay_root=%lu", ctx->deliver_from_root, out_queue_cnt( ctx->redeliver ), out_queue_cnt( ctx->rotor->out_queue ), ctx->rotor->root, ctx->replay_root_slot );
     ctx->deliver_from_root = 1;
     return;
   }
@@ -580,6 +588,7 @@ handle_replay( ctx_t *       ctx,
     if( FD_LIKELY( root->slot > ctx->rotor->root ) ) {
       if( !out_queue_empty( ctx->redeliver ) || !out_queue_empty( ctx->rotor->out_queue ) ) {
         /* hold the root advanced until the redeliver queue is empty */
+        FD_TRACE( "rotor root_held slot=%lu redeliver=%lu out=%lu", root->slot, out_queue_cnt( ctx->redeliver ), out_queue_cnt( ctx->rotor->out_queue ) );
         ctx->replay_root_slot = root->slot;
         fd_memcpy( ctx->replay_root_hash.uc, root->block_id.uc, 32UL );
         return;
@@ -599,9 +608,14 @@ handle_votor( ctx_t *       ctx,
      it and the first check asks for its parent and FEC count. */
 
   fd_votor_repair_t const * nf = (fd_votor_repair_t const *)fd_type_pun_const( chunk );
-  if( FD_UNLIKELY( nf->slot <= ctx->rotor->root ) ) return;
+  char b58[ FD_BASE58_ENCODED_32_SZ ];
+  if( FD_UNLIKELY( nf->slot <= ctx->rotor->root ) ) {
+    FD_TRACE( "rotor votor_block slot=%lu block=%s result=rooted", nf->slot, fd_trace_hash( b58, nf->block_id.uc ) );
+    return;
+  }
   long wallclock = fd_clock_tile_tickcount_to_wallclock( ctx->clock, now ); /* rotor metrics are stamped in wallclock */
   fd_rotor_blk_t * created = fd_rotor_verified_block_insert( ctx->rotor, nf->slot, nf->block_id, wallclock );
+  FD_TRACE( "rotor votor_block slot=%lu block=%s result=%s", nf->slot, fd_trace_hash( b58, nf->block_id.uc ), created ? "new" : "known" );
   if( FD_LIKELY( created ) ) fd_schedulor_block_insert( ctx->schedulor, created->slot, &created->block_id, now );
 }
 
@@ -938,6 +952,8 @@ publish_fec( ctx_t *             ctx,
 
   m->fec_completed_ts_nanos        = fec->metrics.completed_ts;
 
+  char b58[ FD_BASE58_ENCODED_32_SZ ];
+  FD_TRACE( "rotor deliver slot=%u fec=%u root=%08x block=%s turbine=%d last=%d redeliver=%d", fec->slot, (uint)fec->fec_set_idx, fd_trace_root4( fec->merkle_root.uc ), fd_trace_hash( b58, msg->block_id.uc ), (int)block->turbine, (int)fec->slot_complete, from_root );
   fd_stem_publish( stem, ctx->replay_out_ctx->idx, ROTOR_SIG_FEC_REPLAY, ctx->replay_out_ctx->chunk, sizeof(fd_rotor_replay_fec_t), 0UL, 0UL, fd_frag_meta_ts_comp( fd_tickcount() ) );
   ctx->replay_out_ctx->chunk = fd_dcache_compact_next( ctx->replay_out_ctx->chunk, sizeof(fd_rotor_replay_fec_t), ctx->replay_out_ctx->chunk0, ctx->replay_out_ctx->wmark );
   ctx->metrics->fecs_delivered++;
@@ -967,24 +983,35 @@ publish_fec_replay( ctx_t *             ctx,
   if( FD_UNLIKELY( ctx->deliver_from_root ) ) {
     /* queues every FEC from the rotor root down to (block, fec),
        inclusive, onto ctx->redeliver in root-to-target order. */
+    FD_TRACE( "rotor redeliver_walk slot=%lu fec=%u turbine=%d floor=%lu", block->slot, (uint)fec->fec_set_idx, (int)block->turbine, fd_ulong_max( ctx->replay_root_slot, ctx->rotor->root ) );
+    fd_rotor_blk_t * last = NULL;
     for( fd_rotor_blk_t * blk = block;
                           blk && blk->slot > fd_ulong_max( ctx->replay_root_slot, ctx->rotor->root );
                           blk = fd_rotor_slot_version_query( ctx->rotor, blk->parent_slot, &blk->parent_block_id ) ) {
       uint block_idx = (uint)fd_block_pool_idx( ctx->rotor->block_pool, blk );
+      last = blk;
 
       uint kmax;
       if( FD_LIKELY( blk==block ) ) {
         kmax = fec->fec_set_idx / (uint)FD_FEC_SHRED_CNT;
       } else {
-        if( FD_UNLIKELY( blk->buffered_fec_idx==UINT_MAX ) ) continue;
+        if( FD_UNLIKELY( blk->buffered_fec_idx==UINT_MAX ) ) {
+          FD_TRACE( "rotor redeliver_skip slot=%lu turbine=%d abandoned=%d connected=%d why=no_buffered_fec", blk->slot, (int)blk->turbine, (int)blk->abandoned, (int)blk->connected );
+          continue;
+        }
         kmax = blk->buffered_fec_idx / (uint)FD_FEC_SHRED_CNT;
       }
+      FD_TRACE( "rotor redeliver_queue slot=%lu fecs=%u turbine=%d abandoned=%d parent_slot=%lu", blk->slot, kmax+1U, (int)blk->turbine, (int)blk->abandoned, blk->parent_slot );
 
       uint const * fecs = fd_rotor_block_fecs( ctx->rotor, blk );
       for( int k=(int)kmax; k>=0; k-- ) {
         if( FD_UNLIKELY( out_queue_full( ctx->redeliver ) ) ) FD_LOG_ERR(( "deliver_from_root queue full" ));
          out_queue_push_head( ctx->redeliver, (out_ele_t){ .block_idx = block_idx, .fec_idx = fecs[ k ] } );
       }
+    }
+    if( FD_LIKELY( last ) ) {
+      int parent_found = !!fd_rotor_slot_version_query( ctx->rotor, last->parent_slot, &last->parent_block_id );
+      FD_TRACE( "rotor redeliver_stop slot=%lu parent_slot=%lu parent_found=%d queued=%lu", last->slot, last->parent_slot, parent_found, out_queue_cnt( ctx->redeliver ) );
     }
     ctx->deliver_from_root = 0;
   }

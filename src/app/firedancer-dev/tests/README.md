@@ -38,6 +38,45 @@ NUMA nodes. On a four-NUMA host, ten validators use a 3/3/2/2 memory split inste
 of reserving all 165 GiB on one NUMA node. Use the manual setup below when the
 host needs a different node count, port plan, or affinity plan.
 
+`FD_CLUSTER_TWIN_OF=K` at creation adds one more validator, a twin of node
+K. It uses node K's identity key, so in K's leader slots both instances
+produce a block and the cluster sees two conflicting versions of each
+slot. Its authorized voter is a fresh unstaked key, so it never votes.
+Node K and the twin set `development.gossip.allow_duplicate_instance`;
+otherwise gossip makes the instance that started first exit. The
+twin gets its own ports, mount, and CPU set like any other node, and every
+node sends it shreds. The test runs it but does not require it to root,
+because it can fall behind: gossip keeps one contact address per
+identity, so peers may reach only one of the two instances at a time.
+
+`FD_CLUSTER_EQUIVOCATOR=K` at creation makes node K equivocate in
+`FD_CLUSTER_EQUIVOCATE_PCT` percent (default 25) of its leader slots,
+through `development.shred.equivocate_pct`. In each such slot its shred
+tile builds a second version of the block from the same entries, with a
+different reference tick in every data shred. Both versions replay to
+the same result, but they have different block ids. Node K keeps the
+first version. Each version goes directly to a random half of the other
+nodes, not through turbine, and node K skips the turbine root of each
+shred, so no node relays the other version to a node first. With equal
+stakes, neither version gets enough notarize votes on its own. Node K
+logs each equivocated slot at NOTICE level.
+
+`FD_CLUSTER_EQUIVOCATE_FEC_MIX_PCT` selects the percentage of those
+equivocated slots that use mixed FEC delivery. In such a slot, every
+destination switches between version A and version B on alternating FEC
+sets. A validator therefore receives individually valid FEC sets that do
+not form either complete block version. The setting maps to
+`development.shred.equivocate_fec_mix_pct` and defaults to zero.
+
+`FD_CLUSTER_ADVERSARIAL_REPAIR_NODE=K` makes node K answer eligible
+shred repair requests with the requested shred index from another
+completed version of the same slot and FEC position. This covers legacy
+Window, HighestWindow, and Orphan repair plus Alpenglow ShredForBlockId.
+If no alternate version is stored, the node sends its normal response.
+`FD_CLUSTER_ADVERSARIAL_REPAIR_PCT` controls the share of eligible
+responses (default 100) through
+`development.repair.adversarial_response_pct`.
+
 The manual paths below use `/cluster` as an example. The test binary does not
 generate configs, and configs are not checked into the repository: they contain
 host-specific paths, ports, identities, and CPU assignments.
@@ -524,11 +563,46 @@ of the others to finalize that far.
 
 The test fails if any validator exits, if a validator's tiles do not
 come up, or if the root slot is not reached within
-`FD_CLUSTER_TIMEOUT_S`. Each validator writes to the `log.path` in its
-own config.
+`FD_CLUSTER_TIMEOUT_S`. The validators do not use the `log.path` in their
+configs. They inherit the test's log file, which the test names on its
+`Log at` line, and tag each line `fN` for the Nth config (node N-1).
 
 All validators run in a PID namespace owned by the test, so they are
 torn down with it even if it is killed abruptly.
+
+### Consensus traces
+
+Each validator logs one INFO line for each consensus decision:
+
+```text
+TRACE <tile> <event> key=value ...
+```
+
+The votor, rotor, replay, and shred tiles trace votes and certificates,
+block versions built, delivered, replayed, abandoned, or pruned, FEC sets
+completed or rejected, equivocation, roots, and leader slots (see
+`src/disco/fd_trace.h`). Block ids are in base58. FEC set roots are their
+first 4 bytes in hex. A ten-node run logs about 150 trace lines per second
+for each validator. To compile the traces out, build in a separate
+directory with `make -j BUILDDIR=notrace EXTRA_CPPFLAGS=-DFD_TRACE_ENABLED=0`.
+
+`contrib/test/show_fd_cluster_trace.py` merges the traces of all nodes:
+
+```sh
+# Summary and timeline of one slot, a summary of each slot in a range,
+# or event counts per tile and node:
+contrib/test/show_fd_cluster_trace.py /tmp/fd-0.1.1_... --slot 110
+contrib/test/show_fd_cluster_trace.py /tmp/fd-0.1.1_... --slot 100-120
+contrib/test/show_fd_cluster_trace.py /tmp/fd-0.1.1_... --counts
+```
+
+The summary names the block ids of a slot `a`, `b`, `c`, and so on. For each
+version, it lists the FEC set roots and the nodes that completed, replayed,
+and voted for the version. If the leader equivocated, each root is marked `A`
+or `B` for the leader's two versions. For each node, the summary shows its
+votes, certificates, and finalization, and unusual events, such as rejected
+FEC sets, abandoned versions, and dropped FEC sets. `--node N` limits the
+per-node lines and the timeline to node N.
 
 After the run, optional per-node host cleanup is:
 

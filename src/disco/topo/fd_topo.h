@@ -261,6 +261,7 @@ struct fd_topo_tile {
 
       ushort shred_version;
       int allow_private_address;
+      int allow_duplicate_instance;
 
       char          gossip_host[ FD_FQDN_BUF_MAX ];
       fd_ip4_port_t gossip_addr;
@@ -406,6 +407,9 @@ struct fd_topo_tile {
       char  adtl_dests_retransmit[ FD_TOPO_ADTL_DESTS_MAX ][ FD_HOSTPORT_BUF_MAX ];
       ulong adtl_dests_leader_cnt;
       char  adtl_dests_leader[ FD_TOPO_ADTL_DESTS_MAX ][ FD_HOSTPORT_BUF_MAX ];
+      uint  equivocate_pct; /* [development.shred], test clusters only */
+      uint  equivocate_fec_mix_pct; /* [development.shred], test clusters only */
+      uint  withhold_pct;   /* [development.shred], test clusters only */
     } shred;
 
     struct {
@@ -609,6 +613,7 @@ struct fd_topo_tile {
       ulong  ping_cache_entries;
       ulong  max_shreds_per_block;
       ulong  blockdb_max; /* 0 disables the block metadata db */
+      uint   adversarial_response_pct; /* [development.repair], test clusters only */
     } rserve;
 
     struct {
@@ -661,6 +666,7 @@ struct fd_topo_tile {
       ushort quic_server_listen_port;
       uint   ip_addr;
       ulong  max_live_slots;
+      uint   byzantine_vote_pct; /* [development.votor], test clusters only */
     } votor;
 
     struct {

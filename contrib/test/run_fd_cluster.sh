@@ -15,6 +15,7 @@ usage() {
     '  net      Build, prepare the host, and run with the Rust network controller' \
     '  netctl   Send a controller command: status | block N M | allow N M | heal | stop' \
     '           delay N M MS | duplicate N M 0|1 (one extra copy)' \
+    '           apply [RULE, ...] (replace every rule at once, e.g. "block 1 2, delay 2 3 50")' \
     '           typesafe [SECONDS] (automatic single-node partition; default: 1s)' \
     '  mem      Show the memory reservation for each node' \
     '  logs     Follow all default node log files' \
@@ -29,6 +30,15 @@ usage() {
     'Environment: FD (repository), C (cluster directory),' \
     '  FD_CLUSTER_ROOT_SLOT, FD_CLUSTER_TIMEOUT_S, FD_CLUSTER_BUILD_JOBS,' \
     '  FD_CLUSTER_NODES (create only; default: 10).' \
+    '  FD_CLUSTER_TWIN_OF=K (create only): also add a non-voting twin of node K,' \
+    '    which shares its identity, so its leader slots equivocate.' \
+    '  FD_CLUSTER_EQUIVOCATOR=K (create only): node K equivocates in' \
+    '    FD_CLUSTER_EQUIVOCATE_PCT percent (default: 25) of its leader slots.' \
+    '    FD_CLUSTER_EQUIVOCATE_FEC_MIX_PCT percent (default: 0) of those slots' \
+    '    alternate versions across FEC sets.' \
+    '  FD_CLUSTER_ADVERSARIAL_REPAIR_NODE=K (create only): node K serves another' \
+    '    stored block version in FD_CLUSTER_ADVERSARIAL_REPAIR_PCT percent' \
+    '    (default: 100) of eligible repair responses.' \
     '  FD_CLUSTER_CONFIGS: colon-separated absolute node config paths (1..128).' \
     '  FD_NETCTL_SOCKET: control socket (default: /run/fd-netctl/control.sock).' \
     'C defaults to the cluster directory alongside the repository.' \

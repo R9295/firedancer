@@ -93,6 +93,7 @@ fd_gossip_subtopo( config_t * config, ulong tile_to_cpu[ FD_TILE_MAX ] FD_PARAM_
     gossvf_tile->gossvf.tcache_depth = 1UL<<22UL;
     gossvf_tile->gossvf.shred_version = config->consensus.expected_shred_version;
     gossvf_tile->gossvf.allow_private_address = config->development.gossip.allow_private_address;
+    gossvf_tile->gossvf.allow_duplicate_instance = config->development.gossip.allow_duplicate_instance;
     gossvf_tile->gossvf.entrypoints_cnt = config->gossip.entrypoints_cnt;
     gossvf_tile->gossvf.boot_timestamp_nanos = config->boot_timestamp_nanos;
     fd_cstr_ncpy( gossvf_tile->gossvf.gossip_host, config->firedancer.gossip.host, sizeof(gossvf_tile->gossvf.gossip_host) );

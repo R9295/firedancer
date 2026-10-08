@@ -2084,12 +2084,72 @@ telemetry = true
         # to this port.
         quic_server_listen_port = 8004
 
+        # The percentage, 0 to 100, of this validator's own votes after
+        # which it also broadcasts a conflicting or invalid vote, for
+        # test clusters.  The extra vote is one of: a notarize vote for
+        # a different block, a skip vote for a slot it voted to
+        # notarize or finalize, a notarize vote for a slot it voted to
+        # skip, or a copy of its vote with a corrupted signature.  It
+        # is only sent to peers, never added to this validator's own
+        # pool.  Never set it on a real network.
+        byzantine_vote_pct = 0
+
+    [development.shred]
+        # The percentage, 0 to 100, of this validator's leader slots in
+        # which it equivocates on purpose.  For each such slot the shred
+        # tile also builds a second version of the block from the same
+        # entries, with a different reference tick in every data shred.
+        # Both versions replay to the same result, but they have
+        # different block ids.  Version B goes to a random 1 to n-1 of
+        # the n tiles.shred.additional_shred_destinations_leader, version
+        # A to the rest, and the
+        # slot is not sent through turbine.  This only works when that
+        # list holds every other validator, as in a local test cluster.
+        # Never set it on a real network.
+        equivocate_pct = 0
+
+        # The percentage, 0 to 100, of equivocated leader slots whose
+        # destination assignment flips between versions A and B on
+        # alternating FEC sets.  Every peer therefore receives a block
+        # assembled from both versions when the slot has multiple FEC
+        # sets.  Has no effect unless equivocate_pct is nonzero.  Never
+        # set it on a real network.
+        equivocate_fec_mix_pct = 0
+
+        # The percentage, 0 to 100, of this validator's leader slots in
+        # which it withholds part of its block.  In such a slot each
+        # FEC set is withheld with probability one half: the leader
+        # sends only 24 to 31 of its 64 shreds, too few to recover the
+        # set, so other validators must repair it.  The leader stores
+        # and serves the whole block to repair as usual.  Equivocated
+        # slots are never withheld.  Never set it on a real network.
+        withhold_pct = 0
+
+    [development.repair]
+        # The percentage, 0 to 100, of eligible shred repair responses
+        # for which the repair server returns the requested shred index
+        # from another completed version of the same slot and FEC set.
+        # When no alternate version is stored, the response instead has
+        # its first payload byte flipped, so it fails its merkle root
+        # and signature checks.
+        # This applies to Window, HighestWindow, Orphan, and
+        # ShredForBlockId responses.  Never set it on a real network.
+        adversarial_response_pct = 0
+
     [development.gossip]
         # Under normal operating conditions, a validator should always
         # reach out to a host located on the public internet.  If this
         # value is true, it allows the validator to gossip with nodes
         # located on a private internet (rfc1918).
         allow_private_address = false
+
+        # A validator normally exits when gossip shows another running
+        # instance of its own identity that started later, so an
+        # operator cannot run two copies by accident.  Test clusters
+        # set this to true on two instances that share an identity on
+        # purpose, to make that validator's leader slots equivocate.
+        # Never set it on a real network.
+        allow_duplicate_instance = false
 
     [development.genesis]
         # During normal operation, the genesi tile performs a validation

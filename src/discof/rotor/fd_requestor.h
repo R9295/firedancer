@@ -40,9 +40,16 @@
 
      3. Metadata.  One request ends the walk with REQUESTED_PARENT,
         after any fill requests:
-          parent known, absent  Orphan (asks peers for the ancestry)
+          parent known, absent  verified, another version of the
+                                parent slot held: ParentAndFecSetCount
+                                otherwise: Orphan (asks peers for the
+                                ancestry)
           complete_idx unknown  verified: ParentAndFecSetCount
                                 turbine:  HighestShred
+        Orphan's answers for a slot the rotor already holds another
+        version of conflict with that version and are dropped, so a
+        verified block asks for its parent by block id there; the
+        verified answer creates the missing parent version.
 
      4. Exhausted: REQUESTED if any fill request went out, DONE otherwise.
 

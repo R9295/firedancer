@@ -147,6 +147,13 @@ fd_config_extract_podf( uchar *        pod,
 
   CFG_POP      ( ushort, development.votor.quic_client_listen_port           );
   CFG_POP      ( ushort, development.votor.quic_server_listen_port           );
+  CFG_POP      ( uint,   development.votor.byzantine_vote_pct                );
+
+  CFG_POP      ( uint,   development.shred.equivocate_pct                    );
+  CFG_POP      ( uint,   development.shred.equivocate_fec_mix_pct            );
+  CFG_POP      ( uint,   development.shred.withhold_pct                      );
+
+  CFG_POP      ( uint,   development.repair.adversarial_response_pct         );
 
   CFG_POP      ( bool,   development.genesis.validate_genesis_hash           );
   CFG_POP      ( ulong,  development.genesis.max_file_size_mib               );
@@ -333,6 +340,7 @@ fd_config_extract_pod( uchar *       pod,
   CFG_POP      ( bool,   development.bootstrap                            );
 
   CFG_POP      ( bool,   development.gossip.allow_private_address         );
+  CFG_POP      ( bool,   development.gossip.allow_duplicate_instance      );
 
   CFG_POP      ( ulong,  development.genesis.hashes_per_tick              );
   CFG_POP      ( ulong,  development.genesis.target_tick_duration_micros  );

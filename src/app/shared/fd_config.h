@@ -188,7 +188,18 @@ struct fd_configf {
     struct {
       ushort quic_client_listen_port;
       ushort quic_server_listen_port;
+      uint   byzantine_vote_pct;
     } votor;
+
+    struct {
+      uint equivocate_pct;
+      uint equivocate_fec_mix_pct;
+      uint withhold_pct;
+    } shred;
+
+    struct {
+      uint adversarial_response_pct;
+    } repair;
 
     struct {
       int   validate_genesis_hash;
@@ -385,6 +396,7 @@ struct fd_config {
 
     struct {
       int allow_private_address;
+      int allow_duplicate_instance;
     } gossip;
 
     struct {

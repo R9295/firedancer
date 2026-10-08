@@ -292,6 +292,7 @@ make_shred( uchar buf[ FD_SHRED_MAX_SZ ],
   shred->variant   = fd_shred_variant( FD_SHRED_TYPE_LEGACY_DATA, 0 );
   shred->slot      = slot;
   shred->idx       = idx;
+  shred->fec_set_idx = (idx/FD_FEC_SHRED_CNT)*FD_FEC_SHRED_CNT;
   shred->data.size = (ushort)(FD_SHRED_DATA_HEADER_SZ+1UL);
   buf[ FD_SHRED_DATA_HEADER_SZ ] = marker;
   return shred;
@@ -322,6 +323,9 @@ check_shred( ulong sz,
   uchar const * res = response();
   fd_shred_t const * shred = fd_type_pun_const( res );
   FD_TEST( sz==fd_shred_sz( shred )+sizeof(uint) );
+  if( FD_UNLIKELY( shred->slot!=slot || shred->idx!=idx || res[ FD_SHRED_DATA_HEADER_SZ ]!=marker ) )
+    FD_LOG_WARNING(( "shred mismatch: expected slot=%lu idx=%u marker=%02x, got slot=%lu idx=%u marker=%02x",
+                     slot, idx, (uint)marker, shred->slot, shred->idx, (uint)res[ FD_SHRED_DATA_HEADER_SZ ] ));
   FD_TEST( shred->slot==slot && shred->idx==idx && res[ FD_SHRED_DATA_HEADER_SZ ]==marker );
   FD_TEST( FD_LOAD( uint, res+sz-sizeof(uint) )==nonce );
 }
@@ -346,6 +350,11 @@ test_shred_for_block_id( fd_repair_t * client,
   uchar buf[ FD_SHRED_MAX_SZ ];
   uchar alt_root[ FD_SHRED_MERKLE_NODE_SZ ];
   memset( alt_root, 0xEE, sizeof(alt_root) );
+  fd_hash_t alt_id = blk_id; alt_id.uc[ 0 ] ^= 1U;
+  uchar alt_roots[ FEC_CNT ][ FD_SHRED_MERKLE_NODE_SZ ];
+  memcpy( alt_roots, blk_roots, sizeof(alt_roots) );
+  memcpy( alt_roots[ 1 ], alt_root, sizeof(alt_root) );
+  FD_TEST( fd_blockdb_insert( ctx->blockdb, blk_slot, &alt_id, blk_parent, &blk_parent_id, FEC_CNT, (uchar const *)alt_roots ) );
   insert( ctx, make_shred( buf, blk_slot, 33U, 0xEEU ), alt_root );
   insert( ctx, make_shred( buf, blk_slot,  0U, 0x00U ), blk_roots[ 0 ] );
   insert( ctx, make_shred( buf, blk_slot, 33U, 0x21U ), blk_roots[ 1 ] );
@@ -369,6 +378,35 @@ test_shred_for_block_id( fd_repair_t * client,
   FD_TEST( sz );
   check_shred( sz, blk_slot, 33U, 0xEEU, 9U );
 
+  /* At 100%, block-id repair deliberately switches away from the
+     requested version. */
+  ctx->adversarial_response_pct = 100U;
+  msg = ag_repair_shred_block_id( client, &server_pub, now_ms(), 11U, blk_slot, &blk_id, 33U );
+  sz = request( ctx, (uchar const *)msg, sign( msg ) );
+  FD_TEST( sz );
+  check_shred( sz, blk_slot, 33U, 0xEEU, 11U );
+
+  /* A requested block id that this server does not know still gets a
+     valid shred from a completed conflicting version of the slot. */
+  fd_hash_t other = blk_id; other.uc[ 3 ] ^= 1;
+  msg = ag_repair_shred_block_id( client, &server_pub, now_ms(), 12U, blk_slot, &other, 33U );
+  sz = request( ctx, (uchar const *)msg, sign( msg ) );
+  FD_TEST( sz );
+  uchar marker = response()[ FD_SHRED_DATA_HEADER_SZ ];
+  FD_TEST( marker==0x21U || marker==0xEEU );
+  FD_TEST( FD_LOAD( uint, response()+sz-sizeof(uint) )==12U );
+
+  /* Without another version of the FEC set, the shred is corrupted. */
+  msg = ag_repair_shred_block_id( client, &server_pub, now_ms(), 13U, blk_slot, &blk_id, 0U );
+  sz = request( ctx, (uchar const *)msg, sign( msg ) );
+  FD_TEST( sz );
+  check_shred( sz, blk_slot, 0U, 0xFFU, 13U );
+  msg = fd_repair_shred( client, &server_pub, now_ms(), 14U, blk_slot, 95UL );
+  sz = request( ctx, (uchar const *)msg, sign( msg ) );
+  FD_TEST( sz );
+  check_shred( sz, blk_slot, 95U, 0x5FU^0xFFU, 14U );
+  ctx->adversarial_response_pct = 0U;
+
   /* A shred of the block that isn't stored misses */
   ulong read_miss = ctx->metrics->disk_read_miss;
   msg = ag_repair_shred_block_id( client, &server_pub, now_ms(), 1U, blk_slot, &blk_id, 1U );
@@ -376,7 +414,6 @@ test_shred_for_block_id( fd_repair_t * client,
   FD_TEST( ctx->metrics->disk_read_miss==read_miss+1UL );
 
   /* An unknown block misses */
-  fd_hash_t other = blk_id; other.uc[ 3 ] ^= 1;
   msg = ag_repair_shred_block_id( client, &server_pub, now_ms(), 1U, blk_slot, &other, 0U );
   FD_TEST( !request( ctx, (uchar const *)msg, sign( msg ) ) );
   FD_TEST( ctx->metrics->missed_pkt_types[ FD_METRICS_ENUM_RSERVE_SENT_RESPONSE_TYPES_V_SHRED_FOR_BLOCK_ID_IDX ]==2UL );
